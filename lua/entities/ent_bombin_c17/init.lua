@@ -81,9 +81,8 @@ local CFG_W2_Pool    = {
 }
 
 -- ---------- W3 -- GBU-53 parachute cluster (replaces medium carpet) ----------
--- Each "shot" drops one ent_bombin_gbu53_chute_owned:
---   a metal palette with 4 GBU-53 munitions + a parachute riding above.
--- The chute detaches at ignition and each GBU-53 loiters independently.
+-- Each "shot" drops one ent_bombin_gbu53_owned which handles the
+-- chute+palette assembly internally and loiters after ignition.
 local CFG_W3_GBU53_Count  = 3          -- pallets per window
 local CFG_W3_GBU53_Delay  = 1.2        -- seconds between pallets
 local CFG_W3_AltStagger   = 400        -- altitude separation per pallet (units)
@@ -199,114 +198,84 @@ function ENT:Initialize()
     self.JitterPhase      = math.Rand(0, math.pi * 2)
     self.JitterAmplitude  = 8
 
-    self.RadialGain  = 0.9
-    self.MaxTurnRate = 34
+    self.WPN_Active     = nil
+    self.WPN_ShotsFired = 0
+    self.WPN_NextShot   = 0
+    self.WPN_WindowEnd  = 0
+    self.WPN_PeaceUntil = CurTime() + math.Rand(CFG_PeacefulMin, CFG_PeacefulMax)
 
-    self.IsTumbling        = false
-    self.TumbleStartTime   = 0
-    self.TumbleGroundZ     = ground
-    self.TumbleCrashed     = false
-    self.TumbleVelocity    = Vector(0, 0, 0)
-    self.TumbleAngVelocity = Vector(0, 0, 0)
+    self.HP           = self.MaxHP
+    self.DamageTier   = 0
+    self.DestroyStart = nil
+    self.Destroyed    = false
 
-    self.IsDestroyed = false
-    self.DamageTier  = 0
+    self.FadeAlpha    = 0
+    self.FadeIn       = true
+
+    self.JASSM_Stock  = 6
+
+    self.EngineSound = CreateSound(self, ENGINE_LOOP_SOUND)
+    if self.EngineSound then
+        self.EngineSound:PlayEx(0.9, 95)
+    end
+
+    self:SetNWBool("Destroyed", false)
+
+    self.WanderPhaseX = math.Rand(0, math.pi * 2)
+    self.WanderPhaseY = math.Rand(0, math.pi * 2)
+    self.WanderAmp    = math.Rand(80, 200)
+    self.WanderRateX  = math.Rand(0.003, 0.009)
+    self.WanderRateY  = math.Rand(0.002, 0.007)
+    self.BaseCenterPos = Vector(self.CenterPos.x, self.CenterPos.y, self.CenterPos.z)
+
+    self.SkyYawBias      = 0
+    self.SkyProbeDist    = math.max(1400, self.Speed * 6)
+    self.SkyProbeLastHit = 0
+    self.ObsLastEval     = 0
+    self.ObsYawBias      = 0
+    self.ObsConsecHits   = 0
 
     self.PhysObj = self:GetPhysicsObject()
     if IsValid(self.PhysObj) then
-        self.PhysObj:Wake()
         self.PhysObj:EnableGravity(false)
-        self.PhysObj:SetAngles(self.ang)
+        self.PhysObj:Wake()
+        local initVel = tangent * self.Speed
+        initVel.z = 0
+        self.PhysObj:SetVelocity(initVel)
     end
 
-    self.EngineLoop = CreateSound(self, ENGINE_LOOP_SOUND)
-    if self.EngineLoop then
-        self.EngineLoop:SetSoundLevel(80)
-        self.EngineLoop:ChangePitch(100, 0)
-        self.EngineLoop:ChangeVolume(1.0, 0)
-        self.EngineLoop:Play()
-    end
+    self.OrbitAngle    = math.atan2(spawnOffset.y, spawnOffset.x)
+    self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDirection
 
-    self.CurrentWeapon   = nil
-    self.IsPeaceful      = false
-    self.PeacefulUntil   = 0
-
-    self.WPN_ShotsFired  = 0
-    self.WPN_NextShot    = 0
-    self.WPN_MuzzleIndex = 1
-
-    self:Debug("C-17 (SW-munitions, scale=" .. MODEL_SCALE .. ") spawned. sky=" .. self.sky)
+    self:Debug("C-17 spawned, orbit radius=" .. self.OrbitRadius .. " sky=" .. self.sky)
 end
 
 -- ============================================================
--- DAMAGE
+-- DEBUG
 -- ============================================================
-function ENT:OnTakeDamage(dmginfo)
-    if self.IsDestroyed then return end
-    if dmginfo:IsDamageType(DMG_CRUSH) then return end
-    local hp = self:GetNWInt("HP", self.MaxHP) - dmginfo:GetDamage()
-    self:SetNWInt("HP", hp)
-    local tier = CalcTier(hp, self.MaxHP)
-    if tier ~= self.DamageTier then
-        self.DamageTier = tier
-        BroadcastTier(self, tier)
-    end
-    if hp <= 0 then self:DestroyUAV() end
+function ENT:Debug(msg)
+    print("[Bombin C-17] " .. tostring(msg))
 end
 
-function ENT:StartTumble()
-    self.IsTumbling      = true
-    self.TumbleStartTime = CurTime()
-    self.TumbleCrashed   = false
-    local gnd = self:FindGround(self:GetPos())
-    if gnd ~= -1 then self.TumbleGroundZ = gnd end
-    local fwd = Angle(0, self.flightYaw, 0):Forward()
-    self.TumbleVelocity    = Vector(fwd.x*(self.Speed or 260), fwd.y*(self.Speed or 260), -200)
-    local function sign() return (math.random(2)==1) and 1 or -1 end
-    self.TumbleAngVelocity = Vector(
-        math.Rand(80,200)*sign(),
-        math.Rand(20,80)*sign(),
-        math.Rand(150,400)*sign()
-    )
-    local pos = self:GetPos()
-    local ed  = EffectData() ed:SetOrigin(pos) ed:SetScale(4) ed:SetMagnitude(4) ed:SetRadius(400)
-    util.Effect("500lb_air", ed, true, true)
-    sound.Play("ambient/explosions/explode_4.wav", pos, 135, 95, 1.0)
+-- ============================================================
+-- FINDGROUND
+-- ============================================================
+function ENT:FindGround(pos)
+    local tr = util.TraceLine({
+        start  = Vector(pos.x, pos.y, pos.z + 100),
+        endpos = Vector(pos.x, pos.y, pos.z - 32768),
+        filter = function(e) return e:IsWorld() end,
+        mask   = MASK_SOLID_BRUSHONLY,
+    })
+    if tr.Hit then return tr.HitPos.z end
+    return -1
 end
 
-function ENT:CrashExplode()
-    if self.TumbleCrashed then return end
-    self.TumbleCrashed = true
-    local pos = self:GetPos()
-    local e1=EffectData() e1:SetOrigin(pos) e1:SetScale(6) e1:SetMagnitude(6) e1:SetRadius(600) util.Effect("HelicopterMegaBomb",e1,true,true)
-    local e2=EffectData() e2:SetOrigin(pos) e2:SetScale(5) e2:SetMagnitude(5) e2:SetRadius(500) util.Effect("500lb_air",e2,true,true)
-    local e3=EffectData() e3:SetOrigin(pos+Vector(0,0,80)) e3:SetScale(4) e3:SetMagnitude(4) e3:SetRadius(400) util.Effect("500lb_air",e3,true,true)
-    sound.Play("ambient/explosions/explode_8.wav", pos, 140, 90, 1.0)
-    sound.Play("weapon_AWP.Single", pos, 145, 60, 1.0)
-    util.BlastDamage(self, self, pos, 400, 200)
-    self:Remove()
-end
-
-function ENT:DestroyUAV()
-    if self.IsDestroyed then return end
-    self.IsDestroyed = true
-    if self.EngineLoop then
-        self.EngineLoop:ChangeVolume(0, 0.3)
-        timer.Simple(0.4, function()
-            if self.EngineLoop then self.EngineLoop:Stop() end
-        end)
-    end
-    self:StartTumble()
-    timer.Simple(12, function()
-        if IsValid(self) then self:CrashExplode() end
-    end)
-end
-
-function ENT:Debug(msg) print("[Bombin C-17] " .. tostring(msg)) end
-
-function ENT:UpdateTrackedTarget(ct)
-    if ct < (self.NextTargetRefresh or 0) and IsValid(self.TargetEnt) then return self.TargetEnt end
-
+-- ============================================================
+-- TARGET TRACKING
+-- ============================================================
+function ENT:RefreshTarget(ct)
+    if ct < self.NextTargetRefresh then return self.TargetEnt end
     self.NextTargetRefresh = ct + TARGET_REACQUIRE_INTERVAL
 
     local closest, closestDist = nil, math.huge
@@ -324,367 +293,326 @@ function ENT:UpdateTrackedTarget(ct)
     return closest
 end
 
-function ENT:GetTargetOrbitCenter(ct)
-    local target = self:UpdateTrackedTarget(ct)
-    local desiredCenter = Vector(self.CenterPos.x, self.CenterPos.y, self.CenterPos.z)
+-- ============================================================
+-- ORBIT PHYSICS
+-- ============================================================
+function ENT:UpdateOrbit(ct, dt)
+    local phys = self.PhysObj
+    if not IsValid(phys) then
+        self.PhysObj = self:GetPhysicsObject()
+        phys = self.PhysObj
+    end
+    if not IsValid(phys) then return end
+    if phys:IsAsleep() then phys:Wake() end
 
+    -- Dynamic centre wander
+    self.WanderPhaseX = self.WanderPhaseX + self.WanderRateX
+    self.WanderPhaseY = self.WanderPhaseY + self.WanderRateY
+    self.DynamicCenterPos.x = self.BaseCenterPos.x + math.sin(self.WanderPhaseX) * self.WanderAmp
+    self.DynamicCenterPos.y = self.BaseCenterPos.y + math.cos(self.WanderPhaseY) * self.WanderAmp
+
+    -- Target-based centre pull
+    local target = self:RefreshTarget(ct)
     if IsValid(target) then
-        local tpos = target:GetPos()
-        local tvel = target.GetVelocity and target:GetVelocity() or Vector(0,0,0)
-        tvel.z = 0
-        local lookAhead = math.min(tvel:Length() * TARGET_LOOKAHEAD_TIME, TARGET_MAX_LOOKAHEAD_DIST)
-        desiredCenter = tpos + tvel:GetNormalized() * lookAhead
-        desiredCenter.z = tpos.z
-        self.TargetVel = tvel
-        self.LastTargetSampleTime = ct
+        local tPos = target:GetPos()
+        local tVelNow = target:GetVelocity()
+        local lookahead = math.min(tVelNow:Length() * TARGET_LOOKAHEAD_TIME, TARGET_MAX_LOOKAHEAD_DIST)
+        local predictedPos = tPos + tVelNow:GetNormalized() * lookahead
+        local biasFwd = Angle(0, self.flightYaw, 0):Forward() * (self.OrbitRadius * TARGET_PASS_BIAS)
+        local desiredCenter = Vector(
+            predictedPos.x + biasFwd.x,
+            predictedPos.y + biasFwd.y,
+            self.DynamicCenterPos.z
+        )
+        self.DynamicCenterPos.x = Lerp(TARGET_CENTER_LERP, self.DynamicCenterPos.x, desiredCenter.x)
+        self.DynamicCenterPos.y = Lerp(TARGET_CENTER_LERP, self.DynamicCenterPos.y, desiredCenter.y)
     end
 
-    self.DynamicCenterPos = LerpVector(TARGET_CENTER_LERP, self.DynamicCenterPos or desiredCenter, desiredCenter)
-    self.CenterPos = self.DynamicCenterPos
-    return self.DynamicCenterPos, target
+    -- Advance orbit angle
+    self.OrbitAngle = self.OrbitAngle + self.OrbitAngSpeed * dt
+
+    local desX = self.DynamicCenterPos.x + math.cos(self.OrbitAngle) * self.OrbitRadius
+    local desY = self.DynamicCenterPos.y + math.sin(self.OrbitAngle) * self.OrbitRadius
+
+    -- Altitude drift
+    if ct >= self.AltDriftNextPick then
+        self.AltDriftNextPick = ct + math.Rand(12, 30)
+        self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
+    end
+    self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
+
+    -- Jitter
+    self.JitterPhase = self.JitterPhase + dt * 1.3
+    local jitterZ = math.sin(self.JitterPhase) * self.JitterAmplitude
+
+    local desZ  = self.AltDriftCurrent + jitterZ
+    local curPos = self:GetPos()
+    local velZ  = math.Clamp((desZ - curPos.z) * 8, -120, 120)
+
+    -- Sky clearance raycast
+    if ct - self.SkyProbeLastHit > 0.3 then
+        local fwd = Angle(0, self.flightYaw, 0):Forward()
+        local probeEnd = curPos + fwd * self.SkyProbeDist
+        local tr = util.TraceLine({
+            start  = curPos,
+            endpos = probeEnd,
+            filter = function(e) return e ~= self end,
+            mask   = MASK_SOLID_BRUSHONLY,
+        })
+        if tr.Hit then
+            self.SkyYawBias   = self.SkyYawBias + (30 * self.OrbitDirection * dt)
+            self.SkyProbeLastHit = ct
+        else
+            self.SkyYawBias = self.SkyYawBias * (1 - dt * 0.3)
+        end
+    end
+
+    local desiredYaw  = math.deg(self.OrbitAngle + (math.pi / 2) * self.OrbitDirection) + self.SkyYawBias
+    local prevYaw     = self.flightYaw
+    self.flightYaw    = desiredYaw
+
+    -- Angular velocity for bank calculation
+    local yawDelta    = math.NormalizeAngle(desiredYaw - prevYaw)
+    local turnRate    = yawDelta / math.max(dt, 0.001)
+    self.PrevTurnRate = Lerp(0.15, self.PrevTurnRate, turnRate)
+
+    local targetRoll  = -math.Clamp(self.PrevTurnRate * ROLL_SUSTAINED_GAIN + turnRate * ROLL_TRANSIENT_GAIN, -ROLL_MAX, ROLL_MAX)
+    local rollLerp    = (math.abs(targetRoll) > math.abs(self.SmoothedRoll)) and ROLL_LERP_IN or ROLL_LERP_OUT
+    self.SmoothedRoll = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
+
+    local curVel  = phys:GetVelocity()
+    local desVelX = math.cos(math.rad(desiredYaw)) * self.Speed
+    local desVelY = math.sin(math.rad(desiredYaw)) * self.Speed
+    local newVel  = Vector(
+        Lerp(0.12, curVel.x, desVelX),
+        Lerp(0.12, curVel.y, desVelY),
+        velZ
+    )
+    phys:SetVelocity(newVel)
+
+    self.ang = Angle(-self.SmoothedRoll, self.flightYaw + MODEL_YAW_OFFSET, -self.SmoothedPitch)
+    self:SetAngles(self.ang)
 end
 
 -- ============================================================
--- WEAPON SYSTEM STATE MACHINE
+-- FADE-IN
 -- ============================================================
-
-function ENT:PickNewWeapon(ct)
-    self.IsPeaceful    = true
-    self.PeacefulUntil = ct + math.Rand(CFG_PeacefulMin, CFG_PeacefulMax)
-    self.CurrentWeapon = nil
-
-    local choice = WEAPON_ROSTER[math.random(#WEAPON_ROSTER)]
-
-    timer.Simple(self.PeacefulUntil - ct, function()
-        if not IsValid(self) or self.IsDestroyed then return end
-        self.IsPeaceful      = false
-        self.CurrentWeapon   = choice
-        self.WPN_ShotsFired  = 0
-        self.WPN_NextShot    = CurTime()
-        self.WPN_MuzzleIndex = 1
-        self:Debug("Armed: " .. choice)
-    end)
-
-    self:Debug("Peaceful until +" .. string.format("%.1f", self.PeacefulUntil - ct) .. "s, next=" .. choice)
+function ENT:UpdateFade(dt)
+    if not self.FadeIn then return end
+    self.FadeAlpha = math.min(self.FadeAlpha + dt / self.FadeDuration * 255, 255)
+    self:SetColor(Color(255, 255, 255, math.floor(self.FadeAlpha)))
+    if self.FadeAlpha >= 255 then
+        self:SetRenderMode(RENDERMODE_NORMAL)
+        self.FadeIn = false
+    end
 end
 
-function ENT:HandleWeaponSystem(ct)
-    if self.CurrentWeapon == nil and not self.IsPeaceful then
-        self:PickNewWeapon(ct)
+-- ============================================================
+-- WEAPON SYSTEM
+-- ============================================================
+function ENT:PickNewWeapon()
+    if #WEAPON_ROSTER == 0 then return end
+    local w = WEAPON_ROSTER[math.random(#WEAPON_ROSTER)]
+    if w == "jassm" and self.JASSM_Stock <= 0 then
+        w = WEAPON_ROSTER[math.random(#WEAPON_ROSTER)]
+    end
+    self.WPN_Active     = w
+    self.WPN_ShotsFired = 0
+    self.WPN_NextShot   = CurTime()
+    self.WPN_WindowEnd  = CurTime() + 12
+    self:Debug("Weapon window: " .. w)
+end
+
+function ENT:UpdateWeapons(ct)
+    if ct < self.WPN_PeaceUntil then return end
+
+    if not self.WPN_Active then
+        self:PickNewWeapon()
         return
     end
 
-    if self.IsPeaceful then return end
+    if ct > self.WPN_WindowEnd then
+        self.WPN_Active = nil
+        self.WPN_PeaceUntil = ct + math.Rand(CFG_PeacefulMin, CFG_PeacefulMax)
+        return
+    end
 
-    if self.CurrentWeapon == nil then return end
-
+    local w    = self.WPN_Active
     local done = false
-    local w = self.CurrentWeapon
 
     if     w == "jassm"    then done = self:UpdateJASSM(ct)
     elseif w == "heavy"    then done = self:UpdateHeavy(ct)
     elseif w == "gbu53"    then done = self:UpdateGBU53(ct)
     elseif w == "retarded" then done = self:UpdateRetarded(ct)
-    else
-        self:Debug("Unknown weapon '" .. tostring(w) .. "', resetting")
-        done = true
     end
 
     if done then
-        self:PickNewWeapon(ct)
+        self.WPN_Active = nil
+        self.WPN_PeaceUntil = ct + math.Rand(CFG_PeacefulMin, CFG_PeacefulMax)
     end
 end
 
 -- ============================================================
--- THINK / PHYSICS UPDATE
+-- THINK
 -- ============================================================
 function ENT:Think()
-    if not self.DieTime or not self.SpawnTime then
-        self:NextThink(CurTime()+0.1) return true
-    end
+    if not self.DieTime then self:NextThink(CurTime() + 0.1) return true end
+
     local ct = CurTime()
-
-    if self.IsTumbling and not self.TumbleCrashed then
-        local pos = self:GetPos()
-        if pos.z <= (self.TumbleGroundZ or -16384)+150 then self:CrashExplode() return end
-        local tr = util.TraceLine({start=pos, endpos=pos+Vector(0,0,-200), filter=self})
-        if tr.HitWorld then self:CrashExplode() return end
-        self:NextThink(ct+0.05) return true
+    if ct >= self.DieTime then
+        self:DestroyPlane()
+        return
     end
 
-    if ct >= self.DieTime then self:Remove() return end
-    if not IsValid(self.PhysObj) then self.PhysObj = self:GetPhysicsObject() end
-    if IsValid(self.PhysObj) and self.PhysObj:IsAsleep() then self.PhysObj:Wake() end
+    local dt = FrameTime()
+    if dt <= 0 then dt = 0.015 end
 
-    local age  = ct - self.SpawnTime
-    local left = self.DieTime - ct
-    local alpha = 255
-    if age  < self.FadeDuration then alpha = math.Clamp(255*(age /self.FadeDuration),0,255)
-    elseif left < self.FadeDuration then alpha = math.Clamp(255*(left/self.FadeDuration),0,255) end
-    self:SetColor(Color(255,255,255,math.Round(alpha)))
-
-    if not self.IsDestroyed then
-        self:HandleWeaponSystem(ct)
+    if self.Destroyed then
+        self:NextThink(ct + 0.05)
+        return true
     end
 
-    self:NextThink(ct)
+    self:UpdateFade(dt)
+    self:UpdateOrbit(ct, dt)
+    self:UpdateWeapons(ct)
+
+    self:NextThink(ct + 0.015)
     return true
 end
 
-function ENT:PhysicsUpdate(phys)
-    if not self.DieTime or not self.sky then return end
+function ENT:PhysicsUpdate(phys, dt)
+    -- Keep physics object awake; actual velocity driven in UpdateOrbit
+end
 
-    if self.IsTumbling then
-        if self.TumbleCrashed then return end
-        local dt  = engine.TickInterval()
-        self.TumbleVelocity.z = self.TumbleVelocity.z + physenv.GetGravity().z * dt
-        local pos    = self:GetPos()
-        local newPos = pos + self.TumbleVelocity * dt
-        local av     = self.TumbleAngVelocity
-        self.ang = Angle(self.ang.p+av.x*dt, self.ang.y+av.y*dt, self.ang.r+av.z*dt)
-        self:SetPos(newPos) self:SetAngles(self.ang)
-        if IsValid(phys) then phys:SetPos(newPos) phys:SetAngles(self.ang) end
-        return
+-- ============================================================
+-- DAMAGE
+-- ============================================================
+function ENT:OnTakeDamage(dmginfo)
+    if self.Destroyed then return end
+    local dmg = dmginfo:GetDamage()
+    self.HP = math.max(self.HP - dmg, 0)
+    self:SetNWInt("HP", self.HP)
+
+    local tier = CalcTier(self.HP, self.MaxHP)
+    if tier ~= self.DamageTier then
+        self.DamageTier = tier
+        BroadcastTier(self, tier)
     end
 
-    if CurTime() >= self.DieTime then self:Remove() return end
+    if self.HP <= 0 then
+        self:DestroyPlane()
+    end
+end
+
+-- ============================================================
+-- DESTROY
+-- ============================================================
+function ENT:DestroyPlane()
+    if self.Destroyed then return end
+    self.Destroyed = true
+    self:SetNWBool("Destroyed", true)
+    BroadcastTier(self, 3)
+
+    if self.EngineSound then
+        self.EngineSound:Stop()
+        self.EngineSound = nil
+    end
 
     local pos = self:GetPos()
-    local dt  = engine.TickInterval()
+    local expEd = EffectData()
+    expEd:SetOrigin(pos)
+    expEd:SetScale(4)
+    util.Effect("HelicopterMegaBomb", expEd, true, true)
+    sound.Play("ambient/explosions/explode_8.wav", pos, 145, 90, 1.0)
 
-    if CurTime() >= self.AltDriftNextPick then
-        self.AltDriftTarget   = self.sky - math.Rand(0, self.AltDriftRange)
-        self.AltDriftNextPick = CurTime() + math.Rand(12, 30)
-    end
-    self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
-    self.JitterPhase = self.JitterPhase + 0.02
-    local liveAlt = math.Clamp(
-        self.AltDriftCurrent + math.sin(self.JitterPhase) * self.JitterAmplitude,
-        self.sky - self.AltDriftRange, self.sky
-    )
-
-    local dynamicCenter = self:GetTargetOrbitCenter(CurTime())
-    local flatPos    = Vector(pos.x, pos.y, 0)
-    local flatCenter = Vector(dynamicCenter.x, dynamicCenter.y, 0)
-    local toCenter   = flatCenter - flatPos
-    local dist       = toCenter:Length()
-
-    local radialDir  = (dist > 1) and (toCenter / dist) or Vector(0,0,0)
-    local tangentDir = Vector(
-        -radialDir.y * self.OrbitDirection,
-         radialDir.x * self.OrbitDirection,
-        0
-    )
-    if tangentDir:LengthSqr() < 0.001 then
-        local fb = Angle(0, self.flightYaw, 0):Forward()
-        tangentDir = Vector(fb.x, fb.y, 0)
-    end
-    tangentDir:Normalize()
-
-    local targetBiasDir = radialDir
-    local target = self.TargetEnt
-    if IsValid(target) then
-        local targetFlat = Vector(target:GetPos().x, target:GetPos().y, 0)
-        local toTarget = targetFlat - flatPos
-        if toTarget:LengthSqr() > 1 then
-            targetBiasDir = toTarget:GetNormalized()
+    -- Debris
+    local debrisModels = {
+        "models/props_c17/FurnitureDrawer001a.mdl",
+        "models/props_c17/FurnitureCouch001a.mdl",
+    }
+    for i = 1, 4 do
+        local deb = ents.Create("prop_physics")
+        if IsValid(deb) then
+            deb:SetModel(debrisModels[math.random(#debrisModels)])
+            deb:SetPos(pos + Vector(math.Rand(-200, 200), math.Rand(-200, 200), math.Rand(-100, 100)))
+            deb:SetAngles(Angle(math.Rand(0,360), math.Rand(0,360), math.Rand(0,360)))
+            deb:Spawn()
+            deb:Activate()
+            local dp = deb:GetPhysicsObject()
+            if IsValid(dp) then
+                dp:SetVelocity(Vector(math.Rand(-300,300), math.Rand(-300,300), math.Rand(100,400)))
+            end
+            timer.Simple(8, function() if IsValid(deb) then deb:Remove() end end)
         end
     end
 
-    local radialError = 0
-    if self.OrbitRadius > 0 then
-        radialError = math.Clamp((dist - self.OrbitRadius) / self.OrbitRadius, -1, 1)
-    end
-
-    local desired2 = Vector(
-        tangentDir.x + radialDir.x * radialError * self.RadialGain + targetBiasDir.x * TARGET_PASS_BIAS,
-        tangentDir.y + radialDir.y * radialError * self.RadialGain + targetBiasDir.y * TARGET_PASS_BIAS,
-        0
-    )
-    if desired2:LengthSqr() < 0.001 then desired2 = tangentDir end
-    desired2:Normalize()
-
-    local fwdAngle = Angle(0, self.flightYaw, 0)
-    local fwd3     = fwdAngle:Forward()
-    local fwd2     = Vector(fwd3.x, fwd3.y, 0)
-    if fwd2:LengthSqr() > 0 then fwd2:Normalize() end
-
-    local cross    = fwd2.x * desired2.y - fwd2.y * desired2.x
-    local dot      = math.Clamp(fwd2.x * desired2.x + fwd2.y * desired2.y, -1, 1)
-    local urgency  = 0.35 + (1 - dot) * 0.65
-    local turnRate = math.Clamp(
-        cross * urgency * self.MaxTurnRate * 2,
-        -self.MaxTurnRate, self.MaxTurnRate
-    )
-
-    self.flightYaw      = self.flightYaw + turnRate * dt
-    local turnRateDelta = turnRate - self.PrevTurnRate
-    self.PrevTurnRate   = turnRate
-
-    local sustained  = math.Clamp(turnRate      * ROLL_SUSTAINED_GAIN, -20, 20)
-    local transient  = math.Clamp(turnRateDelta * ROLL_TRANSIENT_GAIN, -12, 12)
-    local rollTarget = math.Clamp(sustained + transient, -ROLL_MAX, ROLL_MAX)
-
-    local building = (rollTarget * self.SmoothedRoll >= 0)
-                     and (math.abs(rollTarget) > math.abs(self.SmoothedRoll))
-    self.SmoothedRoll = Lerp(building and ROLL_LERP_IN or ROLL_LERP_OUT, self.SmoothedRoll, rollTarget)
-
-    local climbDelta   = math.Clamp((liveAlt - pos.z) / 400, -1, 1)
-    local targetPitch  = math.Clamp(climbDelta * 6, -8, 8)
-    self.SmoothedPitch = Lerp(0.03, self.SmoothedPitch, targetPitch)
-
-    self.ang = Angle(
-        -self.SmoothedRoll,
-        self.flightYaw + MODEL_YAW_OFFSET,
-        -self.SmoothedPitch
-    )
-
-    local newPos = pos + fwdAngle:Forward() * self.Speed * dt
-    newPos.z     = Lerp(0.07, pos.z, liveAlt)
-
-    if not util.IsInWorld(newPos) then
-        self:Debug("OOB guard - steering to center")
-        local toC = flatCenter - Vector(pos.x, pos.y, 0)  toC.z = 0
-        if toC:LengthSqr() < 0.001 then toC = Vector(-fwd2.x, -fwd2.y, 0) end
-        toC:Normalize()
-        local sCross = fwd2.x*toC.y - fwd2.y*toC.x
-        self.flightYaw = self.flightYaw
-            + math.Clamp(sCross * self.MaxTurnRate, -self.MaxTurnRate, self.MaxTurnRate) * dt
-        self:SetPos(pos)
-        self:SetAngles(Angle(-self.SmoothedRoll, self.flightYaw+MODEL_YAW_OFFSET, -self.SmoothedPitch))
-        return
-    end
-
-    self:SetPos(newPos)
-    self:SetAngles(self.ang)
+    timer.Simple(3.0, function()
+        if IsValid(self) then self:Remove() end
+    end)
 end
 
 -- ============================================================
--- TARGET ACQUISITION
+-- REMOVE
 -- ============================================================
-function ENT:GetPrimaryTarget()
-    local target = self:UpdateTrackedTarget(CurTime())
-    if IsValid(target) then return target end
-
-    local closest, closestDist = nil, math.huge
-    local selfPos = self:GetPos()
-    for _, ply in ipairs(player.GetAll()) do
-        if not IsValid(ply) or not ply:Alive() then continue end
-        local d = ply:GetPos():DistToSqr(selfPos)
-        if d < closestDist then closestDist = d  closest = ply end
+function ENT:OnRemove()
+    if self.EngineSound then
+        self.EngineSound:Stop()
+        self.EngineSound = nil
     end
-    return closest
-end
-
-function ENT:GetDirectTarget(scatter)
-    scatter = scatter or 0
-    local target = self:GetPrimaryTarget()
-    local base
-    if IsValid(target) then
-        base = target:GetPos()
-        local tvel = target.GetVelocity and target:GetVelocity() or Vector(0,0,0)
-        local dist = self:GetPos():Distance(base)
-        local travelTime = dist / DART_SPEED
-        base = base + tvel * travelTime
-        base.z = target:GetPos().z
-    else
-        local tr = util.QuickTrace(
-            Vector(self.CenterPos.x, self.CenterPos.y, self.sky),
-            Vector(0,0,-30000), self)
-        base = tr.HitPos
-    end
-    if scatter > 0 then
-        base = base + Vector(
-            math.Rand(-scatter, scatter),
-            math.Rand(-scatter, scatter),
-            0
-        )
-    end
-    return base
-end
-
-function ENT:GetAimedGroundPos(scatter)
-    scatter = scatter or 0
-    local target = self:GetPrimaryTarget()
-    local base
-    if IsValid(target) then
-        local dropPos   = self:LocalToWorld(CFG_BombBayLocal)
-        local targetPos = target:GetPos()
-        local targetVel = target.GetVelocity and target:GetVelocity() or Vector(0,0,0)
-        targetVel.z = 0
-        local H        = math.max(dropPos.z - targetPos.z, 100)
-        local fallTime = math.sqrt(2 * H / GRAVITY_EST)
-        base   = targetPos + targetVel * fallTime
-        base.z = targetPos.z
-    else
-        local tr = util.QuickTrace(
-            Vector(self.CenterPos.x, self.CenterPos.y, self.sky),
-            Vector(0,0,-30000), self)
-        base = tr.HitPos
-    end
-    if scatter > 0 then
-        base = base + Vector(
-            math.Rand(-scatter, scatter),
-            math.Rand(-scatter, scatter),
-            0
-        )
-    end
-    return base
 end
 
 -- ============================================================
--- DART VELOCITY SOLVER
+-- BOMB HELPERS
 -- ============================================================
 local function CalcDartVelocity(dropPos, targetPos)
     local dir = targetPos - dropPos
-    if dir:LengthSqr() < 1 then return Vector(0, 0, -DART_SPEED) end
-    dir:Normalize()
-    return dir * DART_SPEED
+    local H   = math.max(dropPos.z - targetPos.z, 100)
+    local hDist = Vector(dir.x, dir.y, 0):Length()
+    local tFall = math.sqrt(2 * H / GRAVITY_EST)
+    local hSpeed = (hDist > 0) and math.min(hDist / math.max(tFall, 0.1), DART_SPEED) or 0
+    local hDir   = Vector(dir.x, dir.y, 0):GetNormalized()
+    return Vector(hDir.x * hSpeed, hDir.y * hSpeed, 0)
 end
-
--- ============================================================
--- CARPET BALLISTIC SOLVER (unused after W3 replaced, kept for W6 if needed)
--- ============================================================
-local CARPET_SPEED_MIN = 150
-local CARPET_SPEED_MAX = 3200
 
 local function CalcCarpetImpulse(dropPos, aimPos, aircraftFwdVel)
-    local H        = math.max(dropPos.z - aimPos.z, 100)
-    local fallTime = math.sqrt(2 * H / GRAVITY_EST)
+    local H  = math.max(dropPos.z - aimPos.z, 100)
+    local tF = math.sqrt(2 * H / GRAVITY_EST)
     local dx = aimPos.x - dropPos.x
     local dy = aimPos.y - dropPos.y
-    local lateralDist = math.sqrt(dx*dx + dy*dy)
-    local reqSpeed = math.Clamp(lateralDist / fallTime, CARPET_SPEED_MIN, CARPET_SPEED_MAX)
-    local dir
-    if lateralDist > 1 then
-        dir = Vector(dx / lateralDist, dy / lateralDist, 0)
-    else
-        local a = math.Rand(0, math.pi * 2)
-        dir = Vector(math.cos(a), math.sin(a), 0)
-    end
-    local vel = dir * reqSpeed
-    vel.x = vel.x + aircraftFwdVel.x
-    vel.y = vel.y + aircraftFwdVel.y
-    vel.z = -60
-    return vel
+    local hDist = math.sqrt(dx*dx + dy*dy)
+    if hDist < 1 then return Vector(0,0,0) end
+    local hSpeed = hDist / math.max(tF, 0.1)
+    hSpeed = math.min(hSpeed, DART_SPEED)
+    local hDir = Vector(dx, dy, 0):GetNormalized()
+    return Vector(hDir.x * hSpeed, hDir.y * hSpeed, 0)
 end
 
--- ============================================================
--- SPAWN HELPERS
--- ============================================================
+function ENT:GetAimPos(scatter)
+    scatter = scatter or 0
+    local target = self:RefreshTarget(CurTime())
+    if IsValid(target) then
+        local p = target:GetPos()
+        if scatter > 0 then
+            p = p + Vector(math.Rand(-scatter, scatter), math.Rand(-scatter, scatter), 0)
+        end
+        return p
+    end
+    local cp = self.CenterPos
+    if scatter > 0 then
+        cp = cp + Vector(math.Rand(-scatter * 3, scatter * 3), math.Rand(-scatter * 3, scatter * 3), 0)
+    end
+    return cp
+end
+
 function ENT:SpawnDartBomb(entClass, dropPos, targetPos, isRetarded)
     local bomb = ents.Create(entClass)
     if not IsValid(bomb) then
-        self:Debug("WARN: failed to create '" .. tostring(entClass) .. "'")
-        return nil
+        self:Debug("SpawnDartBomb: class not found: " .. tostring(entClass))
+        return
     end
-    bomb.IsOnPlane = true
-    bomb.Launcher  = self
-    bomb:SetOwner(self)
     local toTarget = targetPos - dropPos
     local dropAng
-    if toTarget:LengthSqr() > 1 then
-        toTarget:Normalize()
+    if toTarget:Length() > 10 then
         dropAng = toTarget:Angle()
     else
         dropAng = Angle(90, 0, 0)
@@ -693,48 +621,31 @@ function ENT:SpawnDartBomb(entClass, dropPos, targetPos, isRetarded)
     bomb:SetAngles(dropAng)
     bomb:Spawn()
     bomb:Activate()
-    if isRetarded then bomb:SetBodygroup(1, 1) end
-    if bomb.Arm then bomb:Arm()
-    elseif bomb.Armed ~= nil then bomb.Armed = true end
     local bPhys = bomb:GetPhysicsObject()
     if IsValid(bPhys) then
-        bPhys:SetVelocity(CalcDartVelocity(dropPos, targetPos))
+        if isRetarded then
+            bPhys:SetVelocity(CalcCarpetImpulse(dropPos, targetPos, Angle(0, self.flightYaw, 0):Forward() * self.Speed))
+        else
+            bPhys:SetVelocity(CalcDartVelocity(dropPos, targetPos))
+        end
     end
-    constraint.NoCollide(bomb, self, 0, 0)
-    local ref = bomb
-    timer.Simple(0.6, function()
-        if IsValid(ref) and IsValid(self) then constraint.RemoveConstraints(ref, "NoCollide") end
-    end)
-    return bomb
 end
 
 function ENT:SpawnCarpetBomb(entClass, dropPos, aimPos)
     local bomb = ents.Create(entClass)
     if not IsValid(bomb) then
-        self:Debug("WARN: failed to create '" .. tostring(entClass) .. "'")
-        return nil
+        self:Debug("SpawnCarpetBomb: class not found: " .. tostring(entClass))
+        return
     end
-    bomb.IsOnPlane = true
-    bomb.Launcher  = self
-    bomb:SetOwner(self)
     bomb:SetPos(dropPos)
-    bomb:SetAngles(Angle(90, 0, 0))
+    bomb:SetAngles(Angle(90, self.flightYaw, 0))
     bomb:Spawn()
     bomb:Activate()
-    if bomb.Arm then bomb:Arm()
-    elseif bomb.Armed ~= nil then bomb.Armed = true end
     local bPhys = bomb:GetPhysicsObject()
     if IsValid(bPhys) then
         local aircraftFwd = Angle(0, self.flightYaw, 0):Forward() * self.Speed
-        aircraftFwd.z = 0
         bPhys:SetVelocity(CalcCarpetImpulse(dropPos, aimPos, aircraftFwd))
     end
-    constraint.NoCollide(bomb, self, 0, 0)
-    local ref = bomb
-    timer.Simple(0.6, function()
-        if IsValid(ref) and IsValid(self) then constraint.RemoveConstraints(ref, "NoCollide") end
-    end)
-    return bomb
 end
 
 -- ============================================================
@@ -762,6 +673,7 @@ function ENT:SpawnOneJASSM(dropIndex)
 
     missile:SetPos(dropPos)
     missile:SetAngles(Angle(0, self.flightYaw, 0))
+    missile.SpawnedFromPlane = true  -- FIX: tell the missile to use the tail pos we just set
     missile:Spawn()
     missile:Activate()
 
@@ -781,7 +693,7 @@ function ENT:SpawnOneJASSM(dropIndex)
     local chute = ents.Create("ent_bombin_jassm_chute_owned")
     if IsValid(chute) then
         chute:SetVar("MissileEnt", missile)
-        chute:SetOwner(self)
+        chute:SetOwner(missile)  -- FIX: chute tracks the missile, not the plane
         chute:SetPos(dropPos + Vector(0, 0, 105))
         chute:SetAngles(Angle(0, self.flightYaw, 0))
         chute:Spawn()
@@ -817,21 +729,20 @@ function ENT:UpdateHeavy(ct)
     if ct < self.WPN_NextShot then return false end
     self.WPN_NextShot   = ct + CFG_W2_Delay
     self.WPN_ShotsFired = self.WPN_ShotsFired + 1
-    local entClass   = CFG_W2_Pool[math.random(#CFG_W2_Pool)]
-    local dropPos    = self:LocalToWorld(CFG_BombBayLocal)
-    local targetPos  = self:GetDirectTarget(CFG_W2_Scatter)
-    local isRetarded = string.find(entClass, "_air_v3", 1, true) ~= nil
-    self:SpawnDartBomb(entClass, dropPos, targetPos, isRetarded)
-    self:Debug("W2 HEAVY " .. self.WPN_ShotsFired .. "/" .. CFG_W2_Count .. " " .. entClass)
+
+    local entClass = CFG_W2_Pool[math.random(#CFG_W2_Pool)]
+    local dropPos   = self:LocalToWorld(CFG_BombBayLocal)
+    local targetPos = self:GetAimPos(CFG_W2_Scatter)
+    self:SpawnDartBomb(entClass, dropPos, targetPos, false)
     return (self.WPN_ShotsFired >= CFG_W2_Count)
 end
 
 -- ============================================================
 -- W3: GBU-53 PARACHUTE CLUSTER DROP
--- Spawns ent_bombin_gbu53_chute_owned: a metal palette loaded with
--- 4x GBU-53 munitions, with a parachute riding above.
--- The chute/palette assembly freefalls and detaches at ignition;
--- each GBU-53 then loiters autonomously (same pattern as the JASSM W1).
+--
+-- Spawns ent_bombin_gbu53_owned: the missile/loiter unit that
+-- internally manages its own chute+palette assembly via SpawnChute().
+-- Each GBU-53 freefalls, ignites at altitude, then loiters and dives.
 --
 -- Dependency: ent_bombin_gbu53_owned + ent_bombin_gbu53_chute_owned
 -- from NachinBombin/Current-Ac-Model.
@@ -845,34 +756,38 @@ function ENT:SpawnOneGBU53Pallet(palletIndex)
     local dropPos = self:LocalToWorld(CFG_W3_DropOffset)
     dropPos.z = self:GetPos().z - CFG_W3_BodyClearance - (palletIndex * CFG_W3_AltStagger)
 
-    -- The chute entity IS the palette: it owns the 4 munitions as sub-props
-    -- and carries the visual parachute 90u above itself.
-    local pallet = ents.Create("ent_bombin_gbu53_chute_owned")
+    -- FIX: spawn ent_bombin_gbu53_owned (the missile/loiter unit).
+    -- ent_bombin_gbu53_owned handles its own chute via SpawnChute() internally,
+    -- so spawning ent_bombin_gbu53_chute_owned directly here was wrong:
+    -- the chute's Think() calls GetOwner() expecting a GBU53 missile entity,
+    -- not the C17 plane, causing it to latch onto and follow the aircraft.
+    local pallet = ents.Create("ent_bombin_gbu53_owned")
     if not IsValid(pallet) then
-        self:Debug("W3 GBU53: ent_bombin_gbu53_chute_owned not found - is Current-Ac-Model installed?")
+        self:Debug("W3 GBU53: ent_bombin_gbu53_owned not found - is Current-Ac-Model installed?")
         return
     end
 
-    -- Forward all orbit / ignition parameters so the sub-munitions know
-    -- where to loiter after the chute releases them.
     pallet:SetVar("CenterPos",    self.CenterPos)
     pallet:SetVar("CallDir",      Angle(0, self.flightYaw, 0):Forward())
     pallet:SetVar("SkyHeightAdd", self.SkyHeightAdd)
     pallet:SetVar("OrbitRadius",  self.OrbitRadius)
+    pallet:SetVar("Speed",        self.Speed)
     pallet:SetOwner(self)
-    pallet.IsOnPlane = true
-    pallet.Launcher  = self
+    pallet.IsOnPlane      = true
+    pallet.Launcher       = self
+    pallet.SpawnedFromPlane = true  -- tells gbu53_owned to use the pos we set, not orbit-entry
 
     pallet:SetPos(dropPos)
     pallet:SetAngles(Angle(0, self.flightYaw, 0))
     pallet:Spawn()
     pallet:Activate()
 
-    local pPhys = pallet:GetPhysicsObject()
-    if IsValid(pPhys) then
+    -- Seed horizontal velocity so the pallet carries the plane's momentum during freefall
+    local mPhys = pallet:GetPhysicsObject()
+    if IsValid(mPhys) then
         local fwdVel = Angle(0, self.flightYaw, 0):Forward() * self.Speed
         fwdVel.z = 0
-        pPhys:SetVelocity(fwdVel)
+        mPhys:SetVelocity(fwdVel)
     end
 
     constraint.NoCollide(pallet, self, 0, 0)
@@ -901,37 +816,26 @@ function ENT:UpdateRetarded(ct)
     if ct < self.WPN_NextShot then return false end
     self.WPN_NextShot   = ct + CFG_W6_Delay
     self.WPN_ShotsFired = self.WPN_ShotsFired + 1
-    local entClass  = CFG_W6_Pool[math.random(#CFG_W6_Pool)]
+
+    local entClass = CFG_W6_Pool[math.random(#CFG_W6_Pool)]
     local dropPos   = self:LocalToWorld(CFG_BombBayLocal)
-    local targetPos = self:GetDirectTarget(CFG_W6_Scatter)
-    self:SpawnDartBomb(entClass, dropPos, targetPos, true)
-    self:Debug("W6 RETARDED " .. self.WPN_ShotsFired .. "/" .. CFG_W6_Count .. " " .. entClass)
+    local aimPos    = self:GetAimPos(CFG_W6_Scatter)
+    self:SpawnDartBomb(entClass, dropPos, aimPos, true)
     return (self.WPN_ShotsFired >= CFG_W6_Count)
 end
 
 -- ============================================================
--- UTILITIES
+-- SETVAR / GETVAR  (simple per-entity key-value store used
+-- before Spawn() to pass init params, mirrors AC-130 pattern)
 -- ============================================================
-function ENT:FindGround(centerPos)
-    local startPos   = Vector(centerPos.x, centerPos.y, centerPos.z+64)
-    local endPos     = Vector(centerPos.x, centerPos.y, -16384)
-    local filterList = {self}
-    local maxIter    = 0
-    while maxIter < 100 do
-        local tr = util.TraceLine({start=startPos, endpos=endPos, filter=filterList})
-        if tr.HitWorld then return tr.HitPos.z end
-        if IsValid(tr.Entity) then table.insert(filterList, tr.Entity)
-        else break end
-        maxIter = maxIter + 1
-    end
-    return -1
+function ENT:SetVar(key, value)
+    self.__vars = self.__vars or {}
+    self.__vars[key] = value
 end
 
-function ENT:OnRemove()
-    if self.EngineLoop then
-        self.EngineLoop:ChangeVolume(0, 0.5)
-        timer.Simple(0.6, function()
-            if self.EngineLoop then self.EngineLoop:Stop() end
-        end)
+function ENT:GetVar(key, default)
+    if self.__vars and self.__vars[key] ~= nil then
+        return self.__vars[key]
     end
+    return default
 end
