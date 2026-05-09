@@ -1,2 +1,0 @@
--- Intentionally empty: manual spawn is handled in npc_bombin_c17.lua
--- (net receiver for BombinC17_ManualSpawn is registered there on SERVER)
