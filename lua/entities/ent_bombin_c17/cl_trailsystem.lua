@@ -1,25 +1,21 @@
 -- ============================================================
 -- CONTRAIL SYSTEM  --  ent_bombin_c17
--- Trail offsets are scaled to match MODEL_SCALE = 1.8.
--- C-17 has 4 engines (2 per wing).
--- Offsets approximate the C-17 under-wing engine pod positions.
--- Original unscaled offsets (1.0x):
---   inner pods ~+/-90 HU, outer pods ~+/-190 HU
--- Scaled 1.8x:
---   inner pods ~+/-162 HU, outer pods ~+/-342 HU
--- Trail ribbon sizes also scaled: startSize 28->50, endSize 8->14.
+-- Trail offsets scaled to MODEL_SCALE = 1.8.
+-- C-17 has 4 engines (2 per wing, under-wing pods).
+-- Unscaled offsets (1.0x): inner ~+/-90 HU, outer ~+/-190 HU
+-- Scaled 1.8x:             inner ~+/-162 HU, outer ~+/-342 HU
+-- Ribbon: startSize 50, endSize 14 (scaled 1.8x from B-52 base).
 -- ============================================================
 
 local TRAIL_MATERIAL = Material( "trails/smoke" )
 local SAMPLE_RATE    = 0.025
 
--- X = wingspan offset, Y = rear of engine pod, Z = slight up
--- All values scaled to match the C-17 model geometry.
+-- X = wingspan offset, Y = rear of engine pod, Z = height
 local TRAIL_OFFSETS = {
-    Vector(  342, -108,  0 ),   -- outer-right engine pod  (190 * 1.8)
-    Vector(  162, -108,  0 ),   -- inner-right engine pod  ( 90 * 1.8)
-    Vector( -162, -108,  0 ),   -- inner-left  engine pod
-    Vector( -342, -108,  0 ),   -- outer-left  engine pod
+    Vector(  342, -108,  0 ),   -- outer-right pod  (190 * 1.8)
+    Vector(  162, -108,  0 ),   -- inner-right pod  ( 90 * 1.8)
+    Vector( -162, -108,  0 ),   -- inner-left  pod
+    Vector( -342, -108,  0 ),   -- outer-left  pod
 }
 
 local CONTRAIL_CFG = {
