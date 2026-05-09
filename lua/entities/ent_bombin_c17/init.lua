@@ -27,14 +27,15 @@ local MODEL_SCALE = 1.8
 -- SW MUNITIONS CATALOGUE
 -- ============================================================
 -- Window IDs (active):
---   W1 "jassm"     -- AGM-158 JASSM parachute drop  (replaces precision)
---   W2 "heavy"     -- heavy GP / penetrators
---   W3 "medium"    -- medium GP carpet bombs
---   W6 "retarded"  -- parachute / retarder bombs
+--   W1 "jassm"   -- AGM-158 JASSM parachute drop
+--   W2 "heavy"   -- heavy GP / penetrators
+--   W3 "gbu53"   -- GBU-53 parachute cluster drop  (replaces old medium carpet)
+--   W6 "retarded"-- parachute / retarder bombs
 --
 -- Removed:
 --   W4 "light"     -- REMOVED
 --   W5 "hellfire"  -- REMOVED
+--   W3 "medium"    -- REPLACED by gbu53
 -- ============================================================
 
 local DART_SPEED  = 4500
@@ -59,12 +60,10 @@ local TARGET_REACQUIRE_INTERVAL  = 0.35
 local TARGET_PASS_BIAS           = 0.55
 
 -- ---------- W1 -- JASSM parachute drop (AC-130 pattern) ----------
--- Spawns ent_bombin_jassm_owned + ent_bombin_jassm_chute_owned
--- identical to how ent_bombin_support_plane:SpawnOneJASSM works.
-local CFG_W1_JASSM_Count      = 1          -- missiles per window (1 clean drop)
-local CFG_W1_JASSM_Delay      = 0          -- delay between missiles if Count>1
-local CFG_W1_JASSM_TailOffset = Vector(-60, 0, 0)   -- local drop point (bomb bay, not tail)
-local CFG_W1_JASSM_SkyAdd     = 0          -- alt offset above self.sky (0 = drop from current altitude)
+local CFG_W1_JASSM_Count      = 1
+local CFG_W1_JASSM_Delay      = 0
+local CFG_W1_JASSM_TailOffset = Vector(-60, 0, 0)
+local CFG_W1_JASSM_SkyAdd     = 0
 
 -- ---------- W2 -- Heavy ordnance ----------
 local CFG_W2_Count   = 2
@@ -81,26 +80,14 @@ local CFG_W2_Pool    = {
     "sw_bomb_anmk1_v3",
 }
 
--- ---------- W3 -- Medium carpet (ballistic drop, spread intended) ----------
-local CFG_W3_Count   = 8
-local CFG_W3_Delay   = 0.4
-local CFG_W3_Scatter = 600
-local CFG_W3_Pool    = {
-    "sw_bomb_mk82_v3",
-    "sw_bomb_mk83_v3",
-    "sw_bomb_mk83_air_v3",
-    "sw_bomb_m117_v3",
-    "sw_bomb_hem32_v3",
-    "sw_bomb_hem31_v3",
-    "sw_bomb_anm64_v3",
-    "sw_bomb_anm65_v3",
-    "sw_bomb_anm65_m129_v3",
-    "sw_bomb_anmk33_v3",
-    "sw_bomb_anm57_v3",
-    "sw_bomb_mk9_v3",
-    "sw_bomb_m62_v3",
-    "sw_bomb_m63_v3",
-}
+-- ---------- W3 -- GBU-53 parachute cluster (replaces medium carpet) ----------
+-- Each "shot" drops one ent_bombin_gbu53_chute_owned:
+--   a metal palette with 4 GBU-53 munitions + a parachute riding above.
+-- The chute detaches at ignition and each GBU-53 loiters independently.
+local CFG_W3_GBU53_Count  = 3          -- pallets per window
+local CFG_W3_GBU53_Delay  = 1.2        -- seconds between pallets
+local CFG_W3_AltStagger   = 400        -- altitude separation per pallet (units)
+local CFG_W3_DropOffset   = Vector(-60, 0, 0)  -- local drop point (bomb bay)
 
 -- ---------- W6 -- Retarded / Parachute bombs ----------
 local CFG_W6_Count   = 6
@@ -114,8 +101,7 @@ local CFG_W6_Pool    = {
 }
 
 -- Weapon roster used by PickNewWeapon
--- W4 "light" and W5 "hellfire" have been removed.
-local WEAPON_ROSTER = { "jassm", "heavy", "medium", "retarded" }
+local WEAPON_ROSTER = { "jassm", "heavy", "gbu53", "retarded" }
 
 -- ============================================================
 -- NETWORK STRING
@@ -396,7 +382,7 @@ function ENT:HandleWeaponSystem(ct)
 
     if     w == "jassm"    then done = self:UpdateJASSM(ct)
     elseif w == "heavy"    then done = self:UpdateHeavy(ct)
-    elseif w == "medium"   then done = self:UpdateMedium(ct)
+    elseif w == "gbu53"    then done = self:UpdateGBU53(ct)
     elseif w == "retarded" then done = self:UpdateRetarded(ct)
     else
         self:Debug("Unknown weapon '" .. tostring(w) .. "', resetting")
@@ -656,7 +642,7 @@ local function CalcDartVelocity(dropPos, targetPos)
 end
 
 -- ============================================================
--- CARPET BALLISTIC SOLVER (W3 only)
+-- CARPET BALLISTIC SOLVER (unused after W3 replaced, kept for W6 if needed)
 -- ============================================================
 local CARPET_SPEED_MIN = 150
 local CARPET_SPEED_MAX = 3200
@@ -751,31 +737,20 @@ function ENT:SpawnCarpetBomb(entClass, dropPos, aimPos)
 end
 
 -- ============================================================
--- W1: JASSM PARACHUTE DROP  (replaces precision guided)
--- Mirrors ent_bombin_support_plane:SpawnOneJASSM exactly:
---   1. Spawn ent_bombin_jassm_owned at drop position, MOVETYPE_NONE, engine off.
---   2. Pass CenterPos / CallDir / SkyHeightAdd so the missile knows its
---      ignition altitude and orbit parameters.
---   3. Spawn ent_bombin_jassm_chute_owned 105 units above the missile.
---      The chute entity self-detaches when missile NWBool "EngineOn" goes true.
+-- W1: JASSM PARACHUTE DROP
 -- ============================================================
 function ENT:SpawnOneJASSM(dropIndex)
     dropIndex = dropIndex or 0
 
-    -- Drop point: bomb bay local offset, at current plane altitude
     local dropPos = self:LocalToWorld(CFG_W1_JASSM_TailOffset)
-    -- Stagger altitude per missile index just like the AC-130 (500 u spacing)
     dropPos.z = self:GetPos().z - (dropIndex * 500)
 
-    -- ---- Missile ----
     local missile = ents.Create("ent_bombin_jassm_owned")
     if not IsValid(missile) then
         self:Debug("W1 JASSM: ent_bombin_jassm_owned not found - is the AC-130 addon installed?")
         return
     end
 
-    -- Pass the same vars the AC-130 passes so the missile can self-calculate
-    -- ignition altitude, orbit, etc.
     missile:SetVar("CenterPos",    self.CenterPos)
     missile:SetVar("CallDir",      Angle(0, self.flightYaw, 0):Forward())
     missile:SetVar("SkyHeightAdd", self.SkyHeightAdd)
@@ -785,40 +760,31 @@ function ENT:SpawnOneJASSM(dropIndex)
     missile.Launcher  = self
 
     missile:SetPos(dropPos)
-    -- Face nose downward, aligned with current flight heading - matches AC-130 drop angle
     missile:SetAngles(Angle(0, self.flightYaw, 0))
     missile:Spawn()
     missile:Activate()
 
-    -- Seed a small forward velocity component matching aircraft momentum
-    -- This is intentional: gives the missile a realistic diagonal release trajectory
-    -- just like when dropped from the AC-130 in motion.
     local mPhys = missile:GetPhysicsObject()
     if IsValid(mPhys) then
         local fwdVel = Angle(0, self.flightYaw, 0):Forward() * self.Speed
-        fwdVel.z = 0  -- missile freefall phase manages Z itself
+        fwdVel.z = 0
         mPhys:SetVelocity(fwdVel)
     end
 
-    -- NoCollide with the plane for the first second of freefall
     constraint.NoCollide(missile, self, 0, 0)
     local mRef = missile
     timer.Simple(1.0, function()
         if IsValid(mRef) and IsValid(self) then constraint.RemoveConstraints(mRef, "NoCollide") end
     end)
 
-    -- ---- Chute ----
-    -- Spawned 105 units above the missile, identical to the AC-130 pattern.
     local chute = ents.Create("ent_bombin_jassm_chute_owned")
     if IsValid(chute) then
-        chute:SetVar("MissileEnt", missile)   -- pass reference if chute uses GetVar
+        chute:SetVar("MissileEnt", missile)
         chute:SetOwner(self)
         chute:SetPos(dropPos + Vector(0, 0, 105))
         chute:SetAngles(Angle(0, self.flightYaw, 0))
         chute:Spawn()
         chute:Activate()
-        -- Tell the chute which missile to track
-        -- (ent_bombin_jassm_chute_owned uses self.MissileEnt in its Think)
         chute.MissileEnt = missile
         constraint.NoCollide(chute, self, 0, 0)
         constraint.NoCollide(chute, missile, 0, 0)
@@ -860,19 +826,73 @@ function ENT:UpdateHeavy(ct)
 end
 
 -- ============================================================
--- W3: MEDIUM CARPET
+-- W3: GBU-53 PARACHUTE CLUSTER DROP
+-- Spawns ent_bombin_gbu53_chute_owned: a metal palette loaded with
+-- 4x GBU-53 munitions, with a parachute riding above.
+-- The chute/palette assembly freefalls and detaches at ignition;
+-- each GBU-53 then loiters autonomously (same pattern as the JASSM W1).
+--
+-- Dependency: ent_bombin_gbu53_owned + ent_bombin_gbu53_chute_owned
+-- from NachinBombin/Current-Ac-Model.
 -- ============================================================
-function ENT:UpdateMedium(ct)
-    if self.WPN_ShotsFired >= CFG_W3_Count then return true end
+function ENT:SpawnOneGBU53Pallet(palletIndex)
+    palletIndex = palletIndex or 0
+
+    -- Drop point: same bomb bay local offset as JASSM, staggered downward
+    -- so successive pallets don't overlap during freefall.
+    local dropPos   = self:LocalToWorld(CFG_W3_DropOffset)
+    dropPos.z       = self:GetPos().z - (palletIndex * CFG_W3_AltStagger)
+
+    -- The chute entity IS the palette: it owns the 4 munitions as sub-props
+    -- and carries the visual parachute 90u above itself.
+    local pallet = ents.Create("ent_bombin_gbu53_chute_owned")
+    if not IsValid(pallet) then
+        self:Debug("W3 GBU53: ent_bombin_gbu53_chute_owned not found - is Current-Ac-Model installed?")
+        return
+    end
+
+    -- Forward all orbit / ignition parameters so the sub-munitions know
+    -- where to loiter after the chute releases them.
+    pallet:SetVar("CenterPos",    self.CenterPos)
+    pallet:SetVar("CallDir",      Angle(0, self.flightYaw, 0):Forward())
+    pallet:SetVar("SkyHeightAdd", self.SkyHeightAdd)
+    pallet:SetVar("OrbitRadius",  self.OrbitRadius)
+    pallet:SetOwner(self)
+    pallet.IsOnPlane = true
+    pallet.Launcher  = self
+
+    pallet:SetPos(dropPos)
+    -- Align palette yaw with current flight heading (nose-forward orientation)
+    pallet:SetAngles(Angle(0, self.flightYaw, 0))
+    pallet:Spawn()
+    pallet:Activate()
+
+    -- Seed the same forward momentum as the C-17 at drop time.
+    -- The pallet's freefall phase will bleed this off naturally via drag.
+    local pPhys = pallet:GetPhysicsObject()
+    if IsValid(pPhys) then
+        local fwdVel = Angle(0, self.flightYaw, 0):Forward() * self.Speed
+        fwdVel.z = 0
+        pPhys:SetVelocity(fwdVel)
+    end
+
+    -- Prevent immediate collision with the C-17 fuselage.
+    constraint.NoCollide(pallet, self, 0, 0)
+    local pRef = pallet
+    timer.Simple(1.2, function()
+        if IsValid(pRef) and IsValid(self) then constraint.RemoveConstraints(pRef, "NoCollide") end
+    end)
+
+    self:Debug("W3 GBU53 pallet #" .. (palletIndex+1) .. " dropped at " .. tostring(dropPos))
+end
+
+function ENT:UpdateGBU53(ct)
+    if self.WPN_ShotsFired >= CFG_W3_GBU53_Count then return true end
     if ct < self.WPN_NextShot then return false end
-    self.WPN_NextShot   = ct + CFG_W3_Delay
+    self.WPN_NextShot   = ct + CFG_W3_GBU53_Delay
     self.WPN_ShotsFired = self.WPN_ShotsFired + 1
-    local entClass = CFG_W3_Pool[math.random(#CFG_W3_Pool)]
-    local dropPos  = self:LocalToWorld(CFG_BombBayLocal)
-    local aimPos   = self:GetAimedGroundPos(CFG_W3_Scatter)
-    self:SpawnCarpetBomb(entClass, dropPos, aimPos)
-    self:Debug("W3 MEDIUM " .. self.WPN_ShotsFired .. "/" .. CFG_W3_Count .. " " .. entClass)
-    return (self.WPN_ShotsFired >= CFG_W3_Count)
+    self:SpawnOneGBU53Pallet(self.WPN_ShotsFired - 1)
+    return (self.WPN_ShotsFired >= CFG_W3_GBU53_Count)
 end
 
 -- ============================================================
