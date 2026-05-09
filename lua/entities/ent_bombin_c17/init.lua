@@ -29,13 +29,8 @@ local MODEL_SCALE = 1.8
 -- Window IDs (active):
 --   W1 "jassm"   -- AGM-158 JASSM parachute drop
 --   W2 "heavy"   -- heavy GP / penetrators
---   W3 "gbu53"   -- GBU-53 parachute cluster drop  (replaces old medium carpet)
+--   W3 "gbu53"   -- GBU-53 parachute cluster drop
 --   W6 "retarded"-- parachute / retarder bombs
---
--- Removed:
---   W4 "light"     -- REMOVED
---   W5 "hellfire"  -- REMOVED
---   W3 "medium"    -- REPLACED by gbu53
 -- ============================================================
 
 local DART_SPEED  = 4500
@@ -59,11 +54,14 @@ local TARGET_MAX_LOOKAHEAD_DIST  = 1200
 local TARGET_REACQUIRE_INTERVAL  = 0.35
 local TARGET_PASS_BIAS           = 0.55
 
--- ---------- W1 -- JASSM parachute drop (AC-130 pattern) ----------
+-- ---------- W1 -- JASSM parachute drop ----------
+-- Critical fix: use a real tail release point instead of a tiny -60 local offset.
+-- The model is scaled to 1.8, and LocalToWorld does NOT account for visual scale.
+-- A small offset was spawning the payload inside the fuselage.
 local CFG_W1_JASSM_Count      = 1
 local CFG_W1_JASSM_Delay      = 0
-local CFG_W1_JASSM_TailOffset = Vector(-60, 0, 0)
-local CFG_W1_JASSM_SkyAdd     = 0
+local CFG_W1_JASSM_TailOffset = Vector(-360, 0, -70)
+local CFG_W1_JASSM_AltOffset  = 500
 
 -- ---------- W2 -- Heavy ordnance ----------
 local CFG_W2_Count   = 2
@@ -80,14 +78,15 @@ local CFG_W2_Pool    = {
     "sw_bomb_anmk1_v3",
 }
 
--- ---------- W3 -- GBU-53 parachute cluster (replaces medium carpet) ----------
--- Each "shot" drops one ent_bombin_gbu53_owned which handles the
--- chute+palette assembly internally and loiters after ignition.
-local CFG_W3_GBU53_Count  = 3          -- pallets per window
-local CFG_W3_GBU53_Delay  = 1.2        -- seconds between pallets
-local CFG_W3_AltStagger   = 400        -- altitude separation per pallet (units)
-local CFG_W3_DropOffset   = Vector(-60, 0, 0)  -- local drop point (bomb bay)
-local CFG_W3_BodyClearance = 220       -- extra downward clearance below aircraft body for pallet 0
+-- ---------- W3 -- GBU-53 parachute cluster ----------
+-- Same release-point fix as JASSM, but with extra downward clearance so the
+-- palette/chute/visual munition combo starts fully below the aircraft.
+local CFG_W3_GBU53_Count       = 3
+local CFG_W3_GBU53_Delay       = 1.2
+local CFG_W3_AltStagger        = 400
+local CFG_W3_DropOffset        = Vector(-340, 0, -140)
+local CFG_W3_BodyClearance     = 260
+local CFG_W3_NoCollideHoldTime = 1.8
 
 -- ---------- W6 -- Retarded / Parachute bombs ----------
 local CFG_W6_Count   = 6
@@ -100,12 +99,8 @@ local CFG_W6_Pool    = {
     "sw_bomb_mk84_air_v3",
 }
 
--- Weapon roster used by PickNewWeapon
 local WEAPON_ROSTER = { "jassm", "heavy", "gbu53", "retarded" }
 
--- ============================================================
--- NETWORK STRING
--- ============================================================
 util.AddNetworkString("bombin_c17_damage_tier")
 
 local function CalcTier(hp, maxHP)
@@ -119,9 +114,6 @@ local function BroadcastTier(ent, tier)
     net.Broadcast()
 end
 
--- ============================================================
--- INITIALIZE
--- ============================================================
 function ENT:Initialize()
     self.CenterPos    = self:GetVar("CenterPos",    self:GetPos())
     self.CallDir      = self:GetVar("CallDir",      Vector(1,0,0))
@@ -250,16 +242,10 @@ function ENT:Initialize()
     self:Debug("C-17 spawned, orbit radius=" .. self.OrbitRadius .. " sky=" .. self.sky)
 end
 
--- ============================================================
--- DEBUG
--- ============================================================
 function ENT:Debug(msg)
     print("[Bombin C-17] " .. tostring(msg))
 end
 
--- ============================================================
--- FINDGROUND
--- ============================================================
 function ENT:FindGround(pos)
     local tr = util.TraceLine({
         start  = Vector(pos.x, pos.y, pos.z + 100),
@@ -271,9 +257,6 @@ function ENT:FindGround(pos)
     return -1
 end
 
--- ============================================================
--- TARGET TRACKING
--- ============================================================
 function ENT:RefreshTarget(ct)
     if ct < self.NextTargetRefresh then return self.TargetEnt end
     self.NextTargetRefresh = ct + TARGET_REACQUIRE_INTERVAL
@@ -293,9 +276,6 @@ function ENT:RefreshTarget(ct)
     return closest
 end
 
--- ============================================================
--- ORBIT PHYSICS
--- ============================================================
 function ENT:UpdateOrbit(ct, dt)
     local phys = self.PhysObj
     if not IsValid(phys) then
@@ -305,13 +285,11 @@ function ENT:UpdateOrbit(ct, dt)
     if not IsValid(phys) then return end
     if phys:IsAsleep() then phys:Wake() end
 
-    -- Dynamic centre wander
     self.WanderPhaseX = self.WanderPhaseX + self.WanderRateX
     self.WanderPhaseY = self.WanderPhaseY + self.WanderRateY
     self.DynamicCenterPos.x = self.BaseCenterPos.x + math.sin(self.WanderPhaseX) * self.WanderAmp
     self.DynamicCenterPos.y = self.BaseCenterPos.y + math.cos(self.WanderPhaseY) * self.WanderAmp
 
-    -- Target-based centre pull
     local target = self:RefreshTarget(ct)
     if IsValid(target) then
         local tPos = target:GetPos()
@@ -328,20 +306,17 @@ function ENT:UpdateOrbit(ct, dt)
         self.DynamicCenterPos.y = Lerp(TARGET_CENTER_LERP, self.DynamicCenterPos.y, desiredCenter.y)
     end
 
-    -- Advance orbit angle
     self.OrbitAngle = self.OrbitAngle + self.OrbitAngSpeed * dt
 
     local desX = self.DynamicCenterPos.x + math.cos(self.OrbitAngle) * self.OrbitRadius
     local desY = self.DynamicCenterPos.y + math.sin(self.OrbitAngle) * self.OrbitRadius
 
-    -- Altitude drift
     if ct >= self.AltDriftNextPick then
         self.AltDriftNextPick = ct + math.Rand(12, 30)
         self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
     end
     self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
 
-    -- Jitter
     self.JitterPhase = self.JitterPhase + dt * 1.3
     local jitterZ = math.sin(self.JitterPhase) * self.JitterAmplitude
 
@@ -349,7 +324,6 @@ function ENT:UpdateOrbit(ct, dt)
     local curPos = self:GetPos()
     local velZ  = math.Clamp((desZ - curPos.z) * 8, -120, 120)
 
-    -- Sky clearance raycast
     if ct - self.SkyProbeLastHit > 0.3 then
         local fwd = Angle(0, self.flightYaw, 0):Forward()
         local probeEnd = curPos + fwd * self.SkyProbeDist
@@ -371,7 +345,6 @@ function ENT:UpdateOrbit(ct, dt)
     local prevYaw     = self.flightYaw
     self.flightYaw    = desiredYaw
 
-    -- Angular velocity for bank calculation
     local yawDelta    = math.NormalizeAngle(desiredYaw - prevYaw)
     local turnRate    = yawDelta / math.max(dt, 0.001)
     self.PrevTurnRate = Lerp(0.15, self.PrevTurnRate, turnRate)
@@ -394,9 +367,6 @@ function ENT:UpdateOrbit(ct, dt)
     self:SetAngles(self.ang)
 end
 
--- ============================================================
--- FADE-IN
--- ============================================================
 function ENT:UpdateFade(dt)
     if not self.FadeIn then return end
     self.FadeAlpha = math.min(self.FadeAlpha + dt / self.FadeDuration * 255, 255)
@@ -407,9 +377,6 @@ function ENT:UpdateFade(dt)
     end
 end
 
--- ============================================================
--- WEAPON SYSTEM
--- ============================================================
 function ENT:PickNewWeapon()
     if #WEAPON_ROSTER == 0 then return end
     local w = WEAPON_ROSTER[math.random(#WEAPON_ROSTER)]
@@ -452,9 +419,6 @@ function ENT:UpdateWeapons(ct)
     end
 end
 
--- ============================================================
--- THINK
--- ============================================================
 function ENT:Think()
     if not self.DieTime then self:NextThink(CurTime() + 0.1) return true end
 
@@ -481,12 +445,8 @@ function ENT:Think()
 end
 
 function ENT:PhysicsUpdate(phys, dt)
-    -- Keep physics object awake; actual velocity driven in UpdateOrbit
 end
 
--- ============================================================
--- DAMAGE
--- ============================================================
 function ENT:OnTakeDamage(dmginfo)
     if self.Destroyed then return end
     local dmg = dmginfo:GetDamage()
@@ -504,9 +464,6 @@ function ENT:OnTakeDamage(dmginfo)
     end
 end
 
--- ============================================================
--- DESTROY
--- ============================================================
 function ENT:DestroyPlane()
     if self.Destroyed then return end
     self.Destroyed = true
@@ -525,7 +482,6 @@ function ENT:DestroyPlane()
     util.Effect("HelicopterMegaBomb", expEd, true, true)
     sound.Play("ambient/explosions/explode_8.wav", pos, 145, 90, 1.0)
 
-    -- Debris
     local debrisModels = {
         "models/props_c17/FurnitureDrawer001a.mdl",
         "models/props_c17/FurnitureCouch001a.mdl",
@@ -551,9 +507,6 @@ function ENT:DestroyPlane()
     end)
 end
 
--- ============================================================
--- REMOVE
--- ============================================================
 function ENT:OnRemove()
     if self.EngineSound then
         self.EngineSound:Stop()
@@ -561,9 +514,6 @@ function ENT:OnRemove()
     end
 end
 
--- ============================================================
--- BOMB HELPERS
--- ============================================================
 local function CalcDartVelocity(dropPos, targetPos)
     local dir = targetPos - dropPos
     local H   = math.max(dropPos.z - targetPos.z, 100)
@@ -650,65 +600,69 @@ end
 
 -- ============================================================
 -- W1: JASSM PARACHUTE DROP
+-- Critical fix:
+-- 1) Use a real tail offset outside the fuselage.
+-- 2) Pass init data exactly how ent_bombin_jassm_owned expects it: direct fields,
+--    not SetVar(). This makes the loitering logic byte-for-byte compatible in behavior.
 -- ============================================================
 function ENT:SpawnOneJASSM(dropIndex)
     dropIndex = dropIndex or 0
 
-    local dropPos = self:LocalToWorld(CFG_W1_JASSM_TailOffset)
-    dropPos.z = self:GetPos().z - (dropIndex * 500)
+    local tailWorld = self:LocalToWorld(CFG_W1_JASSM_TailOffset)
+    local dropPos = Vector(tailWorld.x, tailWorld.y, tailWorld.z - (dropIndex * CFG_W1_JASSM_AltOffset))
+    if not util.IsInWorld(dropPos) then
+        dropPos = Vector(self.CenterPos.x, self.CenterPos.y, self:GetPos().z - (dropIndex * CFG_W1_JASSM_AltOffset))
+    end
 
     local missile = ents.Create("ent_bombin_jassm_owned")
     if not IsValid(missile) then
-        self:Debug("W1 JASSM: ent_bombin_jassm_owned not found - is the AC-130 addon installed?")
+        self:Debug("W1 JASSM: ent_bombin_jassm_owned not found - dependency missing")
         return
     end
 
-    missile:SetVar("CenterPos",    self.CenterPos)
-    missile:SetVar("CallDir",      Angle(0, self.flightYaw, 0):Forward())
-    missile:SetVar("SkyHeightAdd", self.SkyHeightAdd)
-    missile:SetVar("OrbitRadius",  self.OrbitRadius)
+    local callDir = Angle(0, self.flightYaw, 0):Forward()
+
+    missile:SetPos(dropPos)
+    missile:SetAngles(callDir:Angle())
+    missile.SpawnedFromPlane = true
+    missile.CenterPos    = self.CenterPos
+    missile.CallDir      = callDir
+    missile.Lifetime     = math.min(self.Lifetime, 35)
+    missile.Speed        = 250
+    missile.OrbitRadius  = self.OrbitRadius * 0.75
+    missile.SkyHeightAdd = math.max(dropPos.z - self:FindGround(dropPos), 800)
     missile:SetOwner(self)
     missile.IsOnPlane = true
     missile.Launcher  = self
-
-    missile:SetPos(dropPos)
-    missile:SetAngles(Angle(0, self.flightYaw, 0))
-    missile.SpawnedFromPlane = true  -- FIX: tell the missile to use the tail pos we just set
     missile:Spawn()
     missile:Activate()
 
-    local mPhys = missile:GetPhysicsObject()
-    if IsValid(mPhys) then
-        local fwdVel = Angle(0, self.flightYaw, 0):Forward() * self.Speed
-        fwdVel.z = 0
-        mPhys:SetVelocity(fwdVel)
-    end
-
     constraint.NoCollide(missile, self, 0, 0)
     local mRef = missile
-    timer.Simple(1.0, function()
-        if IsValid(mRef) and IsValid(self) then constraint.RemoveConstraints(mRef, "NoCollide") end
+    timer.Simple(1.25, function()
+        if IsValid(mRef) then constraint.RemoveConstraints(mRef, "NoCollide") end
     end)
 
     local chute = ents.Create("ent_bombin_jassm_chute_owned")
     if IsValid(chute) then
-        chute:SetVar("MissileEnt", missile)
-        chute:SetOwner(missile)  -- FIX: chute tracks the missile, not the plane
+        chute:SetOwner(missile)
         chute:SetPos(dropPos + Vector(0, 0, 105))
         chute:SetAngles(Angle(0, self.flightYaw, 0))
         chute:Spawn()
         chute:Activate()
-        chute.MissileEnt = missile
         constraint.NoCollide(chute, self, 0, 0)
         constraint.NoCollide(chute, missile, 0, 0)
         local cRef = chute
-        timer.Simple(1.0, function()
-            if IsValid(cRef) and IsValid(self) then constraint.RemoveConstraints(cRef, "NoCollide") end
+        timer.Simple(1.25, function()
+            if IsValid(cRef) then constraint.RemoveConstraints(cRef, "NoCollide") end
         end)
     else
-        self:Debug("W1 JASSM: ent_bombin_jassm_chute_owned not found - chute will be missing")
+        self:Debug("W1 JASSM: ent_bombin_jassm_chute_owned not found - chute missing")
     end
 
+    if self.JASSM_Stock > 0 then
+        self.JASSM_Stock = self.JASSM_Stock - 1
+    end
     self:Debug("W1 JASSM drop #" .. (dropIndex+1) .. " pos=" .. tostring(dropPos))
 end
 
@@ -721,9 +675,6 @@ function ENT:UpdateJASSM(ct)
     return (self.WPN_ShotsFired >= CFG_W1_JASSM_Count)
 end
 
--- ============================================================
--- W2: HEAVY ORDNANCE
--- ============================================================
 function ENT:UpdateHeavy(ct)
     if self.WPN_ShotsFired >= CFG_W2_Count then return true end
     if ct < self.WPN_NextShot then return false end
@@ -739,61 +690,51 @@ end
 
 -- ============================================================
 -- W3: GBU-53 PARACHUTE CLUSTER DROP
---
--- Spawns ent_bombin_gbu53_owned: the missile/loiter unit that
--- internally manages its own chute+palette assembly via SpawnChute().
--- Each GBU-53 freefalls, ignites at altitude, then loiters and dives.
---
--- Dependency: ent_bombin_gbu53_owned + ent_bombin_gbu53_chute_owned
--- from NachinBombin/Current-Ac-Model.
+-- Critical fix:
+-- 1) Real aft/below release point so the combo starts outside the aircraft.
+-- 2) Keep owner on the loitering missile entity, not the plane.
+-- 3) Pass direct fields to match ent_bombin_gbu53_owned Initialize().
 -- ============================================================
 function ENT:SpawnOneGBU53Pallet(palletIndex)
     palletIndex = palletIndex or 0
 
-    -- Drop from the aircraft-defined local release point, but force the
-    -- initial Z below the fuselage so pallet 0 never spawns inside the body.
-    -- Additional pallets are staggered further down from that cleared point.
-    local dropPos = self:LocalToWorld(CFG_W3_DropOffset)
-    dropPos.z = self:GetPos().z - CFG_W3_BodyClearance - (palletIndex * CFG_W3_AltStagger)
+    local tailWorld = self:LocalToWorld(CFG_W3_DropOffset)
+    local dropPos = Vector(
+        tailWorld.x,
+        tailWorld.y,
+        tailWorld.z - CFG_W3_BodyClearance - (palletIndex * CFG_W3_AltStagger)
+    )
+    if not util.IsInWorld(dropPos) then
+        dropPos = Vector(self.CenterPos.x, self.CenterPos.y, self:GetPos().z - CFG_W3_BodyClearance - (palletIndex * CFG_W3_AltStagger))
+    end
 
-    -- FIX: spawn ent_bombin_gbu53_owned (the missile/loiter unit).
-    -- ent_bombin_gbu53_owned handles its own chute via SpawnChute() internally,
-    -- so spawning ent_bombin_gbu53_chute_owned directly here was wrong:
-    -- the chute's Think() calls GetOwner() expecting a GBU53 missile entity,
-    -- not the C17 plane, causing it to latch onto and follow the aircraft.
     local pallet = ents.Create("ent_bombin_gbu53_owned")
     if not IsValid(pallet) then
-        self:Debug("W3 GBU53: ent_bombin_gbu53_owned not found - is Current-Ac-Model installed?")
+        self:Debug("W3 GBU53: ent_bombin_gbu53_owned not found")
         return
     end
 
-    pallet:SetVar("CenterPos",    self.CenterPos)
-    pallet:SetVar("CallDir",      Angle(0, self.flightYaw, 0):Forward())
-    pallet:SetVar("SkyHeightAdd", self.SkyHeightAdd)
-    pallet:SetVar("OrbitRadius",  self.OrbitRadius)
-    pallet:SetVar("Speed",        self.Speed)
-    pallet:SetOwner(self)
-    pallet.IsOnPlane      = true
-    pallet.Launcher       = self
-    pallet.SpawnedFromPlane = true  -- tells gbu53_owned to use the pos we set, not orbit-entry
+    local callDir = Angle(0, self.flightYaw, 0):Forward()
 
     pallet:SetPos(dropPos)
     pallet:SetAngles(Angle(0, self.flightYaw, 0))
+    pallet.SpawnedFromPlane = true
+    pallet.CenterPos    = self.CenterPos
+    pallet.CallDir      = callDir
+    pallet.Lifetime     = math.min(self.Lifetime, 60)
+    pallet.Speed        = 420
+    pallet.OrbitRadius  = self.OrbitRadius
+    pallet.SkyHeightAdd = math.max(dropPos.z - self:FindGround(dropPos), 1200)
+    pallet:SetOwner(self)
+    pallet.IsOnPlane = true
+    pallet.Launcher  = self
     pallet:Spawn()
     pallet:Activate()
 
-    -- Seed horizontal velocity so the pallet carries the plane's momentum during freefall
-    local mPhys = pallet:GetPhysicsObject()
-    if IsValid(mPhys) then
-        local fwdVel = Angle(0, self.flightYaw, 0):Forward() * self.Speed
-        fwdVel.z = 0
-        mPhys:SetVelocity(fwdVel)
-    end
-
     constraint.NoCollide(pallet, self, 0, 0)
     local pRef = pallet
-    timer.Simple(1.2, function()
-        if IsValid(pRef) and IsValid(self) then constraint.RemoveConstraints(pRef, "NoCollide") end
+    timer.Simple(CFG_W3_NoCollideHoldTime, function()
+        if IsValid(pRef) then constraint.RemoveConstraints(pRef, "NoCollide") end
     end)
 
     self:Debug("W3 GBU53 pallet #" .. (palletIndex+1) .. " dropped at " .. tostring(dropPos))
@@ -808,9 +749,6 @@ function ENT:UpdateGBU53(ct)
     return (self.WPN_ShotsFired >= CFG_W3_GBU53_Count)
 end
 
--- ============================================================
--- W6: RETARDED / PARACHUTE BOMBS
--- ============================================================
 function ENT:UpdateRetarded(ct)
     if self.WPN_ShotsFired >= CFG_W6_Count then return true end
     if ct < self.WPN_NextShot then return false end
@@ -824,10 +762,6 @@ function ENT:UpdateRetarded(ct)
     return (self.WPN_ShotsFired >= CFG_W6_Count)
 end
 
--- ============================================================
--- SETVAR / GETVAR  (simple per-entity key-value store used
--- before Spawn() to pass init params, mirrors AC-130 pattern)
--- ============================================================
 function ENT:SetVar(key, value)
     self.__vars = self.__vars or {}
     self.__vars[key] = value
