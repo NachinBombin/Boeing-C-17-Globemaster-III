@@ -88,6 +88,7 @@ local CFG_W3_GBU53_Count  = 3          -- pallets per window
 local CFG_W3_GBU53_Delay  = 1.2        -- seconds between pallets
 local CFG_W3_AltStagger   = 400        -- altitude separation per pallet (units)
 local CFG_W3_DropOffset   = Vector(-60, 0, 0)  -- local drop point (bomb bay)
+local CFG_W3_BodyClearance = 220       -- extra downward clearance below aircraft body for pallet 0
 
 -- ---------- W6 -- Retarded / Parachute bombs ----------
 local CFG_W6_Count   = 6
@@ -838,10 +839,11 @@ end
 function ENT:SpawnOneGBU53Pallet(palletIndex)
     palletIndex = palletIndex or 0
 
-    -- Drop point: same bomb bay local offset as JASSM, staggered downward
-    -- so successive pallets don't overlap during freefall.
-    local dropPos   = self:LocalToWorld(CFG_W3_DropOffset)
-    dropPos.z       = self:GetPos().z - (palletIndex * CFG_W3_AltStagger)
+    -- Drop from the aircraft-defined local release point, but force the
+    -- initial Z below the fuselage so pallet 0 never spawns inside the body.
+    -- Additional pallets are staggered further down from that cleared point.
+    local dropPos = self:LocalToWorld(CFG_W3_DropOffset)
+    dropPos.z = self:GetPos().z - CFG_W3_BodyClearance - (palletIndex * CFG_W3_AltStagger)
 
     -- The chute entity IS the palette: it owns the 4 munitions as sub-props
     -- and carries the visual parachute 90u above itself.
@@ -862,13 +864,10 @@ function ENT:SpawnOneGBU53Pallet(palletIndex)
     pallet.Launcher  = self
 
     pallet:SetPos(dropPos)
-    -- Align palette yaw with current flight heading (nose-forward orientation)
     pallet:SetAngles(Angle(0, self.flightYaw, 0))
     pallet:Spawn()
     pallet:Activate()
 
-    -- Seed the same forward momentum as the C-17 at drop time.
-    -- The pallet's freefall phase will bleed this off naturally via drag.
     local pPhys = pallet:GetPhysicsObject()
     if IsValid(pPhys) then
         local fwdVel = Angle(0, self.flightYaw, 0):Forward() * self.Speed
@@ -876,7 +875,6 @@ function ENT:SpawnOneGBU53Pallet(palletIndex)
         pPhys:SetVelocity(fwdVel)
     end
 
-    -- Prevent immediate collision with the C-17 fuselage.
     constraint.NoCollide(pallet, self, 0, 0)
     local pRef = pallet
     timer.Simple(1.2, function()
