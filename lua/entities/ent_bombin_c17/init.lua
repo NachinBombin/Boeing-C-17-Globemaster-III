@@ -26,21 +26,15 @@ local MODEL_SCALE = 1.8
 -- ============================================================
 -- SW MUNITIONS CATALOGUE
 -- ============================================================
--- AIMING PHILOSOPHY:
---   W1/W2/W4/W6: dart-throw. CalcDartVelocity fires a normalized vector
---   straight from the drop point to the predicted target position at
---   DART_SPEED. No gravity compensation, no horizontal clamp.
+-- Window IDs (active):
+--   W1 "jassm"     -- AGM-158 JASSM parachute drop  (replaces precision)
+--   W2 "heavy"     -- heavy GP / penetrators
+--   W3 "medium"    -- medium GP carpet bombs
+--   W6 "retarded"  -- parachute / retarder bombs
 --
---   W3 medium: ballistic carpet drop for intentional spread pattern.
---   W5 hellfire: guided missile, unchanged.
---
--- Window IDs:
---   W1 "precision"  -- GPS / LGB / glide weapons
---   W2 "heavy"      -- heavy GP / penetrators
---   W3 "medium"     -- medium GP carpet bombs
---   W4 "light"      -- light GP / sub-250 lb weapons
---   W5 "hellfire"   -- AGM-114 Hellfire
---   W6 "retarded"   -- parachute / retarder bombs
+-- Removed:
+--   W4 "light"     -- REMOVED
+--   W5 "hellfire"  -- REMOVED
 -- ============================================================
 
 local DART_SPEED  = 4500
@@ -64,29 +58,13 @@ local TARGET_MAX_LOOKAHEAD_DIST  = 1200
 local TARGET_REACQUIRE_INTERVAL  = 0.35
 local TARGET_PASS_BIAS           = 0.55
 
--- ---------- W1 -- Precision guided ----------
-local CFG_W1_Count   = 4
-local CFG_W1_Delay   = 3.0
-local CFG_W1_Scatter = 0
-local CFG_W1_Pool    = {
-    "sw_bomb_gbu31_v3",
-    "sw_bomb_gbu32_v3",
-    "sw_bomb_gbu38_v3",
-    "sw_bomb_gbu39_v3",
-    "sw_bomb_gbu12_v3",
-    "sw_bomb_gbu16_v3",
-    "sw_bomb_gbu10_v3",
-    "sw_bomb_gbu24_v3",
-    "sw_bomb_gbu27_v3",
-    "sw_bomb_gbu28_v3",
-    "sw_bomb_gbu48_v3",
-    "sw_bomb_gbu49_v3",
-    "sw_bomb_gbu53_v3",
-    "sw_bomb_gbu8_v3",
-    "sw_bomb_agm154_v3",
-    "sw_bomb_agm62a_v3",
-    "sw_bomb_gbu15_v3",
-}
+-- ---------- W1 -- JASSM parachute drop (AC-130 pattern) ----------
+-- Spawns ent_bombin_jassm_owned + ent_bombin_jassm_chute_owned
+-- identical to how ent_bombin_support_plane:SpawnOneJASSM works.
+local CFG_W1_JASSM_Count      = 1          -- missiles per window (1 clean drop)
+local CFG_W1_JASSM_Delay      = 0          -- delay between missiles if Count>1
+local CFG_W1_JASSM_TailOffset = Vector(-60, 0, 0)   -- local drop point (bomb bay, not tail)
+local CFG_W1_JASSM_SkyAdd     = 0          -- alt offset above self.sky (0 = drop from current altitude)
 
 -- ---------- W2 -- Heavy ordnance ----------
 local CFG_W2_Count   = 2
@@ -124,25 +102,6 @@ local CFG_W3_Pool    = {
     "sw_bomb_m63_v3",
 }
 
--- ---------- W4 -- Light scattered ----------
-local CFG_W4_Count   = 12
-local CFG_W4_Delay   = 0.25
-local CFG_W4_Scatter = 150
-local CFG_W4_Pool    = {
-    "sw_bomb_mk81_v3",
-    "sw_bomb_anm30_v3",
-    "sw_bomb_anm57_v3",
-    "sw_bomb_gbu39_v3",
-    "sw_bomb_gbu53_v3",
-}
-
--- ---------- W5 -- Hellfire ----------
-local CFG_W5_Entity  = "sw_missile_agm114_v3"
-local CFG_W5_Count   = 4
-local CFG_W5_Delay   = 2.5
-local CFG_W5_Scatter = 80
-local CFG_W5_Muzzles = { Vector(60,-70,-8), Vector(60,70,-8) }
-
 -- ---------- W6 -- Retarded / Parachute bombs ----------
 local CFG_W6_Count   = 6
 local CFG_W6_Delay   = 0.55
@@ -155,7 +114,8 @@ local CFG_W6_Pool    = {
 }
 
 -- Weapon roster used by PickNewWeapon
-local WEAPON_ROSTER = { "precision", "heavy", "medium", "light", "hellfire", "retarded" }
+-- W4 "light" and W5 "hellfire" have been removed.
+local WEAPON_ROSTER = { "jassm", "heavy", "medium", "retarded" }
 
 -- ============================================================
 -- NETWORK STRING
@@ -434,12 +394,10 @@ function ENT:HandleWeaponSystem(ct)
     local done = false
     local w = self.CurrentWeapon
 
-    if     w == "precision" then done = self:UpdatePrecision(ct)
-    elseif w == "heavy"     then done = self:UpdateHeavy(ct)
-    elseif w == "medium"    then done = self:UpdateMedium(ct)
-    elseif w == "light"     then done = self:UpdateLight(ct)
-    elseif w == "hellfire"  then done = self:UpdateHellfire(ct)
-    elseif w == "retarded"  then done = self:UpdateRetarded(ct)
+    if     w == "jassm"    then done = self:UpdateJASSM(ct)
+    elseif w == "heavy"    then done = self:UpdateHeavy(ct)
+    elseif w == "medium"   then done = self:UpdateMedium(ct)
+    elseif w == "retarded" then done = self:UpdateRetarded(ct)
     else
         self:Debug("Unknown weapon '" .. tostring(w) .. "', resetting")
         done = true
@@ -793,19 +751,95 @@ function ENT:SpawnCarpetBomb(entClass, dropPos, aimPos)
 end
 
 -- ============================================================
--- W1: PRECISION GUIDED
+-- W1: JASSM PARACHUTE DROP  (replaces precision guided)
+-- Mirrors ent_bombin_support_plane:SpawnOneJASSM exactly:
+--   1. Spawn ent_bombin_jassm_owned at drop position, MOVETYPE_NONE, engine off.
+--   2. Pass CenterPos / CallDir / SkyHeightAdd so the missile knows its
+--      ignition altitude and orbit parameters.
+--   3. Spawn ent_bombin_jassm_chute_owned 105 units above the missile.
+--      The chute entity self-detaches when missile NWBool "EngineOn" goes true.
 -- ============================================================
-function ENT:UpdatePrecision(ct)
-    if self.WPN_ShotsFired >= CFG_W1_Count then return true end
+function ENT:SpawnOneJASSM(dropIndex)
+    dropIndex = dropIndex or 0
+
+    -- Drop point: bomb bay local offset, at current plane altitude
+    local dropPos = self:LocalToWorld(CFG_W1_JASSM_TailOffset)
+    -- Stagger altitude per missile index just like the AC-130 (500 u spacing)
+    dropPos.z = self:GetPos().z - (dropIndex * 500)
+
+    -- ---- Missile ----
+    local missile = ents.Create("ent_bombin_jassm_owned")
+    if not IsValid(missile) then
+        self:Debug("W1 JASSM: ent_bombin_jassm_owned not found - is the AC-130 addon installed?")
+        return
+    end
+
+    -- Pass the same vars the AC-130 passes so the missile can self-calculate
+    -- ignition altitude, orbit, etc.
+    missile:SetVar("CenterPos",    self.CenterPos)
+    missile:SetVar("CallDir",      Angle(0, self.flightYaw, 0):Forward())
+    missile:SetVar("SkyHeightAdd", self.SkyHeightAdd)
+    missile:SetVar("OrbitRadius",  self.OrbitRadius)
+    missile:SetOwner(self)
+    missile.IsOnPlane = true
+    missile.Launcher  = self
+
+    missile:SetPos(dropPos)
+    -- Face nose downward, aligned with current flight heading - matches AC-130 drop angle
+    missile:SetAngles(Angle(0, self.flightYaw, 0))
+    missile:Spawn()
+    missile:Activate()
+
+    -- Seed a small forward velocity component matching aircraft momentum
+    -- This is intentional: gives the missile a realistic diagonal release trajectory
+    -- just like when dropped from the AC-130 in motion.
+    local mPhys = missile:GetPhysicsObject()
+    if IsValid(mPhys) then
+        local fwdVel = Angle(0, self.flightYaw, 0):Forward() * self.Speed
+        fwdVel.z = 0  -- missile freefall phase manages Z itself
+        mPhys:SetVelocity(fwdVel)
+    end
+
+    -- NoCollide with the plane for the first second of freefall
+    constraint.NoCollide(missile, self, 0, 0)
+    local mRef = missile
+    timer.Simple(1.0, function()
+        if IsValid(mRef) and IsValid(self) then constraint.RemoveConstraints(mRef, "NoCollide") end
+    end)
+
+    -- ---- Chute ----
+    -- Spawned 105 units above the missile, identical to the AC-130 pattern.
+    local chute = ents.Create("ent_bombin_jassm_chute_owned")
+    if IsValid(chute) then
+        chute:SetVar("MissileEnt", missile)   -- pass reference if chute uses GetVar
+        chute:SetOwner(self)
+        chute:SetPos(dropPos + Vector(0, 0, 105))
+        chute:SetAngles(Angle(0, self.flightYaw, 0))
+        chute:Spawn()
+        chute:Activate()
+        -- Tell the chute which missile to track
+        -- (ent_bombin_jassm_chute_owned uses self.MissileEnt in its Think)
+        chute.MissileEnt = missile
+        constraint.NoCollide(chute, self, 0, 0)
+        constraint.NoCollide(chute, missile, 0, 0)
+        local cRef = chute
+        timer.Simple(1.0, function()
+            if IsValid(cRef) and IsValid(self) then constraint.RemoveConstraints(cRef, "NoCollide") end
+        end)
+    else
+        self:Debug("W1 JASSM: ent_bombin_jassm_chute_owned not found - chute will be missing")
+    end
+
+    self:Debug("W1 JASSM drop #" .. (dropIndex+1) .. " pos=" .. tostring(dropPos))
+end
+
+function ENT:UpdateJASSM(ct)
+    if self.WPN_ShotsFired >= CFG_W1_JASSM_Count then return true end
     if ct < self.WPN_NextShot then return false end
-    self.WPN_NextShot   = ct + CFG_W1_Delay
+    self.WPN_NextShot   = ct + CFG_W1_JASSM_Delay
     self.WPN_ShotsFired = self.WPN_ShotsFired + 1
-    local entClass  = CFG_W1_Pool[math.random(#CFG_W1_Pool)]
-    local dropPos   = self:LocalToWorld(CFG_BombBayLocal)
-    local targetPos = self:GetDirectTarget(CFG_W1_Scatter)
-    self:SpawnDartBomb(entClass, dropPos, targetPos, false)
-    self:Debug("W1 PRECISION " .. self.WPN_ShotsFired .. "/" .. CFG_W1_Count .. " " .. entClass)
-    return (self.WPN_ShotsFired >= CFG_W1_Count)
+    self:SpawnOneJASSM(self.WPN_ShotsFired - 1)
+    return (self.WPN_ShotsFired >= CFG_W1_JASSM_Count)
 end
 
 -- ============================================================
@@ -839,98 +873,6 @@ function ENT:UpdateMedium(ct)
     self:SpawnCarpetBomb(entClass, dropPos, aimPos)
     self:Debug("W3 MEDIUM " .. self.WPN_ShotsFired .. "/" .. CFG_W3_Count .. " " .. entClass)
     return (self.WPN_ShotsFired >= CFG_W3_Count)
-end
-
--- ============================================================
--- W4: LIGHT SCATTERED
--- ============================================================
-function ENT:UpdateLight(ct)
-    if self.WPN_ShotsFired >= CFG_W4_Count then return true end
-    if ct < self.WPN_NextShot then return false end
-    self.WPN_NextShot   = ct + CFG_W4_Delay
-    self.WPN_ShotsFired = self.WPN_ShotsFired + 1
-    local entClass  = CFG_W4_Pool[math.random(#CFG_W4_Pool)]
-    local dropPos   = self:LocalToWorld(CFG_BombBayLocal)
-    local targetPos = self:GetDirectTarget(CFG_W4_Scatter)
-    self:SpawnDartBomb(entClass, dropPos, targetPos, false)
-    self:Debug("W4 LIGHT " .. self.WPN_ShotsFired .. "/" .. CFG_W4_Count .. " " .. entClass)
-    return (self.WPN_ShotsFired >= CFG_W4_Count)
-end
-
--- ============================================================
--- W5: HELLFIRE MISSILE
--- ============================================================
-function ENT:UpdateHellfire(ct)
-    if self.WPN_ShotsFired >= CFG_W5_Count then return true end
-    if ct < self.WPN_NextShot then return false end
-    self.WPN_NextShot   = ct + CFG_W5_Delay
-    self.WPN_ShotsFired = self.WPN_ShotsFired + 1
-    local muzzleLocal = CFG_W5_Muzzles[self.WPN_MuzzleIndex]
-    self.WPN_MuzzleIndex = (self.WPN_MuzzleIndex % #CFG_W5_Muzzles) + 1
-    local muzzlePos = self:LocalToWorld(muzzleLocal)
-    local aimPos = self:GetDirectTarget(CFG_W5_Scatter)
-    local aimDir = aimPos - muzzlePos
-    if aimDir:LengthSqr() < 1 then
-        self:Debug("W5 HELLFIRE: degenerate aim vector, skip")
-        return false
-    end
-    aimDir:Normalize()
-    local missile = ents.Create(CFG_W5_Entity)
-    if not IsValid(missile) then
-        self:Debug("W5 HELLFIRE: entity '" .. CFG_W5_Entity .. "' not found -- is SW installed?")
-        return true
-    end
-    missile:SetPos(muzzlePos)
-    missile:SetAngles(aimDir:Angle())
-    missile:SetOwner(self)
-    missile.IsOnPlane = true
-    missile.Launcher  = self
-    missile:Spawn()
-    missile:Activate()
-    local mPhys = missile:GetPhysicsObject()
-    if IsValid(mPhys) then
-        local fwd = Angle(0, self.flightYaw, 0):Forward() * self.Speed
-        mPhys:SetVelocity(fwd)
-    end
-    constraint.NoCollide(missile, self, 0, 0)
-    local mRef = missile
-    timer.Simple(0.6, function()
-        if IsValid(mRef) and IsValid(self) then constraint.RemoveConstraints(mRef, "NoCollide") end
-    end)
-    timer.Simple(0.15, function()
-        if not IsValid(mRef) then return end
-        local target = self:GetPrimaryTarget()
-        if IsValid(target) then
-            mRef.target       = target
-            mRef.targetOffset = target:WorldToLocal(target:GetPos())
-        else
-            local tr = util.TraceHull({
-                start  = muzzlePos,
-                endpos = muzzlePos + aimDir * 500000,
-                mins   = Vector(-20,-20,-20),
-                maxs   = Vector(20,20,20),
-                filter = { self, mRef }
-            })
-            if tr.Hit and IsValid(tr.Entity) then
-                mRef.target       = tr.Entity
-                mRef.targetOffset = tr.Entity:WorldToLocal(tr.HitPos)
-            else
-                mRef.target       = game.GetWorld()
-                mRef.targetOffset = game.GetWorld():WorldToLocal(aimPos)
-            end
-        end
-        mRef.GuidanceActive = true
-        mRef.HaveGuidance   = true
-        if mRef.Armed ~= nil then mRef.Armed = true end
-        if mRef.Launch then mRef:Launch() end
-        mRef:SetCollisionGroup(COLLISION_GROUP_PROJECTILE)
-    end)
-    local ed = EffectData()
-    ed:SetOrigin(muzzlePos) ed:SetAngles(self:GetAngles()) ed:SetEntity(self)
-    util.Effect("gred_particle_aircraft_muzzle", ed, true, true)
-    sound.Play("sw/rocket/rocket_start_01.wav", muzzlePos, 110, math.random(95,105), 1.0)
-    self:Debug("W5 HELLFIRE " .. self.WPN_ShotsFired .. "/" .. CFG_W5_Count)
-    return (self.WPN_ShotsFired >= CFG_W5_Count)
 end
 
 -- ============================================================
