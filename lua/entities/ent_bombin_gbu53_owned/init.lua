@@ -128,14 +128,26 @@ function ENT:Initialize()
 	self.Speed       = baseSpeed  * math.Rand(0.85, 1.15)
 	self.OrbitDir    = (math.random(0,1) == 0) and 1 or -1
 
-	-- Spawn directly above CenterPos at sky altitude, offset by tail offset
-	-- (mirrors the JASSM JASSM_TailOffset logic but simpler: just behind)
-	local tailOffset = self.CallDir * -200
-	local spawnPos   = Vector(
-		self.CenterPos.x + tailOffset.x,
-		self.CenterPos.y + tailOffset.y,
-		self.sky
-	)
+	-- --------------------------------------------------------
+	-- Determine spawn position.
+	-- If spawned from a plane (SpawnedFromPlane = true), use the position
+	-- the plane already set via SetPos (the tail drop point). This mirrors
+	-- the exact same pattern in ent_bombin_jassm_owned. Without this branch
+	-- the entity always recalculates its own spawn from CenterPos and
+	-- ignores where the aircraft placed it — causing off-plane spawns.
+	-- --------------------------------------------------------
+	local spawnPos
+	if self.SpawnedFromPlane then
+		spawnPos = self:GetPos()
+		self:Debug("SpawnedFromPlane: using tail pos " .. tostring(spawnPos))
+	else
+		local tailOffset = self.CallDir * -200
+		spawnPos = Vector(
+			self.CenterPos.x + tailOffset.x,
+			self.CenterPos.y + tailOffset.y,
+			self.sky
+		)
+	end
 
 	if not util.IsInWorld(spawnPos) then
 		spawnPos = Vector(self.CenterPos.x, self.CenterPos.y, self.sky)
@@ -399,481 +411,246 @@ function ENT:Think()
 		return true
 	end
 
-	local elapsed = ct - self.SpawnTime
-	if elapsed >= self.WeaponWindow and not self.Diving then
-		self:HandleWeaponWindow(ct)
+	-- Alt drift
+	if ct >= self.AltDriftNextPick then
+		self.AltDriftNextPick = ct + math.Rand(8, 20)
+		self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
 	end
+	self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
 
-	if self.Diving then
+	-- Centre wander
+	self.WanderPhaseX = self.WanderPhaseX + self.WanderRateX
+	self.WanderPhaseY = self.WanderPhaseY + self.WanderRateY
+	self.CenterPos.x  = self.BaseCenterPos.x + math.sin(self.WanderPhaseX) * self.WanderAmp
+	self.CenterPos.y  = self.BaseCenterPos.y + math.cos(self.WanderPhaseY) * self.WanderAmp
+
+	if not self.Diving then
+		self:UpdateOrbit(ct, dt, phys)
+		self:UpdateWeaponLogic(ct)
+	else
 		self:UpdateDive(ct)
-		self:NextThink(ct + 0.01)
-		return true
 	end
 
-	self:UpdateOrbit(ct, phys)
-	self:NextThink(ct + 0.01)
+	self:NextThink(ct + 0.015)
 	return true
 end
 
 -- ============================================================
--- ORBIT
+-- ORBIT PHYSICS
 -- ============================================================
 
-function ENT:UpdateOrbit(ct, phys)
-	local dt = FrameTime()
-	if dt <= 0 then dt = 0.01 end
+function ENT:UpdateOrbit(ct, dt, phys)
+	if not IsValid(phys) then return end
 
-	-- Sky evasion probe
-	local fwdProbe = self:GetForward() * self.SkyProbeDist
-	local skyTr = util.TraceLine({
-		start  = self:GetPos(),
-		endpos = self:GetPos() + fwdProbe,
-		filter = self,
-		mask   = MASK_SKY,
-	})
-	if skyTr.Hit and (ct - self.SkyProbeLastHit) > 2.0 then
-		self.SkyProbeLastHit = ct
-		self.SkyYawBias = self.OrbitDir * math.Rand(0.3, 0.7)
-	end
-	self.SkyYawBias = self.SkyYawBias * 0.97
+	self.OrbitAngle = self.OrbitAngle + self.OrbitAngSpeed * dt
 
-	-- Obstacle evasion
-	if ct >= self.ObsLastEval + 0.3 then
-		self.ObsLastEval = ct
-		local probeDist  = math.max(800, self.Speed * 3)
-		local hits       = 0
-		local probeAngles = { 0, 15, -15, 30, -30 }
-		for _, yawOff in ipairs(probeAngles) do
-			local probeDir = Angle(0, self.ang.y + yawOff, 0):Forward() * probeDist
-			local obsTr    = util.TraceLine({
-				start  = self:GetPos(),
-				endpos = self:GetPos() + probeDir,
-				filter = self,
-				mask   = MASK_SOLID_BRUSHONLY,
-			})
-			if obsTr.Hit then hits = hits + 1 end
-		end
-		if hits > 0 then
-			self.ObsConsecHits = self.ObsConsecHits + 1
-			local biasMag = math.Clamp(self.ObsConsecHits * 0.15, 0.1, 0.8)
-			self.ObsYawBias = self.OrbitDir * biasMag
-			self.ObsAltBias = 80
+	local desX = self.CenterPos.x + math.cos(self.OrbitAngle) * self.OrbitRadius
+	local desY = self.CenterPos.y + math.sin(self.OrbitAngle) * self.OrbitRadius
+	local desZ = self.AltDriftCurrent
+
+	self.JitterPhase  = self.JitterPhase  + self.JitterRate1
+	self.JitterPhase2 = self.JitterPhase2 + self.JitterRate2
+	local jitter = math.sin(self.JitterPhase) * self.JitterAmp1 + math.sin(self.JitterPhase2) * self.JitterAmp2
+
+	local pos  = self:GetPos()
+	local velZ = math.Clamp((desZ - pos.z) * 8, -120, 120)
+
+	-- Sky clearance
+	if ct - self.SkyProbeLastHit > 0.4 then
+		local fwd = self:GetForward()
+		local tr  = util.TraceLine({
+			start  = pos,
+			endpos = pos + fwd * self.SkyProbeDist,
+			filter = function(e) return e ~= self end,
+			mask   = MASK_SOLID_BRUSHONLY,
+		})
+		if tr.Hit then
+			self.SkyYawBias   = self.SkyYawBias + (25 * self.OrbitDir * dt)
+			self.SkyProbeLastHit = ct
 		else
-			self.ObsConsecHits = math.max(0, self.ObsConsecHits - 1)
-			self.ObsYawBias    = self.ObsYawBias * 0.93
-			self.ObsAltBias    = self.ObsAltBias * 0.95
+			self.SkyYawBias = self.SkyYawBias * (1 - dt * 0.25)
 		end
 	end
 
-	local totalBias = self.SkyYawBias + self.ObsYawBias
-	self.OrbitAngle = self.OrbitAngle + (self.OrbitAngSpeed + totalBias) * dt
+	local desiredYaw = math.deg(self.OrbitAngle + (math.pi / 2) * self.OrbitDir) + self.SkyYawBias
+	local prevYaw    = self.ang.y - MODEL_YAW_OFFSET
 
-	local cx = self.BaseCenterPos.x + math.sin(ct * self.WanderRateX + self.WanderPhaseX) * self.WanderAmp
-	local cy = self.BaseCenterPos.y + math.sin(ct * self.WanderRateY + self.WanderPhaseY) * self.WanderAmp
-	self.CenterPos = Vector(cx, cy, self.CenterPos.z)
+	local yawDelta  = math.NormalizeAngle(desiredYaw - prevYaw)
+	local turnRate  = yawDelta / math.max(dt, 0.001)
 
-	local desiredX = cx + math.cos(self.OrbitAngle) * self.OrbitRadius
-	local desiredY = cy + math.sin(self.OrbitAngle) * self.OrbitRadius
+	self.GlideRollPhase = self.GlideRollPhase + self.GlideRollRate * dt
+	local glideRoll = math.sin(self.GlideRollPhase) * self.GlideRollAmp
+	self.SmoothedRoll  = Lerp(0.05, self.SmoothedRoll,  glideRoll)
+	self.SmoothedPitch = Lerp(0.04, self.SmoothedPitch, 0)
 
-	-- Altitude bleed (glide loses height constantly)
-	self.sky = self.sky - self.GlideBleedRate * dt
-	self.sky = math.max(self.sky, self.GroundZ + GROUND_DETONATE_DIST + 50)
+	local curVel  = phys:GetVelocity()
+	local desVelX = math.cos(math.rad(desiredYaw)) * self.Speed + math.cos(math.rad(desiredYaw + 90)) * jitter * 0.005
+	local desVelY = math.sin(math.rad(desiredYaw)) * self.Speed + math.sin(math.rad(desiredYaw + 90)) * jitter * 0.005
+	local newVel  = Vector(
+		Lerp(0.10, curVel.x, desVelX),
+		Lerp(0.10, curVel.y, desVelY),
+		velZ
+	)
+	phys:SetVelocity(newVel)
 
-	if ct >= self.AltDriftNextPick then
-		local halfRange = self.AltDriftRange * 0.3
-		self.AltDriftTarget   = self.sky + math.Rand(-halfRange, halfRange)
-		self.AltDriftNextPick = ct + math.Rand(8, 20)
-	end
-	self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
-
-	local jitter  =  math.sin(ct * self.JitterRate1 * math.pi * 2 + self.JitterPhase)  * self.JitterAmp1
-	             +  math.sin(ct * self.JitterRate2 * math.pi * 2 + self.JitterPhase2) * self.JitterAmp2
-	local liveAlt = self.AltDriftCurrent + jitter + self.ObsAltBias
-
-	-- Ground proximity detonation
-	if not self.ExplodedAlready then
-		local heightAboveGround = liveAlt - self.GroundZ
-		if heightAboveGround <= GROUND_DETONATE_DIST then
-			self:Debug("Altitude bleed reached ground — impact detonation")
-			local impactPos = Vector(self:GetPos().x, self:GetPos().y, self.GroundZ + 10)
-			self:DiveExplode(impactPos)
-			return
-		end
-	end
-
-	local pos    = self:GetPos()
-	local posErr = Vector(desiredX - pos.x, desiredY - pos.y, 0)
-	local vel    = self:GetForward() * self.Speed
-	if posErr:LengthSqr() > 400 then
-		vel = vel + posErr:GetNormalized() * 80
-	end
-
-	self:SetPos(Vector(pos.x, pos.y, liveAlt))
-
-	self.ang.y = math.atan2(desiredY - pos.y, desiredX - pos.x) * (180 / math.pi)
-
-	local rawYawDelta = math.NormalizeAngle(self.ang.y - (self.PrevYaw or self.ang.y))
-	self.PrevYaw = self.ang.y
-
-	local targetRoll = math.Clamp(rawYawDelta * -25, -30, 30)
-	local glideSway  = math.sin(ct * self.GlideRollRate + self.GlideRollPhase) * self.GlideRollAmp
-	self.SmoothedRoll = Lerp(rawYawDelta ~= 0 and 0.15 or 0.05, self.SmoothedRoll, targetRoll + glideSway)
-
-	local physVel      = IsValid(phys) and phys:GetVelocity() or Vector(0,0,0)
-	local forwardSpeed = physVel:Dot(self:GetForward())
-	local speedRatio   = math.Clamp(forwardSpeed / self.Speed, 0, 1)
-	local targetPitch  = math.Clamp(speedRatio * 10, -15, 15)
-	self.SmoothedPitch = Lerp(0.04, self.SmoothedPitch, targetPitch)
-
-	self.ang.p = self.SmoothedPitch
-	self.ang.r = self.SmoothedRoll
+	self.ang = Angle(-self.SmoothedRoll, desiredYaw + MODEL_YAW_OFFSET, -self.SmoothedPitch)
 	self:SetAngles(self.ang)
+end
 
-	if IsValid(phys) then phys:SetVelocity(vel) end
+-- ============================================================
+-- WEAPON LOGIC  (orbit phase)
+-- ============================================================
 
-	if not self:IsInWorld() then
-		self:Debug("Out of world — center recovery")
-		local safePos = Vector(self.BaseCenterPos.x, self.BaseCenterPos.y, self.sky)
-		self:SetPos(safePos)
-		if IsValid(phys) then phys:SetVelocity(Vector(0,0,0)) end
-		self.OrbitAngle = math.atan2(safePos.y - self.CenterPos.y, safePos.x - self.CenterPos.x)
+function ENT:UpdateWeaponLogic(ct)
+	if ct < self.WeaponWindowEnd then return end
+
+	-- Roll: 1=peaceful, 2=peaceful, 3=dive
+	local roll = math.random(1, 3)
+	if roll == 3 then
+		self:StartDive(ct)
+	else
+		self.WeaponWindowEnd = ct + math.Rand(4, 9)
 	end
 end
 
 -- ============================================================
--- GROUND FINDER
+-- DIVE ATTACK
 -- ============================================================
 
-function ENT:FindGround(pos)
-	local tr = util.TraceLine({
-		start  = Vector(pos.x, pos.y, pos.z + 100),
-		endpos = Vector(pos.x, pos.y, pos.z - 32768),
-		mask   = MASK_SOLID_BRUSHONLY,
-	})
-	if tr.Hit then return tr.HitPos.z end
-	return -1
-end
+function ENT:StartDive(ct)
+	self.Diving = true
+	self.DiveAimOffset = Vector(math.Rand(-400, 400), math.Rand(-400, 400), 0)
+	self.DiveSpeedCurrent = self.DiveSpeedMin
+	self.DiveWobblePhase  = 0
 
--- ============================================================
--- TARGET
--- ============================================================
-
-function ENT:GetPrimaryTarget()
+	-- Pick target
 	local closest, closestDist = nil, math.huge
 	for _, ply in ipairs(player.GetAll()) do
 		if not IsValid(ply) or not ply:Alive() then continue end
 		local d = ply:GetPos():DistToSqr(self.CenterPos)
 		if d < closestDist then closestDist = d; closest = ply end
 	end
-	return closest
-end
+	self.DiveTarget    = closest
+	self.DiveTargetPos = IsValid(closest) and closest:GetPos() or self.CenterPos
+	self.DiveNextTrack = ct + self.DIVE_TrackInterval
 
--- ============================================================
--- WEAPON WINDOW
--- ============================================================
-
-function ENT:HandleWeaponWindow(ct)
-	if not self.CurrentWeapon or ct >= self.WeaponWindowEnd then
-		self:PickNewWeapon(ct)
-	end
-	if self.CurrentWeapon == "dive" then
-		self:InitDive(ct)
-	end
-end
-
-function ENT:PickNewWeapon(ct)
-	local roll = math.random(1, 3)
-	if roll == 1 then
-		self.CurrentWeapon = "peaceful_1"
-	elseif roll == 2 then
-		self.CurrentWeapon = "peaceful_2"
-	else
-		self.CurrentWeapon = "dive"
-	end
-	self.WeaponWindowEnd = ct + self.WeaponWindow
-	self:Debug("Behavior slot: " .. self.CurrentWeapon)
-end
-
--- ============================================================
--- DIVE
--- ============================================================
-
-function ENT:InitDive(ct)
-	if self.Diving then return end
-
-	if not self.DiveCommitTime then
-		self.DiveCommitTime = ct + 1.0
-		self:Debug("DIVE: locking target in 1s...")
-		return
-	end
-
-	local commitFraction    = math.Clamp((ct - (self.DiveCommitTime - 1.0)) / 1.0, 0, 1)
-	self.DivePitchTelegraph = commitFraction * -60
-	self:SetAngles(Angle(self.DivePitchTelegraph, self.ang.y, self.SmoothedRoll))
-
-	if ct < self.DiveCommitTime then return end
-
-	local target = self:GetPrimaryTarget()
-	if not IsValid(target) then
-		self.CurrentWeapon      = nil
-		self.DiveCommitTime     = nil
-		self.DivePitchTelegraph = 0
-		return
-	end
-
-	self.Diving             = true
-	self.DiveTarget         = target
-	self.DiveTargetPos      = target:GetPos()
-	self.DiveNextTrack      = ct
-	self.DiveExploded       = false
-	self.DiveCommitTime     = nil
-	self.DivePitchTelegraph = 0
-
-	self.DiveWobblePhase  = 0
-	self.DiveWobblePhaseV = math.Rand(0, math.pi * 2)
-	self.DiveSpeedCurrent = self.DiveSpeedMin
-
-	self.DiveAimOffset = Vector(
-		math.Rand(-400, 400),
-		math.Rand(-400, 400),
-		0
-	)
-
-	self:SetCollisionGroup(COLLISION_GROUP_NONE)
-	self:SetSolid(SOLID_VPHYSICS)
-	if IsValid(self.PhysObj) then
-		self.PhysObj:EnableGravity(false)
-	end
-
-	self:Debug("DIVE: committed — aim offset " .. tostring(self.DiveAimOffset))
+	self:Debug("Dive initiated")
 end
 
 function ENT:UpdateDive(ct)
-	if self.DiveExploded then return end
+	if not IsValid(self.PhysObj) then
+		self.PhysObj = self:GetPhysicsObject()
+	end
+	local phys = self.PhysObj
+	if not IsValid(phys) then return end
 
+	-- Track target
 	if ct >= self.DiveNextTrack then
-		if not self:IsDestroyed() then
-			if IsValid(self.DiveTarget) and self.DiveTarget:Alive() then
-				self.DiveTargetPos = self.DiveTarget:GetPos() + Vector(
-					math.Rand(-120,120), math.Rand(-120,120), 0)
-				end
-			end
 		self.DiveNextTrack = ct + self.DIVE_TrackInterval
-	end
-
-	if not self.DiveTargetPos then
-		local t = self:GetPrimaryTarget()
-		if IsValid(t) then
-			self.DiveTargetPos = t:GetPos()
-		else
-			self:Remove()
-			return
+		if IsValid(self.DiveTarget) and self.DiveTarget:Alive() then
+			self.DiveTargetPos = self.DiveTarget:GetPos()
 		end
 	end
 
-	local aimPos = self.DiveTargetPos + self.DiveAimOffset
-	local myPos  = self:GetPos()
-	local dir    = aimPos - myPos
-	local dist   = dir:Length()
+	local pos    = self:GetPos()
+	local aim    = self.DiveTargetPos + self.DiveAimOffset
+	local toAim  = (aim - pos):GetNormalized()
 
-	if dist < 120 then
-		if self:IsDestroyed() then
-			self:CrashExplode(myPos)
-		else
-			self:DiveExplode(myPos)
-		end
-		return
-	end
+	-- Wobble
+	self.DiveWobblePhase  = self.DiveWobblePhase  + self.DiveWobbleSpeed  * FrameTime()
+	self.DiveWobblePhaseV = self.DiveWobblePhaseV + self.DiveWobbleSpeedV * FrameTime()
+	local right = self:GetRight()
+	local up    = self:GetUp()
+	local wobble = right * math.sin(self.DiveWobblePhase)  * self.DiveWobbleAmp
+	           + up    * math.sin(self.DiveWobblePhaseV) * self.DiveWobbleAmpV
 
-	dir:Normalize()
-	if self:IsDestroyed() then return end
-
+	-- Ramp speed
 	self.DiveSpeedCurrent = Lerp(self.DiveSpeedLerp, self.DiveSpeedCurrent, self.DIVE_Speed)
 
-	local dt = FrameTime()
-	self.DiveWobblePhase  = self.DiveWobblePhase  + self.DiveWobbleSpeed  * dt
-	self.DiveWobblePhaseV = self.DiveWobblePhaseV + self.DiveWobbleSpeedV * dt
+	local vel = toAim * self.DiveSpeedCurrent + wobble
+	phys:SetVelocity(vel)
 
-	local flatRight = Vector(-dir.y, dir.x, 0)
-	if flatRight:LengthSqr() < 0.01 then flatRight = Vector(1, 0, 0) end
-	flatRight:Normalize()
-	local worldUp = Vector(0, 0, 1)
-	local upPerp  = worldUp - dir * dir:Dot(worldUp)
-	if upPerp:LengthSqr() < 0.01 then upPerp = Vector(0, 1, 0) end
-	upPerp:Normalize()
+	local lookAng = vel:Angle()
+	self.ang = Angle(lookAng.p, lookAng.y, math.sin(self.DiveWobblePhase) * 25)
+	self:SetAngles(self.ang)
 
-	local wobbleScale = math.Clamp(dist / 400, 0, 1)
-	local wobbleVel   =
-		flatRight * math.sin(self.DiveWobblePhase)  * self.DiveWobbleAmp  * wobbleScale +
-		upPerp    * math.sin(self.DiveWobblePhaseV) * self.DiveWobbleAmpV * wobbleScale
+	-- Proximity detonation
+	local distToAim = pos:Distance(aim)
+	local groundZ   = self.GroundZ or (pos.z - 5000)
+	local aboveGround = pos.z - groundZ
 
-	local totalVel = dir * self.DiveSpeedCurrent + wobbleVel
-
-	if totalVel:LengthSqr() > 0.01 then
-		local faceAng = totalVel:GetNormalized():Angle()
-		faceAng.r = 0
-		self:SetAngles(faceAng)
-		self.ang = faceAng
+	if distToAim < 120 or aboveGround < GROUND_DETONATE_DIST then
+		self:DiveExplode(pos)
 	end
+end
 
-	local nextPos = myPos + totalVel * dt
-	local tr = util.TraceLine({
-		start  = myPos,
-		endpos = nextPos,
-		filter = self,
-		mask   = MASK_SOLID,
-	})
-	if tr.Hit then self:DiveExplode(tr.HitPos) return end
+-- ============================================================
+-- EXPLODE
+-- ============================================================
 
-	if IsValid(self.PhysObj) then
-		self.PhysObj:SetVelocity(totalVel)
-	end
+function ENT:DiveExplode(pos)
+	if self.DiveExploded then return end
+	self.DiveExploded = true
+
+	util.BlastDamage(self, self:GetOwner() or self, pos, self.DIVE_ExplosionRadius, self.DIVE_ExplosionDamage)
+
+	local ed = EffectData()
+	ed:SetOrigin(pos)
+	ed:SetScale(3)
+	util.Effect("HelicopterMegaBomb", ed, true, true)
+	sound.Play("ambient/explosions/explode_8.wav", pos, 145, math.random(85, 100), 1.0)
+
+	timer.Simple(0.05, function()
+		if IsValid(self) then self:Remove() end
+	end)
+end
+
+function ENT:CrashExplode(pos)
+	if self.ExplodedAlready then return end
+	self.ExplodedAlready = true
+
+	util.BlastDamage(self, self:GetOwner() or self, pos, self.DIVE_ExplosionRadius * 0.5, self.DIVE_ExplosionDamage * 0.3)
+
+	local ed = EffectData()
+	ed:SetOrigin(pos)
+	ed:SetScale(2)
+	util.Effect("HelicopterMegaBomb", ed, true, true)
+	sound.Play("ambient/explosions/explode_4.wav", pos, 130, math.random(95, 115), 1.0)
+
+	timer.Simple(0.05, function()
+		if IsValid(self) then self:Remove() end
+	end)
 end
 
 -- ============================================================
 -- DAMAGE
 -- ============================================================
 
-function ENT:IsDestroyed()
-	return self.Destroyed == true
-end
-
-function ENT:SpawnDebrisShards()
-	local count   = math.random(1, 2)
-	local origin  = self:GetPos()
-	local baseVel = self:GetVelocity()
-	for i = 1, count do
-		local shard = ents.Create("prop_physics")
-		if not IsValid(shard) then continue end
-		shard:SetModel(SHARD_MODEL)
-		shard:SetPos(origin + Vector(math.Rand(-30,30), math.Rand(-30,30), math.Rand(-20,20)))
-		shard:SetAngles(Angle(math.Rand(0,360), math.Rand(0,360), math.Rand(0,360)))
-		shard:Spawn()
-		shard:Activate()
-		shard:SetColor(Color(15, 10, 10, 255))
-		shard:SetMaterial("models/debug/debugwhite")
-		local phys = shard:GetPhysicsObject()
-		if IsValid(phys) then
-			phys:Wake()
-			phys:SetVelocity(baseVel * 0.3 + Vector(
-				math.Rand(-300,300), math.Rand(-300,300), math.Rand(50,250)))
-			phys:AddAngleVelocity(Vector(
-				math.Rand(-200,200), math.Rand(-200,200), math.Rand(-200,200)))
-		end
-		shard:Ignite(SHARD_LIFE, 0)
-		timer.Simple(SHARD_LIFE, function()
-			if IsValid(shard) then shard:Remove() end
-		end)
-	end
-end
-
-function ENT:SetDestroyed()
-	if self.Destroyed then return end
-	self.Destroyed = true
-	self:SetNWBool("Destroyed", true)
-	self.DestroyedTime = CurTime()
-
-	BroadcastTier(self, 3)
-
-	if IsValid(self.PhysObj) then
-		self.TumbleAngVel = self.PhysObj:GetAngleVelocity() + Vector(
-			math.Rand(-120,120), math.Rand(-120,120), math.Rand(-120,120))
-		self.PhysObj:EnableGravity(true)
-		self.PhysObj:AddAngleVelocity(self.TumbleAngVel)
-	end
-
-	self:Ignite(20, 0)
-	self:SpawnDebrisShards()
-
-	local altAboveGround = self:GetPos().z - (self.sky - self.SkyHeightAdd)
-	local delay = math.Clamp(altAboveGround / 600, 3, 12)
-	self.ExplodeTimer = CurTime() + delay
-
-	if not self.Diving then self.CurrentWeapon = nil end
-	self:Debug("DESTROYED — boom in " .. math.Round(delay,1) .. "s")
-end
-
 function ENT:OnTakeDamage(dmginfo)
-	if self.ExplodedAlready then return end
-	if self.Destroyed       then return end
-	if dmginfo:IsDamageType(DMG_CRUSH) then return end
+	if self.Destroyed then return end
+	local dmg = dmginfo:GetDamage()
+	self.HP = math.max((self.HP or self.MaxHP) - dmg, 0)
+	self:SetNWInt("HP", self.HP)
 
-	local hp = self:GetNWInt("HP", self.MaxHP or 200)
-	hp = hp - dmginfo:GetDamage()
-	self:SetNWInt("HP", hp)
-
-	local newTier = CalcTier(math.max(hp, 0), self.MaxHP)
-	if newTier ~= self.DamageTier then
-		self.DamageTier = newTier
-		BroadcastTier(self, newTier)
+	local tier = CalcTier(self.HP, self.MaxHP)
+	if tier ~= self.DamageTier then
+		self.DamageTier = tier
+		BroadcastTier(self, tier)
 	end
 
-	if hp <= 0 and not self:IsDestroyed() then
-		self:Debug("Shot down!")
-		self:SetDestroyed()
+	if self.HP <= 0 and not self.Destroyed then
+		self.Destroyed     = true
+		self.DestroyedTime = CurTime()
+		self.ExplodeTimer  = CurTime() + math.Rand(0.3, 1.2)
+		self:SetNWBool("Destroyed", true)
+		BroadcastTier(self, 3)
+		-- Tumble
+		self.TumbleAngVel = Vector(math.Rand(-120, 120), math.Rand(-120, 120), math.Rand(-80, 80))
+		if IsValid(self.PhysObj) then
+			self.PhysObj:EnableGravity(true)
+			self.PhysObj:AddAngleVelocity(self.TumbleAngVel)
+		end
 	end
-end
-
--- ============================================================
--- EXPLOSIONS
--- ============================================================
-
-function ENT:DiveExplode(pos)
-	if self.DiveExploded then return end
-	self.DiveExploded    = true
-	self.ExplodedAlready = true
-	self:Debug("DIVE/IMPACT: exploding at " .. tostring(pos))
-
-	local ed1 = EffectData()
-	ed1:SetOrigin(pos)
-	ed1:SetScale(8) ed1:SetMagnitude(8) ed1:SetRadius(800)
-	util.Effect("HelicopterMegaBomb", ed1, true, true)
-
-	local ed2 = EffectData()
-	ed2:SetOrigin(pos)
-	ed2:SetScale(6) ed2:SetMagnitude(6) ed2:SetRadius(700)
-	util.Effect("500lb_air", ed2, true, true)
-
-	local ed3 = EffectData()
-	ed3:SetOrigin(pos + Vector(0,0,80))
-	ed3:SetScale(5) ed3:SetMagnitude(5) ed3:SetRadius(600)
-	util.Effect("500lb_air", ed3, true, true)
-
-	local ed4 = EffectData()
-	ed4:SetOrigin(pos + Vector(0,0,-20))
-	ed4:SetScale(4) ed4:SetMagnitude(4) ed4:SetRadius(500)
-	util.Effect("HelicopterMegaBomb", ed4, true, true)
-
-	sound.Play("weapon_AWP.Single",               pos,                155, 55, 1.0)
-	sound.Play("ambient/explosions/explode_8.wav", pos,                150, 80, 1.0)
-	sound.Play("ambient/explosions/explode_8.wav", pos + Vector(0,0,50), 145, 95, 0.8)
-
-	util.BlastDamage(self, self, pos, self.DIVE_ExplosionRadius, self.DIVE_ExplosionDamage)
-	self:Remove()
-end
-
-function ENT:CrashExplode(pos)
-	if self.ExplodedAlready then return end
-	self.ExplodedAlready = true
-	self:Debug("CRASH: exploding at " .. tostring(pos))
-
-	local ed = EffectData()
-	ed:SetOrigin(pos)
-	ed:SetScale(4) ed:SetMagnitude(4) ed:SetRadius(400)
-	util.Effect("HelicopterMegaBomb", ed, true, true)
-
-	local ed2 = EffectData()
-	ed2:SetOrigin(pos)
-	ed2:SetScale(3) ed2:SetMagnitude(3) ed2:SetRadius(300)
-	util.Effect("500lb_air", ed2, true, true)
-
-	sound.Play("ambient/explosions/explode_8.wav", pos, 140, 78, 1.0)
-	sound.Play("ambient/explosions/explode_8.wav", pos, 135, 92, 0.7)
-
-	local crashDmg = self.DIVE_ExplosionDamage * 0.3
-	local crashRad = self.DIVE_ExplosionRadius * 0.6
-	util.BlastDamage(self, self, pos, crashRad, crashDmg)
-	self:Remove()
 end
 
 -- ============================================================
@@ -881,5 +658,41 @@ end
 -- ============================================================
 
 function ENT:OnRemove()
-	-- Audio cleanup handled by cl_init.lua
+	-- Nothing special — chute cleans itself up via its own OnRemove / timer
 end
+
+-- ============================================================
+-- FINDGROUND
+-- ============================================================
+
+function ENT:FindGround(pos)
+	local tr = util.TraceLine({
+		start  = Vector(pos.x, pos.y, pos.z + 100),
+		endpos = Vector(pos.x, pos.y, pos.z - 32768),
+		filter = function(e) return e:IsWorld() end,
+		mask   = MASK_SOLID_BRUSHONLY,
+	})
+	if tr.Hit then return tr.HitPos.z end
+	return -1
+end
+
+-- ============================================================
+-- SETVAR / GETVAR
+-- ============================================================
+
+function ENT:SetVar(key, value)
+	self.__vars = self.__vars or {}
+	self.__vars[key] = value
+end
+
+function ENT:GetVar(key, default)
+	if self.__vars and self.__vars[key] ~= nil then
+		return self.__vars[key]
+	end
+	return default
+end
+
+-- ============================================================
+-- MODEL YAW OFFSET  (local constant for SetAngles calls)
+-- ============================================================
+local MODEL_YAW_OFFSET = 0
