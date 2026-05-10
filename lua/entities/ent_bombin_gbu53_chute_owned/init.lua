@@ -1,20 +1,6 @@
 -- ============================================================
 -- ent_bombin_gbu53_chute_owned  —  SERVER
---
--- Palette/chute/4x visual munition combo used by the C-17 GBU-53 drop.
--- Critical fixes:
--- 1) Children are spawned with temporary NoCollide against the launcher plane.
--- 2) Owner remains the loitering missile entity; Think() never follows the plane.
--- 3) Combo tracks the missile cleanly, then detaches into debris on ignition.
--- 4) FIX: collision group changed from COLLISION_GROUP_WORLD to
---    COLLISION_GROUP_INTERACTIVE_DEBRIS.
--- 5) FIX: detached debris refs gathered into a single timer to prevent prop leaks.
--- 6) FIX: chute not falling after ignition — mirror JASSM fresh-prop pattern.
--- 7) FIX: munition children used SetParent+SetLocalPos which requires a live
---    PhysicsObject on the palette at spawn time. The palette is MOVETYPE_NONE
---    so its PhysicsObject does not exist yet — children snapped to world origin.
---    Fix: spawn children at world-space positions, track them manually in Think()
---    by storing their offsets. SetParent is removed entirely.
+-- Palette / chute / 4x visual munition combo for C-17 GBU-53.
 -- ============================================================
 
 AddCSLuaFile("cl_init.lua")
@@ -32,21 +18,22 @@ local CHUTE_SCALE    = 2.2
 local PALETTE_ABOVE_MISSILE = Vector(0, 0, 110)
 local CHUTE_ABOVE_PALETTE   = Vector(0, 0, 90)
 
--- FIX 7: offsets are used for world-space positioning in Think(),
--- not as SetLocalPos arguments. Z is 0 here — they sit ON the palette surface.
+-- Munition offsets: XY spread wide enough to clear the palette visually,
+-- Z raised 8 units so munitions sit ON TOP of the crate surface.
+-- Previously ±18/10 XY at Z=0 put them inside the palette model.
 local MUNITION_OFFSETS = {
-	Vector( 18,  10, 0),
-	Vector( 18, -10, 0),
-	Vector(-18,  10, 0),
-	Vector(-18, -10, 0),
+	Vector( 30,  18, 8),
+	Vector( 30, -18, 8),
+	Vector(-30,  18, 8),
+	Vector(-30, -18, 8),
 }
 local MUNITION_YAW_OFFSETS = { 0, 0, 180, 180 }
 
 local SWAY_AMP  = 2.8
 local SWAY_RATE = 1.1
 local THINK_DT  = 1 / 60
-local CHILD_NOCLIP_HOLD  = 1.8
-local DEBRIS_LIFETIME    = 14
+local CHILD_NOCLIP_HOLD = 1.8
+local DEBRIS_LIFETIME   = 14
 
 function ENT:Initialize()
 	self:SetModel(PALETTE_MODEL)
@@ -75,8 +62,7 @@ function ENT:SpawnChildren()
 	local basePos  = self:GetPos()
 	local baseAng  = self:GetAngles()
 
-	-- Chute: parented via SetParent is fine here because we only use
-	-- SetLocalPos for a static kinematic child — no PhysicsObject needed.
+	-- Chute: SetParent is fine here (static kinematic child, no physics needed)
 	local chute = ents.Create("prop_physics")
 	if IsValid(chute) then
 		chute:SetModel(CHUTE_MODEL)
@@ -103,23 +89,20 @@ function ENT:SpawnChildren()
 		end
 	end
 
-	-- FIX 7: munitions are placed at world-space positions calculated from
-	-- the palette's current pos+ang. NO SetParent — they are tracked manually
-	-- in Think() by rotating their offsets into world space each frame.
+	-- Munitions: world-space spawn, tracked manually in Think().
+	-- NO SetParent — palette is MOVETYPE_NONE so it has no PhysicsObject.
+	local cosY = math.cos(math.rad(baseAng.y))
+	local sinY = math.sin(math.rad(baseAng.y))
 	for i = 1, 4 do
 		local mun = ents.Create("prop_physics")
 		if not IsValid(mun) then continue end
 
-		-- Rotate the local offset into world space using the palette's current yaw.
-		local localOff  = MUNITION_OFFSETS[i]
-		local worldOff  = Vector(
-			localOff.x * math.cos(math.rad(baseAng.y)) - localOff.y * math.sin(math.rad(baseAng.y)),
-			localOff.x * math.sin(math.rad(baseAng.y)) + localOff.y * math.cos(math.rad(baseAng.y)),
-			localOff.z
-		)
+		local off = MUNITION_OFFSETS[i]
+		local wx  = off.x * cosY - off.y * sinY
+		local wy  = off.x * sinY + off.y * cosY
 
 		mun:SetModel(MUNITION_MODEL)
-		mun:SetPos(basePos + worldOff)
+		mun:SetPos(Vector(basePos.x + wx, basePos.y + wy, basePos.z + off.z))
 		mun:SetAngles(Angle(0, baseAng.y + MUNITION_YAW_OFFSETS[i], 0))
 		mun:Spawn()
 		mun:Activate()
@@ -128,7 +111,6 @@ function ENT:SpawnChildren()
 		mun:SetSolid(SOLID_NONE)
 		mun:SetCollisionGroup(COLLISION_GROUP_NONE)
 		mun:DrawShadow(false)
-		-- No SetParent — we drive position manually in Think()
 		self.MunitionEnts[i] = mun
 
 		if IsValid(launcher) then
@@ -164,8 +146,6 @@ function ENT:Think()
 	self:SetPos(palettePos)
 	self:SetAngles(Angle(sway, paletteYaw, 0))
 
-	-- FIX 7: drive munition world positions manually each tick.
-	-- Rotate local offsets by current palette yaw, then add palette world pos.
 	local cosY = math.cos(math.rad(paletteYaw))
 	local sinY = math.sin(math.rad(paletteYaw))
 	for i = 1, 4 do
@@ -189,7 +169,6 @@ function ENT:Detach()
 	local pos = self:GetPos()
 	local ang = self:GetAngles()
 
-	-- Chute: spawn fresh prop_physics clone (JASSM pattern — guaranteed gravity)
 	local chutePos = pos + CHUTE_ABOVE_PALETTE
 	if IsValid(self.ChuteEnt) then
 		chutePos = self.ChuteEnt:GetPos()
@@ -222,7 +201,6 @@ function ENT:Detach()
 		end
 	end
 
-	-- Palette: switch to live physics
 	self:PhysicsInit(SOLID_VPHYSICS)
 	self:SetMoveType(MOVETYPE_VPHYSICS)
 	self:SetSolid(SOLID_VPHYSICS)
@@ -235,7 +213,6 @@ function ENT:Detach()
 		palPhys:AddAngleVelocity(Vector(math.Rand(-40, 40), math.Rand(-40, 40), math.Rand(-20, 20)))
 	end
 
-	-- Munitions: they were never parented so just switch their movetype in place
 	for i = 1, 4 do
 		local mun = self.MunitionEnts[i]
 		if not IsValid(mun) then continue end

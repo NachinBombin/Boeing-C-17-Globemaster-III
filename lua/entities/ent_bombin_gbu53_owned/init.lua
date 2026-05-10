@@ -1,34 +1,6 @@
 -- ============================================================
 -- ent_bombin_gbu53_owned  —  SERVER
 -- GBU-53/B StormBreaker owned variant.
--- Spawned by the AC-130 support plane.  Rides under a
--- chute+palette assembly (ent_bombin_gbu53_chute_owned) during
--- freefall, ignites at IgnitionAlt, then orbits and dives.
---
--- Interface  (set via SetVar before Spawn+Activate):
---   CenterPos            Vector   — target area centre
---   CallDir              Vector   — plane heading at drop
---   Lifetime             number   — seconds before auto-remove  (default 60)
---   SkyHeightAdd         number   — ground + this = sky ceiling (default 2500)
---   OrbitRadius          number   — orbit radius in units       (default 2500)
---   Speed                number   — cruise speed in u/s         (default 250)
---   DIVE_ExplosionDamage number
---   DIVE_ExplosionRadius number
---
--- FIXES:
---   1. MODEL_YAW_OFFSET was declared AFTER UpdateOrbit() used it.
---      In Lua, local upvalues are only visible from their declaration line
---      downward. Moved the constant to the top of the file.
---   2. IgniteEngine() never called SetBodygroup(1,1) to extend wings.
---      Added the same bodygroup call the JASSM uses.
---   3. IgniteEngine() only armed this single missile. With 4 visual
---      munitions on the palette, the system should fire 4 real
---      ent_bombin_gbu53_owned missiles with staggered ignition delays
---      so each one independently orbits and dives. SpawnSalvo() handles this.
---   4. Munitions in SpawnChildren() used SetParent+SetLocalPos which
---      requires the palette's PhysicsObject to be initialised — it isn't
---      at spawn time (MOVETYPE_NONE). Replaced with world-space positioning
---      and manual tracking in Think(), removing the SetParent dependency.
 -- ============================================================
 
 AddCSLuaFile("cl_init.lua")
@@ -38,9 +10,6 @@ include("shared.lua")
 
 -- ============================================================
 -- LOCAL CONSTANTS
--- FIX 1: MODEL_YAW_OFFSET MUST be at the top of the file.
--- Previously it was declared at the very bottom, after UpdateOrbit()
--- referenced it — causing a nil upvalue crash on the first orbit tick.
 -- ============================================================
 local MODEL_YAW_OFFSET     = 0
 
@@ -59,10 +28,8 @@ local HORIZ_GLIDE_RAMP     = 1.4
 local IGNITION_ALT_FRAC    = 0.35
 local ORBIT_ALT_RISE       = 600
 
--- Salvo: 4 missiles, staggered ignition delays in seconds.
--- Each missile in the salvo gets an independent orbit/dive cycle.
 local SALVO_COUNT          = 4
-local SALVO_DELAY_BASE     = 0.6   -- seconds between each missile ignition
+local SALVO_DELAY_BASE     = 0.6
 local SALVO_DELAY_JITTER   = 0.3
 
 ENT.WeaponWindow  = 8
@@ -72,6 +39,21 @@ ENT.DIVE_Speed         = 1800
 ENT.DIVE_TrackInterval = 0.1
 
 util.AddNetworkString("bombin_gbu53owned_damage_tier")
+
+-- ============================================================
+-- FIRE EFFECT HELPER  (mirrors JASSM FireEffect exactly)
+-- Using util.Effect with EffectData scale/magnitude/radius set
+-- prevents the index-buffer crash that raw HelicopterMegaBomb
+-- calls caused when the effect had too many indices.
+-- ============================================================
+local function FireEffect(origin, effect, scale)
+	local ed = EffectData()
+	ed:SetOrigin(origin)
+	ed:SetScale(scale)
+	ed:SetMagnitude(scale)
+	ed:SetRadius(scale * 100)
+	util.Effect(effect, ed, true, true)
+end
 
 -- ============================================================
 -- TIER HELPERS
@@ -97,7 +79,7 @@ end
 -- ============================================================
 
 function ENT:Debug(msg)
-	print("[Bombin GBU53-Owned] " .. tostring(msg))
+	print("[Npc C-17 Globemaster] " .. tostring(msg))
 end
 
 -- ============================================================
@@ -113,8 +95,6 @@ function ENT:Initialize()
 	self.DIVE_ExplosionDamage = self:GetVar("DIVE_ExplosionDamage", 700)
 	self.DIVE_ExplosionRadius = self:GetVar("DIVE_ExplosionRadius", 900)
 
-	-- SalvoIndex: which slot this missile occupies (1-4).
-	-- 1 = the primary missile spawned by the chute; 2-4 are spawned by SpawnSalvo().
 	self.SalvoIndex   = self:GetVar("SalvoIndex", 1)
 	self.IsSalvoChild = self:GetVar("IsSalvoChild", false)
 
@@ -176,10 +156,6 @@ function ENT:Initialize()
 	self:SetCollisionGroup(COLLISION_GROUP_NONE)
 	self:SetPos(spawnPos)
 	self:SetRenderMode(RENDERMODE_NORMAL)
-
-	-- FIX 2: wings start folded (bodygroup 1 = 0)
-	-- IgniteEngine() will call SetBodygroup(1, 1) to extend them,
-	-- mirroring exactly what ent_bombin_jassm_owned does.
 	self:SetBodygroup(1, 0)
 
 	self:SetNWInt("HP",    self.MaxHP)
@@ -264,8 +240,6 @@ function ENT:Initialize()
 	self.ObsAltBias    = 0
 	self.ObsConsecHits = 0
 
-	-- Only the primary missile (SalvoIndex==1, not a salvo child) spawns the chute.
-	-- Salvo children are spawned directly at ignition altitude with no chute.
 	if not self.IsSalvoChild then
 		timer.Simple(0, function()
 			if not IsValid(self) then return end
@@ -296,11 +270,7 @@ function ENT:SpawnChute()
 end
 
 -- ============================================================
--- SALVO SPAWN  (FIX 3)
--- Called from IgniteEngine() on the primary missile only.
--- Spawns SALVO_COUNT-1 additional ent_bombin_gbu53_owned missiles
--- with staggered delays, each with independent orbit + dive cycles.
--- Salvo children skip the chute and enter orbit directly.
+-- SALVO SPAWN
 -- ============================================================
 
 function ENT:SpawnSalvo()
@@ -313,7 +283,6 @@ function ENT:SpawnSalvo()
 			local child = ents.Create("ent_bombin_gbu53_owned")
 			if not IsValid(child) then return end
 
-			-- Inherit all caller parameters
 			child:SetVar("CenterPos",            self.BaseCenterPos)
 			child:SetVar("CallDir",              self.CallDir)
 			child:SetVar("Lifetime",             self.Lifetime)
@@ -325,8 +294,6 @@ function ENT:SpawnSalvo()
 			child:SetVar("SalvoIndex",           idx)
 			child:SetVar("IsSalvoChild",         true)
 
-			-- Place at ignition altitude with slight XY scatter so orbits
-			-- don't overlap perfectly
 			local scatter = Vector(math.Rand(-120, 120), math.Rand(-120, 120), 0)
 			child:SetPos(Vector(
 				self.BaseCenterPos.x + scatter.x,
@@ -335,8 +302,6 @@ function ENT:SpawnSalvo()
 			))
 			child:Spawn()
 			child:Activate()
-
-			-- Skip freefall: go straight to orbit
 			child:IgniteEngine()
 			self:Debug("Salvo child " .. idx .. " ignited")
 		end)
@@ -391,10 +356,7 @@ function ENT:IgniteEngine()
 
 	self:Debug("Engine ignited [salvo " .. self.SalvoIndex .. "] at Z=" .. math.Round(self:GetPos().z))
 
-	-- Signal the chute to detach
 	self:SetNWBool("EngineOn", true)
-
-	-- FIX 2: extend wings on ignition — bodygroup 1 slot 1, same as JASSM
 	self:SetBodygroup(1, 1)
 
 	self:PhysicsInit(SOLID_VPHYSICS)
@@ -422,14 +384,11 @@ function ENT:IgniteEngine()
 	self.AltDriftTarget   = self.OrbitAlt
 	self.AltDriftNextPick = CurTime() + math.Rand(8, 20)
 
-	local ed = EffectData()
-	ed:SetOrigin(pos)
-	ed:SetScale(2)
-	util.Effect("HelicopterMegaBomb", ed, true, true)
-	sound.Play("ambient/explosions/exp_smoke.wav", pos, 95, 110, 0.9)
+	-- Ignition burst: match JASSM sounds exactly
+	FireEffect(pos + self:GetForward() * -40, "HelicopterMegaBomb", 2)
+	sound.Play("ambient/fire/gas_burst1.wav",       pos, 100, math.random(90, 110), 1.0)
+	sound.Play("ambient/fire/fire_large_loop1.wav", pos,  85, 130,                  0.6)
 
-	-- FIX 3: primary missile fires the full salvo of 3 additional missiles.
-	-- IsSalvoChild guard prevents infinite recursion.
 	if not self.IsSalvoChild then
 		self:SpawnSalvo()
 	end
@@ -531,11 +490,9 @@ function ENT:UpdateOrbit(ct, dt, phys)
 	end
 
 	local desiredYaw = math.deg(self.OrbitAngle + (math.pi / 2) * self.OrbitDir) + self.SkyYawBias
-	-- FIX 1: MODEL_YAW_OFFSET is now a valid upvalue (declared at top of file)
 	local prevYaw    = self.ang.y - MODEL_YAW_OFFSET
 
 	local yawDelta  = math.NormalizeAngle(desiredYaw - prevYaw)
-	local turnRate  = yawDelta / math.max(dt, 0.001)
 
 	self.GlideRollPhase = self.GlideRollPhase + self.GlideRollRate * dt
 	local glideRoll = math.sin(self.GlideRollPhase) * self.GlideRollAmp
@@ -638,20 +595,29 @@ function ENT:UpdateDive(ct)
 end
 
 -- ============================================================
--- EXPLODE
+-- EXPLODE  —  mirrors JASSM FireEffect pattern exactly
+-- FIX: util.BlastDamage attacker is now self (not GetOwner()).
+--      GetOwner() returns the chute entity, which is already
+--      removed by the time DiveExplode fires.  NULL entity as
+--      the attacker arg crashes BlastDamage at [C]:-1.
 -- ============================================================
 
 function ENT:DiveExplode(pos)
 	if self.DiveExploded then return end
-	self.DiveExploded = true
+	self.DiveExploded    = true
+	self.ExplodedAlready = true
 
-	util.BlastDamage(self, self:GetOwner() or self, pos, self.DIVE_ExplosionRadius, self.DIVE_ExplosionDamage)
+	FireEffect(pos,                   "HelicopterMegaBomb", 8)
+	FireEffect(pos,                   "500lb_air",          7)
+	FireEffect(pos + Vector(0,0, 80), "500lb_air",          6)
+	FireEffect(pos + Vector(0,0,160), "500lb_air",          5)
+	FireEffect(pos + Vector(0,0, 20), "HelicopterMegaBomb", 6)
 
-	local ed = EffectData()
-	ed:SetOrigin(pos)
-	ed:SetScale(3)
-	util.Effect("HelicopterMegaBomb", ed, true, true)
-	sound.Play("ambient/explosions/explode_8.wav", pos, 145, math.random(85, 100), 1.0)
+	sound.Play("weapon_AWP.Single",                pos,                155, 52,  1.0)
+	sound.Play("ambient/explosions/explode_8.wav", pos,                150, 78,  1.0)
+	sound.Play("ambient/explosions/explode_8.wav", pos+Vector(0,0,40), 145, 85,  0.9)
+
+	util.BlastDamage(self, self, pos, self.DIVE_ExplosionRadius, self.DIVE_ExplosionDamage)
 
 	timer.Simple(0.05, function()
 		if IsValid(self) then self:Remove() end
@@ -662,13 +628,14 @@ function ENT:CrashExplode(pos)
 	if self.ExplodedAlready then return end
 	self.ExplodedAlready = true
 
-	util.BlastDamage(self, self:GetOwner() or self, pos, self.DIVE_ExplosionRadius * 0.5, self.DIVE_ExplosionDamage * 0.3)
+	FireEffect(pos,                  "HelicopterMegaBomb", 5)
+	FireEffect(pos,                  "500lb_air",          4)
+	FireEffect(pos + Vector(0,0,60), "500lb_air",          3)
 
-	local ed = EffectData()
-	ed:SetOrigin(pos)
-	ed:SetScale(2)
-	util.Effect("HelicopterMegaBomb", ed, true, true)
-	sound.Play("ambient/explosions/explode_4.wav", pos, 130, math.random(95, 115), 1.0)
+	sound.Play("ambient/explosions/explode_8.wav", pos, 145, 72, 1.0)
+	sound.Play("ambient/explosions/explode_8.wav", pos, 140, 88, 0.8)
+
+	util.BlastDamage(self, self, pos, self.DIVE_ExplosionRadius * 0.6, self.DIVE_ExplosionDamage * 0.3)
 
 	timer.Simple(0.05, function()
 		if IsValid(self) then self:Remove() end
