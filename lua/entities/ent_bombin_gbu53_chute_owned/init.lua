@@ -8,10 +8,16 @@
 -- 3) Combo tracks the missile cleanly, then detaches into debris on ignition.
 -- 4) FIX: collision group changed from COLLISION_GROUP_WORLD to
 --    COLLISION_GROUP_INTERACTIVE_DEBRIS so the chute prop does not clip
---    into world geometry on detach. WORLD group means it collides WITH the
---    world; INTERACTIVE_DEBRIS is correct for loose falling props.
--- 5) FIX: detached debris (chute + munitions) are gathered into a single
---    timer and auto-removed after 14 seconds to prevent prop leaks.
+--    into world geometry on detach.
+-- 5) FIX: detached debris refs gathered into a single timer to prevent prop leaks.
+-- 6) FIX: chute no longer falls after ignition.
+--    Root cause: Detach() was calling SetMoveType(MOVETYPE_VPHYSICS) on the
+--    pre-existing parented prop_physics ChuteEnt. A reused parented prop has
+--    no guaranteed gravity state and its physics object may be asleep after
+--    unparenting. The Z velocity range was also -20..+30, allowing upward drift.
+--    Fix: mirror the JASSM chute pattern exactly — remove the old ChuteEnt and
+--    spawn a fresh prop_physics clone at its position with gravity on by default
+--    and a proper downward velocity seeded.
 -- ============================================================
 
 AddCSLuaFile("cl_init.lua")
@@ -65,7 +71,7 @@ function ENT:Initialize()
 end
 
 function ENT:SpawnChildren()
-	local missile = self:GetOwner()
+	local missile  = self:GetOwner()
 	local launcher = IsValid(missile) and missile.Launcher or nil
 
 	local chute = ents.Create("prop_physics")
@@ -155,12 +161,50 @@ function ENT:Detach()
 	local pos = self:GetPos()
 	local ang = self:GetAngles()
 
+	-- --------------------------------------------------------
+	-- CHUTE: mirror the JASSM pattern.
+	-- Remove the old parented ChuteEnt and spawn a fresh prop_physics
+	-- clone in its place. A brand-new prop_physics always initialises
+	-- with gravity on by default, guaranteeing it will fall. Reusing the
+	-- parented prop via SetMoveType was unreliable: the physics object
+	-- could be asleep after unparenting and gravity state was undefined.
+	-- --------------------------------------------------------
+	local chutePos = pos + CHUTE_ABOVE_PALETTE
 	if IsValid(self.ChuteEnt) then
-		self.ChuteEnt:SetParent(nil)
-		self.ChuteEnt:SetPos(pos + CHUTE_ABOVE_PALETTE)
-		self.ChuteEnt:SetAngles(ang)
+		chutePos = self.ChuteEnt:GetPos()  -- use actual world pos in case of drift
+		self.ChuteEnt:Remove()
+		self.ChuteEnt = nil
 	end
 
+	local chuteClone = ents.Create("prop_physics")
+	if IsValid(chuteClone) then
+		chuteClone:SetModel(CHUTE_MODEL)
+		chuteClone:SetPos(chutePos)
+		chuteClone:SetAngles(ang)
+		chuteClone:Spawn()
+		chuteClone:Activate()
+		chuteClone:SetModelScale(CHUTE_SCALE, 0)
+		chuteClone:SetCollisionGroup(COLLISION_GROUP_INTERACTIVE_DEBRIS)
+		local cPhys = chuteClone:GetPhysicsObject()
+		if IsValid(cPhys) then
+			cPhys:Wake()
+			-- Seed a convincing cinematic drift: lateral scatter + downward fall
+			cPhys:SetVelocity(Vector(
+				math.Rand(-80, 80),
+				math.Rand(-80, 80),
+				math.Rand(-60, -20)   -- always downward, matching JASSM feel
+			))
+			cPhys:AddAngleVelocity(Vector(
+				math.Rand(-60, 60),
+				math.Rand(-60, 60),
+				math.Rand(-30, 30)
+			))
+		end
+	end
+
+	-- --------------------------------------------------------
+	-- PALETTE + MUNITIONS: switch to live physics normally.
+	-- --------------------------------------------------------
 	for i = 1, 4 do
 		local mun = self.MunitionEnts[i]
 		if IsValid(mun) then
@@ -173,8 +217,6 @@ function ENT:Detach()
 	self:PhysicsInit(SOLID_VPHYSICS)
 	self:SetMoveType(MOVETYPE_VPHYSICS)
 	self:SetSolid(SOLID_VPHYSICS)
-	-- FIX: was COLLISION_GROUP_WORLD which made the palette clip into geometry.
-	-- INTERACTIVE_DEBRIS is the correct group for loose falling debris.
 	self:SetCollisionGroup(COLLISION_GROUP_INTERACTIVE_DEBRIS)
 
 	local palPhys = self:GetPhysicsObject()
@@ -182,19 +224,6 @@ function ENT:Detach()
 		palPhys:Wake()
 		palPhys:SetVelocity(Vector(math.Rand(-60, 60), math.Rand(-60, 60), math.Rand(-30, 10)))
 		palPhys:AddAngleVelocity(Vector(math.Rand(-40, 40), math.Rand(-40, 40), math.Rand(-20, 20)))
-	end
-
-	if IsValid(self.ChuteEnt) then
-		self.ChuteEnt:SetMoveType(MOVETYPE_VPHYSICS)
-		self.ChuteEnt:SetSolid(SOLID_VPHYSICS)
-		-- FIX: same collision group correction for the chute prop.
-		self.ChuteEnt:SetCollisionGroup(COLLISION_GROUP_INTERACTIVE_DEBRIS)
-		local cPhys = self.ChuteEnt:GetPhysicsObject()
-		if IsValid(cPhys) then
-			cPhys:Wake()
-			cPhys:SetVelocity(Vector(math.Rand(-80, 80), math.Rand(-80, 80), math.Rand(-20, 30)))
-			cPhys:AddAngleVelocity(Vector(math.Rand(-60, 60), math.Rand(-60, 60), math.Rand(-30, 30)))
-		end
 	end
 
 	for i = 1, 4 do
@@ -218,9 +247,8 @@ function ENT:Detach()
 
 	sound.Play("npc/combine_soldier/zipline_clip2.wav", pos, 82, math.random(93, 110), 1.0)
 
-	-- FIX: collect all debris refs at detach time so the timer closure
-	-- does not hold stale upvalues if children are independently removed.
-	local debrisRefs = { self, self.ChuteEnt }
+	-- Collect all debris for the cleanup timer.
+	local debrisRefs = { self, chuteClone }
 	for i = 1, 4 do debrisRefs[#debrisRefs + 1] = self.MunitionEnts[i] end
 	timer.Simple(DEBRIS_LIFETIME, function()
 		for _, e in ipairs(debrisRefs) do
