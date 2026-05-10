@@ -1,5 +1,5 @@
 -- ============================================================
--- ent_bombin_gbu53_chute_owned  —  SERVER
+-- ent_bombin_gbu53_chute_owned  --  SERVER
 -- Palette / chute / 4x visual munition combo for C-17 GBU-53.
 -- ============================================================
 
@@ -18,9 +18,6 @@ local CHUTE_SCALE    = 2.2
 local PALETTE_ABOVE_MISSILE = Vector(0, 0, 110)
 local CHUTE_ABOVE_PALETTE   = Vector(0, 0, 90)
 
--- Munition offsets: XY spread wide enough to clear the palette visually,
--- Z raised 8 units so munitions sit ON TOP of the crate surface.
--- Previously ±18/10 XY at Z=0 put them inside the palette model.
 local MUNITION_OFFSETS = {
 	Vector( 30,  18, 8),
 	Vector( 30, -18, 8),
@@ -32,10 +29,13 @@ local MUNITION_YAW_OFFSETS = { 0, 0, 180, 180 }
 local SWAY_AMP  = 2.8
 local SWAY_RATE = 1.1
 local THINK_DT  = 1 / 60
-local CHILD_NOCLIP_HOLD = 1.8
-local DEBRIS_LIFETIME   = 14
+local CHILD_NOCLIP_HOLD  = 1.8
+local DEBRIS_LIFETIME    = 14
 local RELEASE_STEP_DELAY = 0.5
 
+-- ============================================================
+-- INITIALIZE
+-- ============================================================
 function ENT:Initialize()
 	self:SetModel(PALETTE_MODEL)
 	self:SetModelScale(PALETTE_SCALE, 0)
@@ -47,6 +47,7 @@ function ENT:Initialize()
 	self.SwayClock    = math.Rand(0, math.pi * 2)
 	self.MunitionEnts = {}
 	self.ChuteEnt     = nil
+	self.ChuteClone   = nil   -- track detach-phase clone to prevent leaks
 	self.Detached     = false
 
 	timer.Simple(0, function()
@@ -57,13 +58,16 @@ function ENT:Initialize()
 	self:EmitSound("npc/combine_soldier/zipline_clip1.wav", 75, 108, 0.85)
 end
 
+-- ============================================================
+-- CHILDREN
+-- ============================================================
 function ENT:SpawnChildren()
 	local missile  = self:GetOwner()
 	local launcher = IsValid(missile) and missile.Launcher or nil
 	local basePos  = self:GetPos()
 	local baseAng  = self:GetAngles()
 
-	-- Chute: SetParent is fine here (static kinematic child, no physics needed)
+	-- Chute: purely cosmetic MOVETYPE_NONE child, parented for position.
 	local chute = ents.Create("prop_physics")
 	if IsValid(chute) then
 		chute:SetModel(CHUTE_MODEL)
@@ -90,8 +94,7 @@ function ENT:SpawnChildren()
 		end
 	end
 
-	-- Munitions: world-space spawn, tracked manually in Think().
-	-- NO SetParent — palette is MOVETYPE_NONE so it has no PhysicsObject.
+	-- Munitions: world-space manual tracking in Think(), no SetParent.
 	local cosY = math.cos(math.rad(baseAng.y))
 	local sinY = math.sin(math.rad(baseAng.y))
 	for i = 1, 4 do
@@ -124,6 +127,9 @@ function ENT:SpawnChildren()
 	end
 end
 
+-- ============================================================
+-- THINK  (freefall tracking)
+-- ============================================================
 function ENT:Think()
 	if self.Detached then return end
 
@@ -138,10 +144,22 @@ function ENT:Think()
 		return
 	end
 
+	local missilePos = missile:GetPos()
+
+	-- Fix: if the missile has drifted outside the world (skybox boundary
+	-- on small maps, or the orbit radius carrying it past map edges),
+	-- the entire combo would be teleported out-of-bounds and silently
+	-- removed by the engine, leaving orphaned siblings.  Detect this
+	-- early and cleanly remove the whole combo instead.
+	if not util.IsInWorld(missilePos) then
+		self:FullRemove()
+		return
+	end
+
 	self.SwayClock = self.SwayClock + SWAY_RATE * THINK_DT
-	local sway = math.sin(self.SwayClock) * SWAY_AMP
+	local sway      = math.sin(self.SwayClock) * SWAY_AMP
 	local missileAng = missile:GetAngles()
-	local palettePos = missile:GetPos() + PALETTE_ABOVE_MISSILE
+	local palettePos = missilePos + PALETTE_ABOVE_MISSILE
 	local paletteYaw = missileAng.y
 
 	self:SetPos(palettePos)
@@ -163,11 +181,18 @@ function ENT:Think()
 	return true
 end
 
+-- ============================================================
+-- DEBRIS RELEASE
+-- Fix: COLLISION_GROUP_INTERACTIVE_DEBRIS does not collide with
+-- world brushes in GMod's Source fork.  COLLISION_GROUP_DEBRIS_TRIGGER
+-- collides with world/static props but ignores players and other
+-- debris, which is the correct behaviour for falling prop junk.
+-- ============================================================
 local function ReleaseMunition(mun, scatterDir)
 	if not IsValid(mun) then return end
 	mun:SetMoveType(MOVETYPE_VPHYSICS)
 	mun:SetSolid(SOLID_VPHYSICS)
-	mun:SetCollisionGroup(COLLISION_GROUP_INTERACTIVE_DEBRIS)
+	mun:SetCollisionGroup(COLLISION_GROUP_DEBRIS_TRIGGER)
 	local mPhys = mun:GetPhysicsObject()
 	if IsValid(mPhys) then
 		mPhys:Wake()
@@ -177,10 +202,17 @@ local function ReleaseMunition(mun, scatterDir)
 			scatter.y + math.Rand(-30, 30),
 			math.Rand(-20, 20)
 		))
-		mPhys:AddAngleVelocity(Vector(math.Rand(-80, 80), math.Rand(-80, 80), math.Rand(-50, 50)))
+		mPhys:AddAngleVelocity(Vector(
+			math.Rand(-80, 80),
+			math.Rand(-80, 80),
+			math.Rand(-50, 50)
+		))
 	end
 end
 
+-- ============================================================
+-- DETACH  (missile engine ignited)
+-- ============================================================
 function ENT:Detach()
 	if self.Detached then return end
 	self.Detached = true
@@ -195,6 +227,9 @@ function ENT:Detach()
 		self.ChuteEnt = nil
 	end
 
+	-- Spawn a physics-enabled chute clone that falls away.
+	-- Store reference so OnRemove can clean it up if the combo is
+	-- removed before the debris lifetime timer fires.
 	local chuteClone = ents.Create("prop_physics")
 	if IsValid(chuteClone) then
 		chuteClone:SetModel(CHUTE_MODEL)
@@ -203,7 +238,8 @@ function ENT:Detach()
 		chuteClone:Spawn()
 		chuteClone:Activate()
 		chuteClone:SetModelScale(CHUTE_SCALE, 0)
-		chuteClone:SetCollisionGroup(COLLISION_GROUP_INTERACTIVE_DEBRIS)
+		-- Fix: same collision group correction as munitions.
+		chuteClone:SetCollisionGroup(COLLISION_GROUP_DEBRIS_TRIGGER)
 		local cPhys = chuteClone:GetPhysicsObject()
 		if IsValid(cPhys) then
 			cPhys:Wake()
@@ -218,12 +254,14 @@ function ENT:Detach()
 				math.Rand(-30, 30)
 			))
 		end
+		self.ChuteClone = chuteClone
 	end
 
+	-- Palette itself becomes physics debris.
 	self:PhysicsInit(SOLID_VPHYSICS)
 	self:SetMoveType(MOVETYPE_VPHYSICS)
 	self:SetSolid(SOLID_VPHYSICS)
-	self:SetCollisionGroup(COLLISION_GROUP_INTERACTIVE_DEBRIS)
+	self:SetCollisionGroup(COLLISION_GROUP_DEBRIS_TRIGGER)
 
 	local palPhys = self:GetPhysicsObject()
 	if IsValid(palPhys) then
@@ -242,6 +280,7 @@ function ENT:Detach()
 
 	sound.Play("npc/combine_soldier/zipline_clip2.wav", pos, 82, math.random(93, 110), 1.0)
 
+	-- Lifetime cleanup: remove all debris after it has settled.
 	local debrisRefs = { self, chuteClone }
 	for i = 1, 4 do debrisRefs[#debrisRefs + 1] = self.MunitionEnts[i] end
 	timer.Simple(DEBRIS_LIFETIME + ((#self.MunitionEnts - 1) * RELEASE_STEP_DELAY), function()
@@ -251,17 +290,34 @@ function ENT:Detach()
 	end)
 end
 
+-- ============================================================
+-- CLEANUP
+-- ============================================================
 function ENT:FullRemove()
-	if IsValid(self.ChuteEnt) then self.ChuteEnt:Remove() end
+	-- Guard: FullRemove is only called from Think (non-Detached path).
+	-- Setting Detached = true first prevents OnRemove from attempting a
+	-- second removal of the same child entities.
+	self.Detached = true
+
+	if IsValid(self.ChuteEnt)   then self.ChuteEnt:Remove()   self.ChuteEnt   = nil end
+	if IsValid(self.ChuteClone) then self.ChuteClone:Remove() self.ChuteClone = nil end
 	for i = 1, 4 do
-		if IsValid(self.MunitionEnts[i]) then self.MunitionEnts[i]:Remove() end
+		if IsValid(self.MunitionEnts[i]) then
+			self.MunitionEnts[i]:Remove()
+			self.MunitionEnts[i] = nil
+		end
 	end
 	self:Remove()
 end
 
 function ENT:OnRemove()
+	-- Detach() sets self.Detached = true and schedules its own timer-based
+	-- cleanup, so we only need to act here for the non-detached path
+	-- (e.g. missile removed before engine ignition, or FullRemove called).
 	if self.Detached then return end
-	if IsValid(self.ChuteEnt) then self.ChuteEnt:Remove() end
+
+	if IsValid(self.ChuteEnt)   then self.ChuteEnt:Remove()   end
+	if IsValid(self.ChuteClone) then self.ChuteClone:Remove() end
 	for i = 1, 4 do
 		if IsValid(self.MunitionEnts[i]) then self.MunitionEnts[i]:Remove() end
 	end
