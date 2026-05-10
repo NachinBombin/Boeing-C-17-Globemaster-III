@@ -48,12 +48,10 @@ local IGNITION_EFFECT_SCALE_LARGE = 1.8
 local FREEFALL_MIN_TIME = 0.35
 
 -- Pallet bay offsets on the C-17 (local space, scale=1.8).
--- Index matches (capturedI - 1) mod #SALVO_PALLET_OFFSETS.
--- These mirror the drop offsets used in UpdateW3() on the parent plane.
 local SALVO_PALLET_OFFSETS = {
-    Vector(-180,   60, -60),   -- slot 2
-    Vector(-180,  -60, -60),   -- slot 3
-    Vector(-180,    0, -140),  -- slot 4  (lower centreline)
+    Vector(-180,   60, -60),
+    Vector(-180,  -60, -60),
+    Vector(-180,    0, -140),
 }
 
 ENT.WeaponWindow  = 8
@@ -65,7 +63,7 @@ ENT.DIVE_TrackInterval = 0.1
 util.AddNetworkString("bombin_gbu53owned_damage_tier")
 
 -- ============================================================
--- FIRE EFFECT HELPER
+-- HELPERS
 -- ============================================================
 local function FireEffect(origin, effect, scale)
 	local ed = EffectData()
@@ -76,9 +74,12 @@ local function FireEffect(origin, effect, scale)
 	util.Effect(effect, ed, true, true)
 end
 
--- ============================================================
--- TIER HELPERS
--- ============================================================
+-- Returns a valid attacker for util.BlastDamage.
+-- Falls back to the entity itself so the C function never receives NULL.
+local function SafeAttacker(ent)
+	local owner = ent:GetOwner()
+	return IsValid(owner) and owner or ent
+end
 
 local function CalcTier(hp, maxHP)
 	local frac = hp / maxHP
@@ -98,7 +99,6 @@ end
 -- ============================================================
 -- DEBUG
 -- ============================================================
-
 function ENT:Debug(msg)
 	print("[Npc C-17 Globemaster] " .. tostring(msg))
 end
@@ -106,7 +106,6 @@ end
 -- ============================================================
 -- INITIALIZE
 -- ============================================================
-
 function ENT:Initialize()
 	self.CenterPos    = self:GetVar("CenterPos",    self:GetPos())
 	self.CallDir      = self:GetVar("CallDir",      Vector(1,0,0))
@@ -140,9 +139,9 @@ function ENT:Initialize()
 	self.DieTime   = CurTime() + self.Lifetime
 	self.SpawnTime = CurTime()
 
-	self.Phase             = "freefall"
-	self.FreefallVelZ      = 0
-	self.FreefallHorizT    = 0
+	self.Phase              = "freefall"
+	self.FreefallVelZ       = 0
+	self.FreefallHorizT     = 0
 	self.FreefallHorizSpeed = 0
 
 	local baseRadius = self:GetVar("OrbitRadius", 2500)
@@ -151,22 +150,12 @@ function ENT:Initialize()
 	self.Speed       = baseSpeed  * math.Rand(0.85, 1.15)
 	self.OrbitDir    = (math.random(0,1) == 0) and 1 or -1
 
-	-- --------------------------------------------------------
-	-- Spawn position:
-	-- Primary missile : use sky column above CenterPos (unchanged).
-	-- Salvo children  : use the exact pallet world position passed
-	--                   by SpawnSalvo() via SetVar("ReleasePos").
-	--                   This eliminates the previous
-	--                   (BaseCenterPos + scatter, IgnitionAlt) hack
-	--                   that caused visual teleporting.
-	-- --------------------------------------------------------
 	local spawnPos
 	if self.IsSalvoChild then
 		local rel = self:GetVar("ReleasePos", nil)
 		if rel then
 			spawnPos = rel
 		else
-			-- Fallback: scatter around tail (should not normally happen)
 			local tailOffset = self.CallDir * -200
 			local scatter    = Vector(math.Rand(-120, 120), math.Rand(-120, 120), 0)
 			spawnPos = Vector(
@@ -302,7 +291,6 @@ end
 -- ============================================================
 -- CHUTE SPAWN
 -- ============================================================
-
 function ENT:SpawnChute()
 	if IsValid(self.ChuteEnt) then return end
 	local chute = ents.Create("ent_bombin_gbu53_chute_owned")
@@ -320,36 +308,21 @@ end
 
 -- ============================================================
 -- SALVO SPAWN
---
--- planeEnt  (Entity|nil) : reference to the parent C-17 entity.
---   When valid, each child is placed at the real pallet world-space
---   position at the moment of release, so the live missile appears
---   exactly where the visual pallet was dropped.
---   If planeEnt is invalid/nil the old scatter fallback is used.
 -- ============================================================
-
 function ENT:SpawnSalvo(planeEnt)
 	for i = 2, SALVO_COUNT do
-		local delay      = (i - 1) * SALVO_DELAY_BASE + math.Rand(0, SALVO_DELAY_JITTER)
-		local capturedI  = i
+		local delay     = (i - 1) * SALVO_DELAY_BASE + math.Rand(0, SALVO_DELAY_JITTER)
+		local capturedI = i
 		timer.Simple(delay, function()
 			if not IsValid(self) then return end
 
-			-- ------------------------------------------------
-			-- Compute real pallet release position.
-			-- The offset index cycles through SALVO_PALLET_OFFSETS
-			-- (slots 2, 3, 4 → indices 1, 2, 3 → capturedI-1).
-			-- ------------------------------------------------
-			local offIdx     = ((capturedI - 2) % #SALVO_PALLET_OFFSETS) + 1
-			local palletOff  = SALVO_PALLET_OFFSETS[offIdx]
+			local offIdx    = ((capturedI - 2) % #SALVO_PALLET_OFFSETS) + 1
+			local palletOff = SALVO_PALLET_OFFSETS[offIdx]
 			local releasePos
 
 			if IsValid(planeEnt) then
-				-- LocalToWorld in the C-17's current frame at the moment
-				-- the timer fires (matches when the visual pallet departs).
 				releasePos = planeEnt:LocalToWorld(palletOff)
 			else
-				-- Fallback: scatter around tail of BaseCenterPos.
 				local scatter = Vector(math.Rand(-120, 120), math.Rand(-120, 120), 0)
 				releasePos = Vector(
 					self.BaseCenterPos.x + scatter.x,
@@ -361,25 +334,21 @@ function ENT:SpawnSalvo(planeEnt)
 			local child = ents.Create("ent_bombin_gbu53_owned")
 			if not IsValid(child) then return end
 
-			child:SetVar("IsSalvoChild",          true)
-			child:SetVar("SalvoIndex",             capturedI)
-			child:SetVar("ReleasePos",             releasePos)   -- real pallet pos
-			child:SetVar("CenterPos",              self.BaseCenterPos)
-			child:SetVar("CallDir",                self.CallDir)
-			child:SetVar("Lifetime",               self.Lifetime)
-			child:SetVar("SkyHeightAdd",           self.SkyHeightAdd)
-			child:SetVar("OrbitRadius",            self.OrbitRadius)
-			child:SetVar("Speed",                  self.Speed)
-			child:SetVar("DIVE_ExplosionDamage",   self.DIVE_ExplosionDamage)
-			child:SetVar("DIVE_ExplosionRadius",   self.DIVE_ExplosionRadius)
+			child:SetVar("IsSalvoChild",        true)
+			child:SetVar("SalvoIndex",           capturedI)
+			child:SetVar("ReleasePos",           releasePos)
+			child:SetVar("CenterPos",            self.BaseCenterPos)
+			child:SetVar("CallDir",              self.CallDir)
+			child:SetVar("Lifetime",             self.Lifetime)
+			child:SetVar("SkyHeightAdd",         self.SkyHeightAdd)
+			child:SetVar("OrbitRadius",          self.OrbitRadius)
+			child:SetVar("Speed",                self.Speed)
+			child:SetVar("DIVE_ExplosionDamage", self.DIVE_ExplosionDamage)
+			child:SetVar("DIVE_ExplosionRadius", self.DIVE_ExplosionRadius)
 
-			-- Pre-set position so Initialize() finds it via self:GetPos()
-			-- (SpawnedFromPlane path) only if ReleasePos branch fails;
-			-- the ReleasePos SetVar is the authoritative path.
 			child:SetPos(releasePos)
 			child:Spawn()
 			child:Activate()
-
 			child:IgniteEngine()
 			self:Debug("Salvo child " .. capturedI .. " ignited at " .. tostring(releasePos))
 		end)
@@ -389,7 +358,6 @@ end
 -- ============================================================
 -- FREEFALL PHYSICS
 -- ============================================================
-
 function ENT:UpdateFreefall(dt)
 	local k = FREEFALL_GRAVITY / math.abs(TERMINAL_VEL)
 	self.FreefallVelZ = self.FreefallVelZ - FREEFALL_GRAVITY * dt
@@ -408,8 +376,7 @@ function ENT:UpdateFreefall(dt)
 	)
 
 	local speedFrac = math.abs(self.FreefallVelZ) / math.abs(TERMINAL_VEL)
-	local targetPitch = -25 * speedFrac
-	self.SmoothedPitch = Lerp(0.06, self.SmoothedPitch, targetPitch)
+	self.SmoothedPitch = Lerp(0.06, self.SmoothedPitch, -25 * speedFrac)
 	local faceAng = self.CallDir:Angle()
 	self.ang.y = faceAng.y
 	self.ang.p = self.SmoothedPitch
@@ -417,10 +384,6 @@ function ENT:UpdateFreefall(dt)
 	self:SetAngles(self.ang)
 	self:SetPos(newPos)
 
-	-- Fix: require both altitude threshold AND a minimum freefall
-	-- duration before ignition. This prevents instant-ignite on the
-	-- first tick when the C-17 is orbiting low and IgnitionAlt ends
-	-- up at or above the spawn Z despite the SkyHeightAdd clamp.
 	local freefallAge = CurTime() - self.SpawnTime
 	if newPos.z <= self.IgnitionAlt and freefallAge >= FREEFALL_MIN_TIME then
 		newPos.z = self.IgnitionAlt
@@ -432,7 +395,6 @@ end
 -- ============================================================
 -- ENGINE IGNITION
 -- ============================================================
-
 function ENT:IgniteEngine()
 	if self.Phase == "orbit" then return end
 	self.Phase = "orbit"
@@ -447,15 +409,15 @@ function ENT:IgniteEngine()
 	self:SetMoveType(MOVETYPE_VPHYSICS)
 	self:SetSolid(SOLID_VPHYSICS)
 
-	-- --------------------------------------------------------
-	-- Collision safety:
-	-- COLLISION_GROUP_IN_VEHICLE lets missiles pass through
-	-- each other and through the parent plane entity while
-	-- still colliding with the world (for detonation traces).
-	-- Upgraded to INTERACTIVE_DEBRIS only on StartDive() so
-	-- the warhead can interact with world geometry on impact.
-	-- --------------------------------------------------------
-	self:SetCollisionGroup(COLLISION_GROUP_IN_VEHICLE)
+	-- Fix: COLLISION_GROUP_IN_VEHICLE was suppressing all world collision,
+	-- causing missiles to noclip through brushes during orbit.
+	-- COLLISION_GROUP_DEBRIS_TRIGGER collides with world geometry and static
+	-- props but ignores players and other missiles, which is the correct
+	-- behaviour for a loitering munition at altitude.
+	-- On StartDive() this is upgraded to COLLISION_GROUP_NONE so the full
+	-- collision model is active and the ground-proximity detonation check
+	-- has an accurate position reference.
+	self:SetCollisionGroup(COLLISION_GROUP_DEBRIS_TRIGGER)
 
 	self.PhysObj = self:GetPhysicsObject()
 	if IsValid(self.PhysObj) then
@@ -468,11 +430,6 @@ function ENT:IgniteEngine()
 
 	local pos = self:GetPos()
 
-	-- --------------------------------------------------------
-	-- Orbit angle seeded from actual release position.
-	-- Each child enters its loiter at the bearing it was
-	-- released from, not all converging on the same phase.
-	-- --------------------------------------------------------
 	self.OrbitAngle = math.atan2(
 		pos.y - self.CenterPos.y,
 		pos.x - self.CenterPos.x
@@ -483,22 +440,16 @@ function ENT:IgniteEngine()
 	self.AltDriftTarget   = self.OrbitAlt
 	self.AltDriftNextPick = CurTime() + math.Rand(8, 20)
 
-	-- Primary: MuzzleFlash offset behind nozzle so it clears the model.
-	-- Secondary: NPC_Shield_Impact — tight bright ring, readable at
-	-- distance without producing a screen-filling blast.
-	local fwd = self:GetForward()
+	local fwd      = self:GetForward()
 	local ignitePt = pos + fwd * -18
 	FireEffect(ignitePt, IGNITION_EFFECT_NAME, IGNITION_EFFECT_SCALE)
 	FireEffect(ignitePt + fwd * -30, IGNITION_EFFECT_NAME_LARGE, IGNITION_EFFECT_SCALE_LARGE)
 
-	-- Ignition audio: sharp gas-burst transient + low thump tail.
 	sound.Play("ambient/fire/gas_burst1.wav",  pos, 105, math.random(95, 108), 1.0)
 	sound.Play("ambient/explosions/exp1.wav",  pos,  90, math.random(115, 130), 0.55)
 	sound.Play("ambient/fire/fire_small1.wav", pos,  82, 120, 0.45)
 
 	if not self.IsSalvoChild then
-		-- Pass self (the C-17-spawned primary) so children can
-		-- read LocalToWorld pallet positions while the plane is live.
 		local planeRef = self:GetVar("ParentPlane", nil)
 		self:SpawnSalvo(IsValid(planeRef) and planeRef or nil)
 	end
@@ -507,7 +458,6 @@ end
 -- ============================================================
 -- THINK
 -- ============================================================
-
 function ENT:Think()
 	if not self.DieTime or not self.SpawnTime then
 		self:NextThink(CurTime() + 0.1)
@@ -566,7 +516,6 @@ end
 -- ============================================================
 -- ORBIT PHYSICS
 -- ============================================================
-
 function ENT:UpdateOrbit(ct, dt, phys)
 	if not IsValid(phys) then return end
 
@@ -592,7 +541,7 @@ function ENT:UpdateOrbit(ct, dt, phys)
 			mask   = MASK_SOLID_BRUSHONLY,
 		})
 		if tr.Hit then
-			self.SkyYawBias   = self.SkyYawBias + (25 * self.OrbitDir * dt)
+			self.SkyYawBias      = self.SkyYawBias + (25 * self.OrbitDir * dt)
 			self.SkyProbeLastHit = ct
 		else
 			self.SkyYawBias = self.SkyYawBias * (1 - dt * 0.25)
@@ -600,9 +549,7 @@ function ENT:UpdateOrbit(ct, dt, phys)
 	end
 
 	local desiredYaw = math.deg(self.OrbitAngle + (math.pi / 2) * self.OrbitDir) + self.SkyYawBias
-	local prevYaw    = self.ang.y - MODEL_YAW_OFFSET
-
-	local yawDelta  = math.NormalizeAngle(desiredYaw - prevYaw)
+	local yawDelta   = math.NormalizeAngle(desiredYaw - (self.ang.y - MODEL_YAW_OFFSET))
 
 	self.GlideRollPhase = self.GlideRollPhase + self.GlideRollRate * dt
 	local glideRoll = math.sin(self.GlideRollPhase) * self.GlideRollAmp
@@ -612,12 +559,11 @@ function ENT:UpdateOrbit(ct, dt, phys)
 	local curVel  = phys:GetVelocity()
 	local desVelX = math.cos(math.rad(desiredYaw)) * self.Speed + math.cos(math.rad(desiredYaw + 90)) * jitter * 0.005
 	local desVelY = math.sin(math.rad(desiredYaw)) * self.Speed + math.sin(math.rad(desiredYaw + 90)) * jitter * 0.005
-	local newVel  = Vector(
+	phys:SetVelocity(Vector(
 		Lerp(0.10, curVel.x, desVelX),
 		Lerp(0.10, curVel.y, desVelY),
 		velZ
-	)
-	phys:SetVelocity(newVel)
+	))
 
 	self.ang = Angle(-self.SmoothedRoll, desiredYaw + MODEL_YAW_OFFSET, -self.SmoothedPitch)
 	self:SetAngles(self.ang)
@@ -626,7 +572,6 @@ end
 -- ============================================================
 -- WEAPON LOGIC
 -- ============================================================
-
 function ENT:UpdateWeaponLogic(ct)
 	if ct < self.WeaponWindowEnd then return end
 
@@ -641,15 +586,15 @@ end
 -- ============================================================
 -- DIVE ATTACK
 -- ============================================================
-
 function ENT:StartDive(ct)
 	self.Diving = true
-	self.DiveAimOffset = Vector(math.Rand(-400, 400), math.Rand(-400, 400), 0)
+	self.DiveAimOffset    = Vector(math.Rand(-400, 400), math.Rand(-400, 400), 0)
 	self.DiveSpeedCurrent = self.DiveSpeedMin
 	self.DiveWobblePhase  = 0
 
-	-- Upgrade collision so the warhead detonates on world contact.
-	self:SetCollisionGroup(COLLISION_GROUP_INTERACTIVE_DEBRIS)
+	-- Full collision on dive so the missile can't pass through the ground
+	-- on its way to the detonation proximity check.
+	self:SetCollisionGroup(COLLISION_GROUP_NONE)
 
 	local closest, closestDist = nil, math.huge
 	for _, ply in ipairs(player.GetAll()) do
@@ -678,14 +623,14 @@ function ENT:UpdateDive(ct)
 		end
 	end
 
-	local pos    = self:GetPos()
-	local aim    = self.DiveTargetPos + self.DiveAimOffset
-	local toAim  = (aim - pos):GetNormalized()
+	local pos   = self:GetPos()
+	local aim   = self.DiveTargetPos + self.DiveAimOffset
+	local toAim = (aim - pos):GetNormalized()
 
 	self.DiveWobblePhase  = self.DiveWobblePhase  + self.DiveWobbleSpeed  * FrameTime()
 	self.DiveWobblePhaseV = self.DiveWobblePhaseV + self.DiveWobbleSpeedV * FrameTime()
-	local right = self:GetRight()
-	local up    = self:GetUp()
+	local right  = self:GetRight()
+	local up     = self:GetUp()
 	local wobble = right * math.sin(self.DiveWobblePhase)  * self.DiveWobbleAmp
 	           + up    * math.sin(self.DiveWobblePhaseV) * self.DiveWobbleAmpV
 
@@ -698,11 +643,10 @@ function ENT:UpdateDive(ct)
 	self.ang = Angle(lookAng.p, lookAng.y, math.sin(self.DiveWobblePhase) * 25)
 	self:SetAngles(self.ang)
 
-	local distToAim   = pos:Distance(aim)
 	local groundZ     = self.GroundZ or (pos.z - 5000)
 	local aboveGround = pos.z - groundZ
 
-	if distToAim < 120 or aboveGround < GROUND_DETONATE_DIST then
+	if pos:Distance(aim) < 120 or aboveGround < GROUND_DETONATE_DIST then
 		self:DiveExplode(pos)
 	end
 end
@@ -710,12 +654,14 @@ end
 -- ============================================================
 -- EXPLODE
 -- ============================================================
-
 function ENT:DiveExplode(pos)
 	if self.DiveExploded then return end
 	self.DiveExploded = true
 
-	util.BlastDamage(self, self:GetOwner(), pos, self.DIVE_ExplosionRadius, self.DIVE_ExplosionDamage)
+	-- Fix: GetOwner() returns NULL for salvo children (never assigned).
+	-- util.BlastDamage C function rejects NULL attacker and throws.
+	-- SafeAttacker() falls back to self so the call is always valid.
+	util.BlastDamage(self, SafeAttacker(self), pos, self.DIVE_ExplosionRadius, self.DIVE_ExplosionDamage)
 
 	local ed = EffectData()
 	ed:SetOrigin(pos)
@@ -732,7 +678,7 @@ function ENT:CrashExplode(pos)
 	if self.ExplodedAlready then return end
 	self.ExplodedAlready = true
 
-	util.BlastDamage(self, self:GetOwner(), pos, self.DIVE_ExplosionRadius * 0.5, self.DIVE_ExplosionDamage * 0.3)
+	util.BlastDamage(self, SafeAttacker(self), pos, self.DIVE_ExplosionRadius * 0.5, self.DIVE_ExplosionDamage * 0.3)
 
 	local ed = EffectData()
 	ed:SetOrigin(pos)
@@ -748,7 +694,6 @@ end
 -- ============================================================
 -- DAMAGE / DESTRUCTION
 -- ============================================================
-
 function ENT:OnTakeDamage(dmginfo)
 	if self.Destroyed then return end
 
@@ -790,7 +735,6 @@ end
 -- ============================================================
 -- GROUND FINDER
 -- ============================================================
-
 function ENT:FindGround(pos)
 	local tr = util.TraceLine({
 		start  = Vector(pos.x, pos.y, pos.z + 100),
@@ -804,7 +748,6 @@ end
 -- ============================================================
 -- GENERIC VAR HELPERS
 -- ============================================================
-
 function ENT:SetVar(key, val) self["_var_" .. key] = val end
 function ENT:GetVar(key, default)
 	local v = self["_var_" .. key]
