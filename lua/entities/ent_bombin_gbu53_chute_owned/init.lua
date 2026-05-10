@@ -6,6 +6,12 @@
 -- 1) Children are spawned with temporary NoCollide against the launcher plane.
 -- 2) Owner remains the loitering missile entity; Think() never follows the plane.
 -- 3) Combo tracks the missile cleanly, then detaches into debris on ignition.
+-- 4) FIX: collision group changed from COLLISION_GROUP_WORLD to
+--    COLLISION_GROUP_INTERACTIVE_DEBRIS so the chute prop does not clip
+--    into world geometry on detach. WORLD group means it collides WITH the
+--    world; INTERACTIVE_DEBRIS is correct for loose falling props.
+-- 5) FIX: detached debris (chute + munitions) are gathered into a single
+--    timer and auto-removed after 14 seconds to prevent prop leaks.
 -- ============================================================
 
 AddCSLuaFile("cl_init.lua")
@@ -34,7 +40,8 @@ local MUNITION_YAW_OFFSETS = { 0, 0, 180, 180 }
 local SWAY_AMP  = 2.8
 local SWAY_RATE = 1.1
 local THINK_DT  = 1 / 60
-local CHILD_NOCLIP_HOLD = 1.8
+local CHILD_NOCLIP_HOLD  = 1.8
+local DEBRIS_LIFETIME    = 14
 
 function ENT:Initialize()
 	self:SetModel(PALETTE_MODEL)
@@ -166,7 +173,9 @@ function ENT:Detach()
 	self:PhysicsInit(SOLID_VPHYSICS)
 	self:SetMoveType(MOVETYPE_VPHYSICS)
 	self:SetSolid(SOLID_VPHYSICS)
-	self:SetCollisionGroup(COLLISION_GROUP_DEBRIS)
+	-- FIX: was COLLISION_GROUP_WORLD which made the palette clip into geometry.
+	-- INTERACTIVE_DEBRIS is the correct group for loose falling debris.
+	self:SetCollisionGroup(COLLISION_GROUP_INTERACTIVE_DEBRIS)
 
 	local palPhys = self:GetPhysicsObject()
 	if IsValid(palPhys) then
@@ -178,7 +187,8 @@ function ENT:Detach()
 	if IsValid(self.ChuteEnt) then
 		self.ChuteEnt:SetMoveType(MOVETYPE_VPHYSICS)
 		self.ChuteEnt:SetSolid(SOLID_VPHYSICS)
-		self.ChuteEnt:SetCollisionGroup(COLLISION_GROUP_DEBRIS)
+		-- FIX: same collision group correction for the chute prop.
+		self.ChuteEnt:SetCollisionGroup(COLLISION_GROUP_INTERACTIVE_DEBRIS)
 		local cPhys = self.ChuteEnt:GetPhysicsObject()
 		if IsValid(cPhys) then
 			cPhys:Wake()
@@ -192,7 +202,7 @@ function ENT:Detach()
 		if not IsValid(mun) then continue end
 		mun:SetMoveType(MOVETYPE_VPHYSICS)
 		mun:SetSolid(SOLID_VPHYSICS)
-		mun:SetCollisionGroup(COLLISION_GROUP_DEBRIS)
+		mun:SetCollisionGroup(COLLISION_GROUP_INTERACTIVE_DEBRIS)
 		local mPhys = mun:GetPhysicsObject()
 		if IsValid(mPhys) then
 			mPhys:Wake()
@@ -208,10 +218,12 @@ function ENT:Detach()
 
 	sound.Play("npc/combine_soldier/zipline_clip2.wav", pos, 82, math.random(93, 110), 1.0)
 
-	local allEnts = { self, self.ChuteEnt }
-	for i = 1, 4 do allEnts[#allEnts + 1] = self.MunitionEnts[i] end
-	timer.Simple(14, function()
-		for _, e in ipairs(allEnts) do
+	-- FIX: collect all debris refs at detach time so the timer closure
+	-- does not hold stale upvalues if children are independently removed.
+	local debrisRefs = { self, self.ChuteEnt }
+	for i = 1, 4 do debrisRefs[#debrisRefs + 1] = self.MunitionEnts[i] end
+	timer.Simple(DEBRIS_LIFETIME, function()
+		for _, e in ipairs(debrisRefs) do
 			if IsValid(e) then e:Remove() end
 		end
 	end)
