@@ -27,10 +27,10 @@ local MODEL_SCALE = 1.8
 -- SW MUNITIONS CATALOGUE
 -- ============================================================
 -- Window IDs (active):
---   W1 "jassm"   -- AGM-158 JASSM parachute drop
---   W2 "heavy"   -- heavy GP / penetrators
---   W3 "gbu53"   -- GBU-53 parachute cluster drop
---   W6 "retarded"-- parachute / retarder bombs
+--   W1 "jassm"    -- AGM-158 JASSM parachute drop
+--   W2 "heavy"    -- heavy GP / penetrators
+--   W3 "gbu53"    -- GBU-53 parachute cluster drop
+--   W6 "retarded" -- parachute / retarder bombs
 -- ============================================================
 
 local DART_SPEED  = 4500
@@ -76,15 +76,6 @@ local CFG_W2_Pool    = {
 }
 
 -- ---------- W3 -- GBU-53 parachute cluster ----------
--- FIX (Bug 1): CFG_W3_DropOffset reduced from Vector(-340,0,-140).
--- At MODEL_SCALE 1.8 the C-17 fuselage is ~360 units long in world
--- space, but LocalToWorld does NOT scale - it operates in model-local
--- coords regardless of SetModelScale. So -340 local X was already
--- well past the tail. The real issue was that after the offset the
--- BodyClearance subtracted another 260 units of Z, putting the drop
--- point roughly half a map-unit below and far behind the plane when
--- rendered at scale. Corrected offset: -180 local X (just behind the
--- rear cargo ramp), -60 Z (below belly), 80 unit body clearance.
 local CFG_W3_GBU53_Count       = 3
 local CFG_W3_GBU53_Delay       = 1.2
 local CFG_W3_AltStagger        = 400
@@ -518,6 +509,9 @@ function ENT:OnRemove()
     end
 end
 
+-- ============================================================
+-- VELOCITY SOLVERS
+-- ============================================================
 local function CalcDartVelocity(dropPos, targetPos)
     local dir = targetPos - dropPos
     local H   = math.max(dropPos.z - targetPos.z, 100)
@@ -534,11 +528,15 @@ local function CalcCarpetImpulse(dropPos, aimPos, aircraftFwdVel)
     local dx = aimPos.x - dropPos.x
     local dy = aimPos.y - dropPos.y
     local hDist = math.sqrt(dx*dx + dy*dy)
-    if hDist < 1 then return Vector(0,0,0) end
-    local hSpeed = hDist / math.max(tF, 0.1)
-    hSpeed = math.min(hSpeed, DART_SPEED)
+    if hDist < 1 then return Vector(0, 0, 0) end
+    local hSpeed = math.min(hDist / math.max(tF, 0.1), DART_SPEED)
     local hDir = Vector(dx, dy, 0):GetNormalized()
-    return Vector(hDir.x * hSpeed, hDir.y * hSpeed, 0)
+    -- Add aircraft's inherited forward velocity (kinetic energy transfer)
+    return Vector(
+        hDir.x * hSpeed + aircraftFwdVel.x,
+        hDir.y * hSpeed + aircraftFwdVel.y,
+        0
+    )
 end
 
 function ENT:GetAimPos(scatter)
@@ -558,15 +556,33 @@ function ENT:GetAimPos(scatter)
     return cp
 end
 
+-- ============================================================
+-- SPAWN HELPERS
+-- FIX: Restored arming sequence stripped during weapon redesign.
+--   1. bomb.IsOnPlane / bomb.Launcher / bomb:SetOwner set BEFORE Spawn()
+--      -> SW uses these for damage attribution and platform awareness
+--   2. isRetarded bodygroup applied after Activate()
+--      -> deploys visual air-brake / retarder fins
+--   3. bomb:Arm() called if available, else bomb.Armed = true
+--      -> activates air-cushion deployment and arms the impact fuze
+--         so the bomb actually explodes on contact
+--   4. constraint.NoCollide + 0.6s removal timer
+--      -> prevents bomb clipping back through the fuselage on exit
+-- ============================================================
 function ENT:SpawnDartBomb(entClass, dropPos, targetPos, isRetarded)
     local bomb = ents.Create(entClass)
     if not IsValid(bomb) then
         self:Debug("SpawnDartBomb: class not found: " .. tostring(entClass))
-        return
+        return nil
     end
+    -- Must be set before Spawn() so SW initialise hooks see them
+    bomb.IsOnPlane = true
+    bomb.Launcher  = self
+    bomb:SetOwner(self)
     local toTarget = targetPos - dropPos
     local dropAng
-    if toTarget:Length() > 10 then
+    if toTarget:LengthSqr() > 1 then
+        toTarget:Normalize()
         dropAng = toTarget:Angle()
     else
         dropAng = Angle(90, 0, 0)
@@ -575,33 +591,56 @@ function ENT:SpawnDartBomb(entClass, dropPos, targetPos, isRetarded)
     bomb:SetAngles(dropAng)
     bomb:Spawn()
     bomb:Activate()
+    if isRetarded then bomb:SetBodygroup(1, 1) end
+    -- Arm: deploys air-cushion / retarder fins and enables impact fuze
+    if bomb.Arm then bomb:Arm()
+    elseif bomb.Armed ~= nil then bomb.Armed = true end
     local bPhys = bomb:GetPhysicsObject()
     if IsValid(bPhys) then
-        if isRetarded then
-            bPhys:SetVelocity(CalcCarpetImpulse(dropPos, targetPos, Angle(0, self.flightYaw, 0):Forward() * self.Speed))
-        else
-            bPhys:SetVelocity(CalcDartVelocity(dropPos, targetPos))
-        end
+        bPhys:SetVelocity(CalcDartVelocity(dropPos, targetPos))
     end
+    -- Prevent fuselage re-entry collision; remove constraint after clearance
+    constraint.NoCollide(bomb, self, 0, 0)
+    local ref = bomb
+    timer.Simple(0.6, function()
+        if IsValid(ref) and IsValid(self) then constraint.RemoveConstraints(ref, "NoCollide") end
+    end)
+    return bomb
 end
 
 function ENT:SpawnCarpetBomb(entClass, dropPos, aimPos)
     local bomb = ents.Create(entClass)
     if not IsValid(bomb) then
         self:Debug("SpawnCarpetBomb: class not found: " .. tostring(entClass))
-        return
+        return nil
     end
+    bomb.IsOnPlane = true
+    bomb.Launcher  = self
+    bomb:SetOwner(self)
     bomb:SetPos(dropPos)
     bomb:SetAngles(Angle(90, self.flightYaw, 0))
     bomb:Spawn()
     bomb:Activate()
+    -- Arm: deploys air-cushion / retarder fins and enables impact fuze
+    if bomb.Arm then bomb:Arm()
+    elseif bomb.Armed ~= nil then bomb.Armed = true end
     local bPhys = bomb:GetPhysicsObject()
     if IsValid(bPhys) then
         local aircraftFwd = Angle(0, self.flightYaw, 0):Forward() * self.Speed
+        aircraftFwd.z = 0
         bPhys:SetVelocity(CalcCarpetImpulse(dropPos, aimPos, aircraftFwd))
     end
+    constraint.NoCollide(bomb, self, 0, 0)
+    local ref = bomb
+    timer.Simple(0.6, function()
+        if IsValid(ref) and IsValid(self) then constraint.RemoveConstraints(ref, "NoCollide") end
+    end)
+    return bomb
 end
 
+-- ============================================================
+-- W1: JASSM PARACHUTE DROP
+-- ============================================================
 function ENT:SpawnOneJASSM(dropIndex)
     dropIndex = dropIndex or 0
 
@@ -675,22 +714,25 @@ function ENT:UpdateJASSM(ct)
     return (self.WPN_ShotsFired >= CFG_W1_JASSM_Count)
 end
 
+-- ============================================================
+-- W2: HEAVY ORDNANCE
+-- ============================================================
 function ENT:UpdateHeavy(ct)
     if self.WPN_ShotsFired >= CFG_W2_Count then return true end
     if ct < self.WPN_NextShot then return false end
     self.WPN_NextShot   = ct + CFG_W2_Delay
     self.WPN_ShotsFired = self.WPN_ShotsFired + 1
 
-    local entClass = CFG_W2_Pool[math.random(#CFG_W2_Pool)]
+    local entClass  = CFG_W2_Pool[math.random(#CFG_W2_Pool)]
     local dropPos   = self:LocalToWorld(CFG_BombBayLocal)
     local targetPos = self:GetAimPos(CFG_W2_Scatter)
-    self:SpawnDartBomb(entClass, dropPos, targetPos, false)
+    local isRetarded = string.find(entClass, "_air_v3", 1, true) ~= nil
+    self:SpawnDartBomb(entClass, dropPos, targetPos, isRetarded)
     return (self.WPN_ShotsFired >= CFG_W2_Count)
 end
 
 -- ============================================================
 -- W3: GBU-53 PARACHUTE CLUSTER DROP
--- FIX (Bug 1): DropOffset corrected - see CFG_W3_DropOffset comment.
 -- ============================================================
 function ENT:SpawnOneGBU53Pallet(palletIndex)
     palletIndex = palletIndex or 0
@@ -746,6 +788,9 @@ function ENT:UpdateGBU53(ct)
     return (self.WPN_ShotsFired >= CFG_W3_GBU53_Count)
 end
 
+-- ============================================================
+-- W6: RETARDED / PARACHUTE BOMBS
+-- ============================================================
 function ENT:UpdateRetarded(ct)
     if self.WPN_ShotsFired >= CFG_W6_Count then return true end
     if ct < self.WPN_NextShot then return false end
