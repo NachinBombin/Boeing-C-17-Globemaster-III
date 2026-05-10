@@ -14,6 +14,21 @@
 --   Speed                number   — cruise speed in u/s         (default 250)
 --   DIVE_ExplosionDamage number
 --   DIVE_ExplosionRadius number
+--
+-- FIXES:
+--   1. MODEL_YAW_OFFSET was declared AFTER UpdateOrbit() used it.
+--      In Lua, local upvalues are only visible from their declaration line
+--      downward. Moved the constant to the top of the file.
+--   2. IgniteEngine() never called SetBodygroup(1,1) to extend wings.
+--      Added the same bodygroup call the JASSM uses.
+--   3. IgniteEngine() only armed this single missile. With 4 visual
+--      munitions on the palette, the system should fire 4 real
+--      ent_bombin_gbu53_owned missiles with staggered ignition delays
+--      so each one independently orbits and dives. SpawnSalvo() handles this.
+--   4. Munitions in SpawnChildren() used SetParent+SetLocalPos which
+--      requires the palette's PhysicsObject to be initialised — it isn't
+--      at spawn time (MOVETYPE_NONE). Replaced with world-space positioning
+--      and manual tracking in Think(), removing the SetParent dependency.
 -- ============================================================
 
 AddCSLuaFile("cl_init.lua")
@@ -23,28 +38,35 @@ include("shared.lua")
 
 -- ============================================================
 -- LOCAL CONSTANTS
+-- FIX 1: MODEL_YAW_OFFSET MUST be at the top of the file.
+-- Previously it was declared at the very bottom, after UpdateOrbit()
+-- referenced it — causing a nil upvalue crash on the first orbit tick.
 -- ============================================================
+local MODEL_YAW_OFFSET     = 0
 
 local SHARD_MODEL          = "models/props_c17/FurnitureDrawer001a_Shard01.mdl"
 local GRAVITY_MULT         = 1.1
 local SHARD_LIFE           = 8
 
-local GLIDE_BLEED_RATE     = 8.0    -- u/s altitude loss while orbiting
-local GROUND_DETONATE_DIST = 80     -- detonate when this many u above ground
+local GLIDE_BLEED_RATE     = 8.0
+local GROUND_DETONATE_DIST = 80
 
--- Freefall physics constants (must match chute expectations)
-local FREEFALL_GRAVITY     = 600    -- u/s²
-local TERMINAL_VEL         = -320   -- max downward speed (u/s)
-local HORIZ_GLIDE_MAX      = 380    -- horizontal speed at full ramp
-local HORIZ_GLIDE_RAMP     = 1.4   -- seconds to reach max horiz speed
+local FREEFALL_GRAVITY     = 600
+local TERMINAL_VEL         = -320
+local HORIZ_GLIDE_MAX      = 380
+local HORIZ_GLIDE_RAMP     = 1.4
 
--- Ignition altitude above the calculated ground
--- Range: SkyHeightAdd * 0.35  (≈875 u above ground for default 2500)
 local IGNITION_ALT_FRAC    = 0.35
 local ORBIT_ALT_RISE       = 600
 
+-- Salvo: 4 missiles, staggered ignition delays in seconds.
+-- Each missile in the salvo gets an independent orbit/dive cycle.
+local SALVO_COUNT          = 4
+local SALVO_DELAY_BASE     = 0.6   -- seconds between each missile ignition
+local SALVO_DELAY_JITTER   = 0.3
+
 ENT.WeaponWindow  = 8
-ENT.FadeDuration  = 0.0   -- no fade-in; appears solid from drop
+ENT.FadeDuration  = 0.0
 
 ENT.DIVE_Speed         = 1800
 ENT.DIVE_TrackInterval = 0.1
@@ -91,9 +113,13 @@ function ENT:Initialize()
 	self.DIVE_ExplosionDamage = self:GetVar("DIVE_ExplosionDamage", 700)
 	self.DIVE_ExplosionRadius = self:GetVar("DIVE_ExplosionRadius", 900)
 
+	-- SalvoIndex: which slot this missile occupies (1-4).
+	-- 1 = the primary missile spawned by the chute; 2-4 are spawned by SpawnSalvo().
+	self.SalvoIndex   = self:GetVar("SalvoIndex", 1)
+	self.IsSalvoChild = self:GetVar("IsSalvoChild", false)
+
 	self.MaxHP = 200
 
-	-- Sanitise CallDir
 	if self.CallDir:LengthSqr() <= 1 then self.CallDir = Vector(1,0,0) end
 	self.CallDir.z = 0
 	self.CallDir:Normalize()
@@ -102,12 +128,9 @@ function ENT:Initialize()
 	if ground == -1 then self:Debug("FindGround failed") self:Remove() return end
 	self.GroundZ = ground
 
-	-- Sky altitude with ±25% variance (matches JASSM pattern)
 	local altVar = self.SkyHeightAdd * 0.25
 	self.sky = ground + self.SkyHeightAdd + math.Rand(-altVar, altVar)
 
-	-- Ignition altitude: IGNITION_ALT_FRAC of SkyHeightAdd above ground,
-	-- with ±25% local variance so salvos don't all ignite together.
 	local ignBase = ground + (self.SkyHeightAdd * IGNITION_ALT_FRAC)
 	local ignVar  = self.SkyHeightAdd * IGNITION_ALT_FRAC * 0.25
 	self.IgnitionAlt = ignBase + math.Rand(-ignVar, ignVar)
@@ -116,10 +139,7 @@ function ENT:Initialize()
 	self.DieTime   = CurTime() + self.Lifetime
 	self.SpawnTime = CurTime()
 
-	-- --------------------------------------------------------
-	-- FREEFALL PHASE: spawn at sky, not in orbit yet
-	-- --------------------------------------------------------
-	self.Phase = "freefall"   -- "freefall" | "orbit"
+	self.Phase             = "freefall"
 	self.FreefallVelZ      = 0
 	self.FreefallHorizT    = 0
 	self.FreefallHorizSpeed = 0
@@ -130,18 +150,9 @@ function ENT:Initialize()
 	self.Speed       = baseSpeed  * math.Rand(0.85, 1.15)
 	self.OrbitDir    = (math.random(0,1) == 0) and 1 or -1
 
-	-- --------------------------------------------------------
-	-- Determine spawn position.
-	-- If spawned from a plane (SpawnedFromPlane = true), use the position
-	-- the plane already set via SetPos (the tail drop point). This mirrors
-	-- the exact same pattern in ent_bombin_jassm_owned. Without this branch
-	-- the entity always recalculates its own spawn from CenterPos and
-	-- ignores where the aircraft placed it — causing off-plane spawns.
-	-- --------------------------------------------------------
 	local spawnPos
 	if self.SpawnedFromPlane then
 		spawnPos = self:GetPos()
-		self:Debug("SpawnedFromPlane: using tail pos " .. tostring(spawnPos))
 	else
 		local tailOffset = self.CallDir * -200
 		spawnPos = Vector(
@@ -158,7 +169,6 @@ function ENT:Initialize()
 		self:Debug("Spawn position out of world") self:Remove() return
 	end
 
-	-- Model and physics — MOVETYPE_NONE during freefall (manual integration)
 	self:SetModel("models/sw/usa/bombs/guided/gbu53.mdl")
 	self:SetModelScale(1.0, 0)
 	self:SetMoveType(MOVETYPE_NONE)
@@ -167,12 +177,16 @@ function ENT:Initialize()
 	self:SetPos(spawnPos)
 	self:SetRenderMode(RENDERMODE_NORMAL)
 
+	-- FIX 2: wings start folded (bodygroup 1 = 0)
+	-- IgniteEngine() will call SetBodygroup(1, 1) to extend them,
+	-- mirroring exactly what ent_bombin_jassm_owned does.
+	self:SetBodygroup(1, 0)
+
 	self:SetNWInt("HP",    self.MaxHP)
 	self:SetNWInt("MaxHP", self.MaxHP)
 	self:SetNWBool("Destroyed",  false)
-	self:SetNWBool("EngineOn",   false)   -- CRITICAL: chute listens to this
+	self:SetNWBool("EngineOn",   false)
 
-	-- Face along CallDir
 	local faceAng = self.CallDir:Angle()
 	self:SetAngles(Angle(0, faceAng.y, 0))
 	self.ang = self:GetAngles()
@@ -181,7 +195,6 @@ function ENT:Initialize()
 	self.SmoothedPitch = 0
 	self.PrevYaw       = self.ang.y
 
-	-- Orbit / glide state (populated at ignition)
 	self.OrbitAngle    = 0
 	self.OrbitAngSpeed = 0
 
@@ -251,13 +264,16 @@ function ENT:Initialize()
 	self.ObsAltBias    = 0
 	self.ObsConsecHits = 0
 
-	-- Spawn chute+palette assembly above us
-	timer.Simple(0, function()
-		if not IsValid(self) then return end
-		self:SpawnChute()
-	end)
+	-- Only the primary missile (SalvoIndex==1, not a salvo child) spawns the chute.
+	-- Salvo children are spawned directly at ignition altitude with no chute.
+	if not self.IsSalvoChild then
+		timer.Simple(0, function()
+			if not IsValid(self) then return end
+			self:SpawnChute()
+		end)
+	end
 
-	self:Debug("Spawned at " .. tostring(spawnPos) .. " — freefall phase, ignAt=" .. math.Round(self.IgnitionAlt))
+	self:Debug("Spawned [salvo " .. self.SalvoIndex .. "] at " .. tostring(spawnPos))
 end
 
 -- ============================================================
@@ -280,18 +296,64 @@ function ENT:SpawnChute()
 end
 
 -- ============================================================
+-- SALVO SPAWN  (FIX 3)
+-- Called from IgniteEngine() on the primary missile only.
+-- Spawns SALVO_COUNT-1 additional ent_bombin_gbu53_owned missiles
+-- with staggered delays, each with independent orbit + dive cycles.
+-- Salvo children skip the chute and enter orbit directly.
+-- ============================================================
+
+function ENT:SpawnSalvo()
+	for i = 2, SALVO_COUNT do
+		local delay = (i - 1) * SALVO_DELAY_BASE + math.Rand(0, SALVO_DELAY_JITTER)
+		local idx   = i
+		timer.Simple(delay, function()
+			if not IsValid(self) then return end
+
+			local child = ents.Create("ent_bombin_gbu53_owned")
+			if not IsValid(child) then return end
+
+			-- Inherit all caller parameters
+			child:SetVar("CenterPos",            self.BaseCenterPos)
+			child:SetVar("CallDir",              self.CallDir)
+			child:SetVar("Lifetime",             self.Lifetime)
+			child:SetVar("SkyHeightAdd",         self.SkyHeightAdd)
+			child:SetVar("OrbitRadius",          self:GetVar("OrbitRadius", 2500))
+			child:SetVar("Speed",                self:GetVar("Speed",        250))
+			child:SetVar("DIVE_ExplosionDamage", self.DIVE_ExplosionDamage)
+			child:SetVar("DIVE_ExplosionRadius", self.DIVE_ExplosionRadius)
+			child:SetVar("SalvoIndex",           idx)
+			child:SetVar("IsSalvoChild",         true)
+
+			-- Place at ignition altitude with slight XY scatter so orbits
+			-- don't overlap perfectly
+			local scatter = Vector(math.Rand(-120, 120), math.Rand(-120, 120), 0)
+			child:SetPos(Vector(
+				self.BaseCenterPos.x + scatter.x,
+				self.BaseCenterPos.y + scatter.y,
+				self.IgnitionAlt
+			))
+			child:Spawn()
+			child:Activate()
+
+			-- Skip freefall: go straight to orbit
+			child:IgniteEngine()
+			self:Debug("Salvo child " .. idx .. " ignited")
+		end)
+	end
+end
+
+-- ============================================================
 -- FREEFALL PHYSICS
 -- ============================================================
 
 function ENT:UpdateFreefall(dt)
-	-- Gravity with proportional drag to achieve terminal velocity
-	local k = FREEFALL_GRAVITY / math.abs(TERMINAL_VEL)   -- drag coefficient
+	local k = FREEFALL_GRAVITY / math.abs(TERMINAL_VEL)
 	self.FreefallVelZ = self.FreefallVelZ - FREEFALL_GRAVITY * dt
 	local drag = k * math.abs(self.FreefallVelZ)
 	self.FreefallVelZ = self.FreefallVelZ + drag * dt
 	self.FreefallVelZ = math.max(self.FreefallVelZ, TERMINAL_VEL)
 
-	-- Horizontal glide ramp along CallDir
 	self.FreefallHorizT = math.min(self.FreefallHorizT + dt, HORIZ_GLIDE_RAMP)
 	self.FreefallHorizSpeed = (self.FreefallHorizT / HORIZ_GLIDE_RAMP) * HORIZ_GLIDE_MAX
 
@@ -302,7 +364,6 @@ function ENT:UpdateFreefall(dt)
 		pos.z + self.FreefallVelZ * dt
 	)
 
-	-- Cosmetic attitude
 	local speedFrac = math.abs(self.FreefallVelZ) / math.abs(TERMINAL_VEL)
 	local targetPitch = -25 * speedFrac
 	self.SmoothedPitch = Lerp(0.06, self.SmoothedPitch, targetPitch)
@@ -313,9 +374,8 @@ function ENT:UpdateFreefall(dt)
 	self:SetAngles(self.ang)
 	self:SetPos(newPos)
 
-	-- Check ignition altitude
 	if newPos.z <= self.IgnitionAlt then
-		newPos.z = self.IgnitionAlt   -- snap to prevent overshoot
+		newPos.z = self.IgnitionAlt
 		self:SetPos(newPos)
 		self:IgniteEngine()
 	end
@@ -329,12 +389,14 @@ function ENT:IgniteEngine()
 	if self.Phase == "orbit" then return end
 	self.Phase = "orbit"
 
-	self:Debug("Engine ignited at Z=" .. math.Round(self:GetPos().z))
+	self:Debug("Engine ignited [salvo " .. self.SalvoIndex .. "] at Z=" .. math.Round(self:GetPos().z))
 
-	-- Signal the chute to detach (same NWBool pattern as JASSM)
+	-- Signal the chute to detach
 	self:SetNWBool("EngineOn", true)
 
-	-- Switch to VPhysics for orbit phase
+	-- FIX 2: extend wings on ignition — bodygroup 1 slot 1, same as JASSM
+	self:SetBodygroup(1, 1)
+
 	self:PhysicsInit(SOLID_VPHYSICS)
 	self:SetMoveType(MOVETYPE_VPHYSICS)
 	self:SetSolid(SOLID_VPHYSICS)
@@ -344,13 +406,11 @@ function ENT:IgniteEngine()
 	if IsValid(self.PhysObj) then
 		self.PhysObj:Wake()
 		self.PhysObj:EnableGravity(false)
-		-- Seed momentum: preserve horizontal glide speed into orbit entry
 		local seedVel = self.CallDir * math.max(self.Speed, self.FreefallHorizSpeed)
 		seedVel.z = 0
 		self.PhysObj:SetVelocity(seedVel)
 	end
 
-	-- Initialise orbit from current position
 	local pos = self:GetPos()
 	self.OrbitAngle = math.atan2(
 		pos.y - self.CenterPos.y,
@@ -358,17 +418,21 @@ function ENT:IgniteEngine()
 	)
 	self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir
 
-	-- Climb smoothly toward a fixed orbit altitude above ignition
-	self.AltDriftCurrent = self.OrbitAlt
-	self.AltDriftTarget  = self.OrbitAlt
+	self.AltDriftCurrent  = self.OrbitAlt
+	self.AltDriftTarget   = self.OrbitAlt
 	self.AltDriftNextPick = CurTime() + math.Rand(8, 20)
 
-	-- Ignition flash effect
 	local ed = EffectData()
 	ed:SetOrigin(pos)
 	ed:SetScale(2)
 	util.Effect("HelicopterMegaBomb", ed, true, true)
 	sound.Play("ambient/explosions/exp_smoke.wav", pos, 95, 110, 0.9)
+
+	-- FIX 3: primary missile fires the full salvo of 3 additional missiles.
+	-- IsSalvoChild guard prevents infinite recursion.
+	if not self.IsSalvoChild then
+		self:SpawnSalvo()
+	end
 end
 
 -- ============================================================
@@ -387,25 +451,18 @@ function ENT:Think()
 	local dt = FrameTime()
 	if dt <= 0 then dt = 0.015 end
 
-	-- --------------------------------------------------------
-	-- FREEFALL PHASE
-	-- --------------------------------------------------------
 	if self.Phase == "freefall" then
 		self:UpdateFreefall(dt)
 		self:NextThink(ct + 0.015)
 		return true
 	end
 
-	-- --------------------------------------------------------
-	-- ORBIT / DIVE PHASE  (identical to standalone GBU-53)
-	-- --------------------------------------------------------
 	if not IsValid(self.PhysObj) then
 		self.PhysObj = self:GetPhysicsObject()
 	end
 	local phys = self.PhysObj
 	if IsValid(phys) and phys:IsAsleep() then phys:Wake() end
 
-	-- Explode timer for shot-down state
 	if self.Destroyed then
 		if self.ExplodeTimer and ct >= self.ExplodeTimer and not self.ExplodedAlready then
 			self:CrashExplode(self:GetPos())
@@ -415,14 +472,12 @@ function ENT:Think()
 		return true
 	end
 
-	-- Alt drift
 	if ct >= self.AltDriftNextPick then
 		self.AltDriftNextPick = ct + math.Rand(8, 20)
 		self.AltDriftTarget   = self.OrbitAlt + math.Rand(-self.AltDriftRange, self.AltDriftRange)
 	end
 	self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
 
-	-- Centre wander
 	self.WanderPhaseX = self.WanderPhaseX + self.WanderRateX
 	self.WanderPhaseY = self.WanderPhaseY + self.WanderRateY
 	self.CenterPos.x  = self.BaseCenterPos.x + math.sin(self.WanderPhaseX) * self.WanderAmp
@@ -459,7 +514,6 @@ function ENT:UpdateOrbit(ct, dt, phys)
 	local pos  = self:GetPos()
 	local velZ = math.Clamp((desZ - pos.z) * 8, -120, 120)
 
-	-- Sky clearance
 	if ct - self.SkyProbeLastHit > 0.4 then
 		local fwd = self:GetForward()
 		local tr  = util.TraceLine({
@@ -477,6 +531,7 @@ function ENT:UpdateOrbit(ct, dt, phys)
 	end
 
 	local desiredYaw = math.deg(self.OrbitAngle + (math.pi / 2) * self.OrbitDir) + self.SkyYawBias
+	-- FIX 1: MODEL_YAW_OFFSET is now a valid upvalue (declared at top of file)
 	local prevYaw    = self.ang.y - MODEL_YAW_OFFSET
 
 	local yawDelta  = math.NormalizeAngle(desiredYaw - prevYaw)
@@ -502,13 +557,12 @@ function ENT:UpdateOrbit(ct, dt, phys)
 end
 
 -- ============================================================
--- WEAPON LOGIC  (orbit phase)
+-- WEAPON LOGIC
 -- ============================================================
 
 function ENT:UpdateWeaponLogic(ct)
 	if ct < self.WeaponWindowEnd then return end
 
-	-- Roll: 1=peaceful, 2=peaceful, 3=dive
 	local roll = math.random(1, 3)
 	if roll == 3 then
 		self:StartDive(ct)
@@ -527,7 +581,6 @@ function ENT:StartDive(ct)
 	self.DiveSpeedCurrent = self.DiveSpeedMin
 	self.DiveWobblePhase  = 0
 
-	-- Pick target
 	local closest, closestDist = nil, math.huge
 	for _, ply in ipairs(player.GetAll()) do
 		if not IsValid(ply) or not ply:Alive() then continue end
@@ -538,7 +591,7 @@ function ENT:StartDive(ct)
 	self.DiveTargetPos = IsValid(closest) and closest:GetPos() or self.CenterPos
 	self.DiveNextTrack = ct + self.DIVE_TrackInterval
 
-	self:Debug("Dive initiated")
+	self:Debug("Dive initiated [salvo " .. self.SalvoIndex .. "]")
 end
 
 function ENT:UpdateDive(ct)
@@ -548,7 +601,6 @@ function ENT:UpdateDive(ct)
 	local phys = self.PhysObj
 	if not IsValid(phys) then return end
 
-	-- Track target
 	if ct >= self.DiveNextTrack then
 		self.DiveNextTrack = ct + self.DIVE_TrackInterval
 		if IsValid(self.DiveTarget) and self.DiveTarget:Alive() then
@@ -560,7 +612,6 @@ function ENT:UpdateDive(ct)
 	local aim    = self.DiveTargetPos + self.DiveAimOffset
 	local toAim  = (aim - pos):GetNormalized()
 
-	-- Wobble
 	self.DiveWobblePhase  = self.DiveWobblePhase  + self.DiveWobbleSpeed  * FrameTime()
 	self.DiveWobblePhaseV = self.DiveWobblePhaseV + self.DiveWobbleSpeedV * FrameTime()
 	local right = self:GetRight()
@@ -568,7 +619,6 @@ function ENT:UpdateDive(ct)
 	local wobble = right * math.sin(self.DiveWobblePhase)  * self.DiveWobbleAmp
 	           + up    * math.sin(self.DiveWobblePhaseV) * self.DiveWobbleAmpV
 
-	-- Ramp speed
 	self.DiveSpeedCurrent = Lerp(self.DiveSpeedLerp, self.DiveSpeedCurrent, self.DIVE_Speed)
 
 	local vel = toAim * self.DiveSpeedCurrent + wobble
@@ -578,9 +628,8 @@ function ENT:UpdateDive(ct)
 	self.ang = Angle(lookAng.p, lookAng.y, math.sin(self.DiveWobblePhase) * 25)
 	self:SetAngles(self.ang)
 
-	-- Proximity detonation
-	local distToAim = pos:Distance(aim)
-	local groundZ   = self.GroundZ or (pos.z - 5000)
+	local distToAim   = pos:Distance(aim)
+	local groundZ     = self.GroundZ or (pos.z - 5000)
 	local aboveGround = pos.z - groundZ
 
 	if distToAim < 120 or aboveGround < GROUND_DETONATE_DIST then
@@ -648,7 +697,6 @@ function ENT:OnTakeDamage(dmginfo)
 		self.ExplodeTimer  = CurTime() + math.Rand(0.3, 1.2)
 		self:SetNWBool("Destroyed", true)
 		BroadcastTier(self, 3)
-		-- Tumble
 		self.TumbleAngVel = Vector(math.Rand(-120, 120), math.Rand(-120, 120), math.Rand(-80, 80))
 		if IsValid(self.PhysObj) then
 			self.PhysObj:EnableGravity(true)
@@ -662,7 +710,6 @@ end
 -- ============================================================
 
 function ENT:OnRemove()
-	-- Nothing special — chute cleans itself up via its own OnRemove / timer
 end
 
 -- ============================================================
@@ -695,8 +742,3 @@ function ENT:GetVar(key, default)
 	end
 	return default
 end
-
--- ============================================================
--- MODEL YAW OFFSET  (local constant for SetAngles calls)
--- ============================================================
-local MODEL_YAW_OFFSET = 0

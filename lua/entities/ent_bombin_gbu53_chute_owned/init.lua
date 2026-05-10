@@ -7,17 +7,14 @@
 -- 2) Owner remains the loitering missile entity; Think() never follows the plane.
 -- 3) Combo tracks the missile cleanly, then detaches into debris on ignition.
 -- 4) FIX: collision group changed from COLLISION_GROUP_WORLD to
---    COLLISION_GROUP_INTERACTIVE_DEBRIS so the chute prop does not clip
---    into world geometry on detach.
+--    COLLISION_GROUP_INTERACTIVE_DEBRIS.
 -- 5) FIX: detached debris refs gathered into a single timer to prevent prop leaks.
--- 6) FIX: chute no longer falls after ignition.
---    Root cause: Detach() was calling SetMoveType(MOVETYPE_VPHYSICS) on the
---    pre-existing parented prop_physics ChuteEnt. A reused parented prop has
---    no guaranteed gravity state and its physics object may be asleep after
---    unparenting. The Z velocity range was also -20..+30, allowing upward drift.
---    Fix: mirror the JASSM chute pattern exactly — remove the old ChuteEnt and
---    spawn a fresh prop_physics clone at its position with gravity on by default
---    and a proper downward velocity seeded.
+-- 6) FIX: chute not falling after ignition — mirror JASSM fresh-prop pattern.
+-- 7) FIX: munition children used SetParent+SetLocalPos which requires a live
+--    PhysicsObject on the palette at spawn time. The palette is MOVETYPE_NONE
+--    so its PhysicsObject does not exist yet — children snapped to world origin.
+--    Fix: spawn children at world-space positions, track them manually in Think()
+--    by storing their offsets. SetParent is removed entirely.
 -- ============================================================
 
 AddCSLuaFile("cl_init.lua")
@@ -35,11 +32,13 @@ local CHUTE_SCALE    = 2.2
 local PALETTE_ABOVE_MISSILE = Vector(0, 0, 110)
 local CHUTE_ABOVE_PALETTE   = Vector(0, 0, 90)
 
+-- FIX 7: offsets are used for world-space positioning in Think(),
+-- not as SetLocalPos arguments. Z is 0 here — they sit ON the palette surface.
 local MUNITION_OFFSETS = {
-	Vector( 18,  10, -5),
-	Vector( 18, -10, -5),
-	Vector(-18,  10, -5),
-	Vector(-18, -10, -5),
+	Vector( 18,  10, 0),
+	Vector( 18, -10, 0),
+	Vector(-18,  10, 0),
+	Vector(-18, -10, 0),
 }
 local MUNITION_YAW_OFFSETS = { 0, 0, 180, 180 }
 
@@ -73,12 +72,16 @@ end
 function ENT:SpawnChildren()
 	local missile  = self:GetOwner()
 	local launcher = IsValid(missile) and missile.Launcher or nil
+	local basePos  = self:GetPos()
+	local baseAng  = self:GetAngles()
 
+	-- Chute: parented via SetParent is fine here because we only use
+	-- SetLocalPos for a static kinematic child — no PhysicsObject needed.
 	local chute = ents.Create("prop_physics")
 	if IsValid(chute) then
 		chute:SetModel(CHUTE_MODEL)
-		chute:SetPos(self:GetPos() + CHUTE_ABOVE_PALETTE)
-		chute:SetAngles(self:GetAngles())
+		chute:SetPos(basePos + CHUTE_ABOVE_PALETTE)
+		chute:SetAngles(baseAng)
 		chute:Spawn()
 		chute:Activate()
 		chute:SetModelScale(CHUTE_SCALE, 0)
@@ -100,13 +103,24 @@ function ENT:SpawnChildren()
 		end
 	end
 
+	-- FIX 7: munitions are placed at world-space positions calculated from
+	-- the palette's current pos+ang. NO SetParent — they are tracked manually
+	-- in Think() by rotating their offsets into world space each frame.
 	for i = 1, 4 do
 		local mun = ents.Create("prop_physics")
 		if not IsValid(mun) then continue end
 
+		-- Rotate the local offset into world space using the palette's current yaw.
+		local localOff  = MUNITION_OFFSETS[i]
+		local worldOff  = Vector(
+			localOff.x * math.cos(math.rad(baseAng.y)) - localOff.y * math.sin(math.rad(baseAng.y)),
+			localOff.x * math.sin(math.rad(baseAng.y)) + localOff.y * math.cos(math.rad(baseAng.y)),
+			localOff.z
+		)
+
 		mun:SetModel(MUNITION_MODEL)
-		mun:SetPos(self:GetPos() + MUNITION_OFFSETS[i])
-		mun:SetAngles(Angle(0, self:GetAngles().y + MUNITION_YAW_OFFSETS[i], 0))
+		mun:SetPos(basePos + worldOff)
+		mun:SetAngles(Angle(0, baseAng.y + MUNITION_YAW_OFFSETS[i], 0))
 		mun:Spawn()
 		mun:Activate()
 		mun:SetModelScale(MUNITION_SCALE, 0)
@@ -114,9 +128,7 @@ function ENT:SpawnChildren()
 		mun:SetSolid(SOLID_NONE)
 		mun:SetCollisionGroup(COLLISION_GROUP_NONE)
 		mun:DrawShadow(false)
-		mun:SetParent(self)
-		mun:SetLocalPos(MUNITION_OFFSETS[i])
-		mun:SetLocalAngles(Angle(0, MUNITION_YAW_OFFSETS[i], 0))
+		-- No SetParent — we drive position manually in Think()
 		self.MunitionEnts[i] = mun
 
 		if IsValid(launcher) then
@@ -146,9 +158,25 @@ function ENT:Think()
 	self.SwayClock = self.SwayClock + SWAY_RATE * THINK_DT
 	local sway = math.sin(self.SwayClock) * SWAY_AMP
 	local missileAng = missile:GetAngles()
+	local palettePos = missile:GetPos() + PALETTE_ABOVE_MISSILE
+	local paletteYaw = missileAng.y
 
-	self:SetPos(missile:GetPos() + PALETTE_ABOVE_MISSILE)
-	self:SetAngles(Angle(sway, missileAng.y, 0))
+	self:SetPos(palettePos)
+	self:SetAngles(Angle(sway, paletteYaw, 0))
+
+	-- FIX 7: drive munition world positions manually each tick.
+	-- Rotate local offsets by current palette yaw, then add palette world pos.
+	local cosY = math.cos(math.rad(paletteYaw))
+	local sinY = math.sin(math.rad(paletteYaw))
+	for i = 1, 4 do
+		local mun = self.MunitionEnts[i]
+		if not IsValid(mun) then continue end
+		local off = MUNITION_OFFSETS[i]
+		local wx  = off.x * cosY - off.y * sinY
+		local wy  = off.x * sinY + off.y * cosY
+		mun:SetPos(Vector(palettePos.x + wx, palettePos.y + wy, palettePos.z + off.z))
+		mun:SetAngles(Angle(sway, paletteYaw + MUNITION_YAW_OFFSETS[i], 0))
+	end
 
 	self:NextThink(CurTime() + THINK_DT)
 	return true
@@ -161,17 +189,10 @@ function ENT:Detach()
 	local pos = self:GetPos()
 	local ang = self:GetAngles()
 
-	-- --------------------------------------------------------
-	-- CHUTE: mirror the JASSM pattern.
-	-- Remove the old parented ChuteEnt and spawn a fresh prop_physics
-	-- clone in its place. A brand-new prop_physics always initialises
-	-- with gravity on by default, guaranteeing it will fall. Reusing the
-	-- parented prop via SetMoveType was unreliable: the physics object
-	-- could be asleep after unparenting and gravity state was undefined.
-	-- --------------------------------------------------------
+	-- Chute: spawn fresh prop_physics clone (JASSM pattern — guaranteed gravity)
 	local chutePos = pos + CHUTE_ABOVE_PALETTE
 	if IsValid(self.ChuteEnt) then
-		chutePos = self.ChuteEnt:GetPos()  -- use actual world pos in case of drift
+		chutePos = self.ChuteEnt:GetPos()
 		self.ChuteEnt:Remove()
 		self.ChuteEnt = nil
 	end
@@ -188,11 +209,10 @@ function ENT:Detach()
 		local cPhys = chuteClone:GetPhysicsObject()
 		if IsValid(cPhys) then
 			cPhys:Wake()
-			-- Seed a convincing cinematic drift: lateral scatter + downward fall
 			cPhys:SetVelocity(Vector(
 				math.Rand(-80, 80),
 				math.Rand(-80, 80),
-				math.Rand(-60, -20)   -- always downward, matching JASSM feel
+				math.Rand(-60, -20)
 			))
 			cPhys:AddAngleVelocity(Vector(
 				math.Rand(-60, 60),
@@ -202,18 +222,7 @@ function ENT:Detach()
 		end
 	end
 
-	-- --------------------------------------------------------
-	-- PALETTE + MUNITIONS: switch to live physics normally.
-	-- --------------------------------------------------------
-	for i = 1, 4 do
-		local mun = self.MunitionEnts[i]
-		if IsValid(mun) then
-			mun:SetParent(nil)
-			mun:SetPos(pos + MUNITION_OFFSETS[i])
-			mun:SetAngles(Angle(0, ang.y + MUNITION_YAW_OFFSETS[i], 0))
-		end
-	end
-
+	-- Palette: switch to live physics
 	self:PhysicsInit(SOLID_VPHYSICS)
 	self:SetMoveType(MOVETYPE_VPHYSICS)
 	self:SetSolid(SOLID_VPHYSICS)
@@ -226,6 +235,7 @@ function ENT:Detach()
 		palPhys:AddAngleVelocity(Vector(math.Rand(-40, 40), math.Rand(-40, 40), math.Rand(-20, 20)))
 	end
 
+	-- Munitions: they were never parented so just switch their movetype in place
 	for i = 1, 4 do
 		local mun = self.MunitionEnts[i]
 		if not IsValid(mun) then continue end
@@ -247,7 +257,6 @@ function ENT:Detach()
 
 	sound.Play("npc/combine_soldier/zipline_clip2.wav", pos, 82, math.random(93, 110), 1.0)
 
-	-- Collect all debris for the cleanup timer.
 	local debrisRefs = { self, chuteClone }
 	for i = 1, 4 do debrisRefs[#debrisRefs + 1] = self.MunitionEnts[i] end
 	timer.Simple(DEBRIS_LIFETIME, function()
