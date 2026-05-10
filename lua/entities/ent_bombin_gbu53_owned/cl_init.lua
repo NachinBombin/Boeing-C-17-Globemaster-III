@@ -3,16 +3,15 @@ include("cl_trailsystem.lua")
 
 -- ============================================================
 -- CLIENT  —  ent_bombin_gbu53_owned
--- Identical to ent_bombin_gbu53 client, namespaced for the
--- Owned variant so trails / sounds don't cross-pollinate.
 -- ============================================================
 
 local ENGINE_LOOP_SOUND = "ambient/wind/wind_atlas_loop1.wav"
 
+-- Vanilla GMod particle systems — guaranteed to exist without addons.
 local TIER_PARTICLES = {
-	[1] = { name = "fire_medium_01",  offset = Vector(0, -30,  5), scale = 0.6 },
-	[2] = { name = "fire_large_01",   offset = Vector(0, -30, 10), scale = 1.0 },
-	[3] = { name = "fire_large_02",   offset = Vector(0, -20, 15), scale = 1.4 },
+	[1] = { name = "fire_small_01b",  offset = Vector(0, -30,  5) },
+	[2] = { name = "fire_medium_base", offset = Vector(0, -30, 10) },
+	[3] = { name = "burning_gib_01",  offset = Vector(0, -20, 15) },
 }
 
 net.Receive("bombin_gbu53owned_damage_tier", function()
@@ -24,11 +23,9 @@ net.Receive("bombin_gbu53owned_damage_tier", function()
 
 	local prev = ent.GBU53O_ActiveParticle
 	if IsValid(prev) then prev:StopEmission() end
+	ent.GBU53O_ActiveParticle = nil
 
-	if tier == 0 then
-		ent.GBU53O_ActiveParticle = nil
-		return
-	end
+	if tier == 0 then return end
 
 	local cfg = TIER_PARTICLES[tier]
 	if not cfg then return end
@@ -44,7 +41,6 @@ end)
 function ENT:Initialize()
 	GBU53OwnedTrail_Register(self)
 
-	-- Engine sound only starts after EngineOn NWBool is set
 	self.GBU53O_EngineSound   = nil
 	self.GBU53O_EnginePlaying = false
 end
