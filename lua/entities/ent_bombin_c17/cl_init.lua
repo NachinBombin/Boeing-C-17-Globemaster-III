@@ -16,13 +16,13 @@ end
 
 function ENT:Draw()
     -- --------------------------------------------------------
-    -- Bug fix: roll sign was inverted.
-    -- GetAngles().p is SmoothedRoll as set by the server:
-    --   Angle( -SmoothedRoll, yaw+offset, -SmoothedPitch )
-    -- So .p == -SmoothedRoll.  We want the raw roll magnitude
-    -- (positive = right wing down on right turn), so negate .p.
+    -- Roll sign fix:
+    -- Server stores:  Angle( -SmoothedRoll, yaw+offset, -SmoothedPitch )
+    -- So  .p  ==  -SmoothedRoll  (the sign is already embedded).
+    -- We want visual roll = -SmoothedRoll, which is exactly .p.
+    -- A second negation would cancel the fix and invert the flaps.
     -- --------------------------------------------------------
-    local roll = -self:GetAngles().p   -- corrected sign
+    local roll = self:GetAngles().p   -- NO negation: server already encoded the correct sign
 
     -- --------------------------------------------------------
     -- Fan rotation: all four fans spin continuously.
