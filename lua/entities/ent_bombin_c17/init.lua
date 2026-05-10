@@ -618,6 +618,9 @@ function ENT:SpawnOneJASSM(dropIndex)
     end
 
     local callDir = Angle(0, self.flightYaw, 0):Forward()
+    local groundZ = self:FindGround(dropPos)
+    if groundZ == -1 then groundZ = self.CenterPos.z end
+    local dropHeightAboveGround = math.max(dropPos.z - groundZ, 800)
 
     missile:SetPos(dropPos)
     missile:SetAngles(callDir:Angle())
@@ -627,7 +630,7 @@ function ENT:SpawnOneJASSM(dropIndex)
     missile.Lifetime     = math.min(self.Lifetime, 35)
     missile.Speed        = 250
     missile.OrbitRadius  = self.OrbitRadius * 0.75
-    missile.SkyHeightAdd = math.max(dropPos.z - self:FindGround(dropPos), 800)
+    missile.SkyHeightAdd = dropHeightAboveGround
     missile:SetOwner(self)
     missile.IsOnPlane = true
     missile.Launcher  = self
@@ -660,7 +663,7 @@ function ENT:SpawnOneJASSM(dropIndex)
     if self.JASSM_Stock > 0 then
         self.JASSM_Stock = self.JASSM_Stock - 1
     end
-    self:Debug("W1 JASSM drop #" .. (dropIndex+1) .. " pos=" .. tostring(dropPos))
+    self:Debug("W1 JASSM drop #" .. (dropIndex+1) .. " pos=" .. tostring(dropPos) .. " dropHeight=" .. math.Round(dropHeightAboveGround))
 end
 
 function ENT:UpdateJASSM(ct)

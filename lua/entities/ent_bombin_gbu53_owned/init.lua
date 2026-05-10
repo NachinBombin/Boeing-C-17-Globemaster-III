@@ -29,8 +29,10 @@ local IGNITION_ALT_FRAC    = 0.35
 local ORBIT_ALT_RISE       = 600
 
 local SALVO_COUNT          = 4
-local SALVO_DELAY_BASE     = 0.6
-local SALVO_DELAY_JITTER   = 0.3
+local SALVO_DELAY_BASE     = 0.5
+local SALVO_DELAY_JITTER   = 0.0
+local IGNITION_EFFECT_NAME = "MuzzleFlash"
+local IGNITION_EFFECT_SCALE = 1
 
 ENT.WeaponWindow  = 8
 ENT.FadeDuration  = 0.0
@@ -395,9 +397,9 @@ function ENT:IgniteEngine()
 	self.AltDriftTarget   = self.OrbitAlt
 	self.AltDriftNextPick = CurTime() + math.Rand(8, 20)
 
-	FireEffect(pos + self:GetForward() * -40, "HelicopterMegaBomb", 2)
-	sound.Play("ambient/fire/gas_burst1.wav",       pos, 100, math.random(90, 110), 1.0)
-	sound.Play("ambient/fire/fire_large_loop1.wav", pos,  85, 130,                  0.6)
+	FireEffect(pos + self:GetForward() * -18, IGNITION_EFFECT_NAME, IGNITION_EFFECT_SCALE)
+	sound.Play("ambient/fire/gas_burst1.wav", pos, 92, math.random(100, 112), 0.55)
+	sound.Play("ambient/fire/fire_small1.wav", pos, 78, 120, 0.35)
 
 	if not self.IsSalvoChild then
 		self:SpawnSalvo()

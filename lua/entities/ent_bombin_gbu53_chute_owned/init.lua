@@ -34,6 +34,7 @@ local SWAY_RATE = 1.1
 local THINK_DT  = 1 / 60
 local CHILD_NOCLIP_HOLD = 1.8
 local DEBRIS_LIFETIME   = 14
+local RELEASE_STEP_DELAY = 0.5
 
 function ENT:Initialize()
 	self:SetModel(PALETTE_MODEL)
@@ -162,6 +163,24 @@ function ENT:Think()
 	return true
 end
 
+local function ReleaseMunition(mun, scatterDir)
+	if not IsValid(mun) then return end
+	mun:SetMoveType(MOVETYPE_VPHYSICS)
+	mun:SetSolid(SOLID_VPHYSICS)
+	mun:SetCollisionGroup(COLLISION_GROUP_INTERACTIVE_DEBRIS)
+	local mPhys = mun:GetPhysicsObject()
+	if IsValid(mPhys) then
+		mPhys:Wake()
+		local scatter = scatterDir * math.Rand(40, 100)
+		mPhys:SetVelocity(Vector(
+			scatter.x + math.Rand(-30, 30),
+			scatter.y + math.Rand(-30, 30),
+			math.Rand(-20, 20)
+		))
+		mPhys:AddAngleVelocity(Vector(math.Rand(-80, 80), math.Rand(-80, 80), math.Rand(-50, 50)))
+	end
+end
+
 function ENT:Detach()
 	if self.Detached then return end
 	self.Detached = true
@@ -215,28 +234,17 @@ function ENT:Detach()
 
 	for i = 1, 4 do
 		local mun = self.MunitionEnts[i]
-		if not IsValid(mun) then continue end
-		mun:SetMoveType(MOVETYPE_VPHYSICS)
-		mun:SetSolid(SOLID_VPHYSICS)
-		mun:SetCollisionGroup(COLLISION_GROUP_INTERACTIVE_DEBRIS)
-		local mPhys = mun:GetPhysicsObject()
-		if IsValid(mPhys) then
-			mPhys:Wake()
-			local scatter = MUNITION_OFFSETS[i]:GetNormalized() * math.Rand(40, 100)
-			mPhys:SetVelocity(Vector(
-				scatter.x + math.Rand(-30, 30),
-				scatter.y + math.Rand(-30, 30),
-				math.Rand(-20, 20)
-			))
-			mPhys:AddAngleVelocity(Vector(math.Rand(-80, 80), math.Rand(-80, 80), math.Rand(-50, 50)))
-		end
+		local scatterDir = MUNITION_OFFSETS[i]:GetNormalized()
+		timer.Simple((i - 1) * RELEASE_STEP_DELAY, function()
+			ReleaseMunition(mun, scatterDir)
+		end)
 	end
 
 	sound.Play("npc/combine_soldier/zipline_clip2.wav", pos, 82, math.random(93, 110), 1.0)
 
 	local debrisRefs = { self, chuteClone }
 	for i = 1, 4 do debrisRefs[#debrisRefs + 1] = self.MunitionEnts[i] end
-	timer.Simple(DEBRIS_LIFETIME, function()
+	timer.Simple(DEBRIS_LIFETIME + ((#self.MunitionEnts - 1) * RELEASE_STEP_DELAY), function()
 		for _, e in ipairs(debrisRefs) do
 			if IsValid(e) then e:Remove() end
 		end
