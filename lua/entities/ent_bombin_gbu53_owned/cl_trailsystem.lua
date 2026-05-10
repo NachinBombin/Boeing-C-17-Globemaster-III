@@ -7,11 +7,12 @@
 -- Only active after EngineOn NWBool is true.
 -- ============================================================
 
-local TRAIL_LIFETIME  = 5
-local SAMPLE_RATE     = 0.025
-local TRAIL_WIDTH_CTR = 6
-local TRAIL_WIDTH_TIP = 3
-local TRAIL_ALPHA     = 180
+local TRAIL_LIFETIME  = 9        -- longer persistence
+local SAMPLE_RATE     = 0.018    -- denser sample points
+local TRAIL_WIDTH_CTR = 18       -- was 6  — wide centre contrail
+local TRAIL_WIDTH_TIP = 9        -- was 3  — visible fin-tip trails
+local TRAIL_ALPHA     = 230      -- was 180 — more opaque at head
+local TRAIL_COLOR     = Color(180, 180, 180)  -- was color_white — visible grey
 local TRAIL_TEX       = "trails/smoke"
 
 local TRAIL_OFFSETS = {
@@ -66,7 +67,7 @@ hook.Add("PostDrawTranslucentRenderables", "bombin_gbu53owned_trail_draw", funct
 				local age   = now - s.t
 				local frac  = 1 - (age / TRAIL_LIFETIME)
 				local alpha = frac * frac * TRAIL_ALPHA
-				render.AddBeam(s.pos, width * frac, j / #samples, ColorAlpha(color_white, alpha))
+				render.AddBeam(s.pos, width * frac, j / #samples, ColorAlpha(TRAIL_COLOR, alpha))
 			end
 			render.EndBeam()
 		end
