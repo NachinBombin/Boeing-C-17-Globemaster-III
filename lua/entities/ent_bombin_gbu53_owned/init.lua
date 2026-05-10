@@ -92,7 +92,7 @@ function ENT:Initialize()
 	self.DIVE_ExplosionDamage = self:GetVar("DIVE_ExplosionDamage", 700)
 	self.DIVE_ExplosionRadius = self:GetVar("DIVE_ExplosionRadius", 900)
 
-	self.SalvoIndex   = self:GetVar("SalvoIndex", 1)
+	self.SalvoIndex   = self:GetVar("SalvoIndex",   1)
 	self.IsSalvoChild = self:GetVar("IsSalvoChild", false)
 
 	self.MaxHP = 200
@@ -287,15 +287,19 @@ function ENT:SpawnSalvo()
 			local child = ents.Create("ent_bombin_gbu53_owned")
 			if not IsValid(child) then return end
 
+			-- Use SetVar so Initialize() reads these correctly via GetVar.
+			child:SetVar("IsSalvoChild",          true)
+			child:SetVar("SalvoIndex",             capturedI)
+			child:SetVar("CenterPos",              self.BaseCenterPos)
+			child:SetVar("CallDir",                self.CallDir)
+			child:SetVar("Lifetime",               self.Lifetime)
+			child:SetVar("SkyHeightAdd",           self.SkyHeightAdd)
+			child:SetVar("OrbitRadius",            self.OrbitRadius)
+			child:SetVar("Speed",                  self.Speed)
+			child:SetVar("DIVE_ExplosionDamage",   self.DIVE_ExplosionDamage)
+			child:SetVar("DIVE_ExplosionRadius",   self.DIVE_ExplosionRadius)
+
 			child.SpawnedFromPlane = true
-			child.CenterPos    = self.BaseCenterPos
-			child.CallDir      = self.CallDir
-			child.Lifetime     = self.Lifetime
-			child.SkyHeightAdd = self.SkyHeightAdd
-			child.Speed        = self.Speed
-			child.OrbitRadius  = self.OrbitRadius
-			child.IsSalvoChild = true
-			child.SalvoIndex   = capturedI
 
 			local scatter = Vector(math.Rand(-120, 120), math.Rand(-120, 120), 0)
 			child:SetPos(Vector(
@@ -305,9 +309,6 @@ function ENT:SpawnSalvo()
 			))
 			child:Spawn()
 			child:Activate()
-
-			child:SetVar("DIVE_ExplosionDamage", self.DIVE_ExplosionDamage)
-			child:SetVar("DIVE_ExplosionRadius", self.DIVE_ExplosionRadius)
 
 			child:IgniteEngine()
 			self:Debug("Salvo child " .. capturedI .. " ignited")
