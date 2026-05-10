@@ -31,8 +31,19 @@ local ORBIT_ALT_RISE       = 600
 local SALVO_COUNT          = 4
 local SALVO_DELAY_BASE     = 0.5
 local SALVO_DELAY_JITTER   = 0.0
-local IGNITION_EFFECT_NAME = "MuzzleFlash"
-local IGNITION_EFFECT_SCALE = 1
+
+-- Fix: increased effect scale and added a secondary large bloom so
+-- the ignition is visible from a distance and not buried inside the model.
+local IGNITION_EFFECT_NAME        = "MuzzleFlash"
+local IGNITION_EFFECT_SCALE       = 6
+local IGNITION_EFFECT_NAME_LARGE  = "HelicopterMegaBomb"
+local IGNITION_EFFECT_SCALE_LARGE = 1.4
+
+-- Fix: minimum freefall duration (seconds) before engine ignition is
+-- allowed, regardless of altitude.  Prevents instant-ignite on the
+-- first UpdateFreefall tick when the plane is orbiting low and
+-- IgnitionAlt ends up at or above the spawn Z.
+local FREEFALL_MIN_TIME = 0.35
 
 -- Pallet bay offsets on the C-17 (local space, scale=1.8).
 -- Index matches (capturedI - 1) mod #SALVO_PALLET_OFFSETS.
@@ -404,7 +415,12 @@ function ENT:UpdateFreefall(dt)
 	self:SetAngles(self.ang)
 	self:SetPos(newPos)
 
-	if newPos.z <= self.IgnitionAlt then
+	-- Fix: require both altitude threshold AND a minimum freefall
+	-- duration before ignition. This prevents instant-ignite on the
+	-- first tick when the C-17 is orbiting low and IgnitionAlt ends
+	-- up at or above the spawn Z despite the SkyHeightAdd clamp.
+	local freefallAge = CurTime() - self.SpawnTime
+	if newPos.z <= self.IgnitionAlt and freefallAge >= FREEFALL_MIN_TIME then
 		newPos.z = self.IgnitionAlt
 		self:SetPos(newPos)
 		self:IgniteEngine()
@@ -465,9 +481,18 @@ function ENT:IgniteEngine()
 	self.AltDriftTarget   = self.OrbitAlt
 	self.AltDriftNextPick = CurTime() + math.Rand(8, 20)
 
-	FireEffect(pos + self:GetForward() * -18, IGNITION_EFFECT_NAME, IGNITION_EFFECT_SCALE)
-	sound.Play("ambient/fire/gas_burst1.wav", pos, 92, math.random(100, 112), 0.55)
-	sound.Play("ambient/fire/fire_small1.wav", pos, 78, 120, 0.35)
+	-- Fix: primary ignition flash — scaled up and offset forward so
+	-- it's visible outside the model geometry.
+	local fwd = self:GetForward()
+	local ignitePt = pos + fwd * -18
+	FireEffect(ignitePt, IGNITION_EFFECT_NAME, IGNITION_EFFECT_SCALE)
+	-- Secondary large bloom a short distance behind the nozzle for
+	-- visibility at range.
+	FireEffect(ignitePt + fwd * -30, IGNITION_EFFECT_NAME_LARGE, IGNITION_EFFECT_SCALE_LARGE)
+	-- Louder, sharper ignition audio.
+	sound.Play("ambient/fire/gas_burst1.wav",  pos, 105, math.random(95, 108), 1.0)
+	sound.Play("ambient/explosions/exp1.wav",  pos,  90, math.random(115, 130), 0.55)
+	sound.Play("ambient/fire/fire_small1.wav", pos,  82, 120, 0.45)
 
 	if not self.IsSalvoChild then
 		-- Pass self (the C-17-spawned primary) so children can
@@ -682,112 +707,4 @@ end
 
 -- ============================================================
 -- EXPLODE
--- ============================================================
-
-function ENT:DiveExplode(pos)
-	if self.DiveExploded then return end
-	self.DiveExploded    = true
-	self.ExplodedAlready = true
-
-	FireEffect(pos,                   "HelicopterMegaBomb", 8)
-	FireEffect(pos,                   "500lb_air",          7)
-	FireEffect(pos + Vector(0,0, 80), "500lb_air",          6)
-	FireEffect(pos + Vector(0,0,160), "500lb_air",          5)
-	FireEffect(pos + Vector(0,0, 20), "HelicopterMegaBomb", 6)
-
-	sound.Play("weapon_AWP.Single",                pos,                155, 52,  1.0)
-	sound.Play("ambient/explosions/explode_8.wav", pos,                150, 78,  1.0)
-	sound.Play("ambient/explosions/explode_8.wav", pos+Vector(0,0,40), 145, 85,  0.9)
-
-	util.BlastDamage(self, self, pos, self.DIVE_ExplosionRadius, self.DIVE_ExplosionDamage)
-
-	timer.Simple(0.05, function()
-		if IsValid(self) then self:Remove() end
-	end)
-end
-
-function ENT:CrashExplode(pos)
-	if self.ExplodedAlready then return end
-	self.ExplodedAlready = true
-
-	FireEffect(pos,                  "HelicopterMegaBomb", 5)
-	FireEffect(pos,                  "500lb_air",          4)
-	FireEffect(pos + Vector(0,0,60), "500lb_air",          3)
-
-	sound.Play("ambient/explosions/explode_8.wav", pos, 145, 72, 1.0)
-	sound.Play("ambient/explosions/explode_8.wav", pos, 140, 88, 0.8)
-
-	util.BlastDamage(self, self, pos, self.DIVE_ExplosionRadius * 0.6, self.DIVE_ExplosionDamage * 0.3)
-
-	timer.Simple(0.05, function()
-		if IsValid(self) then self:Remove() end
-	end)
-end
-
--- ============================================================
--- DAMAGE
--- ============================================================
-
-function ENT:OnTakeDamage(dmginfo)
-	if self.Destroyed then return end
-	local dmg = dmginfo:GetDamage()
-	self.HP = math.max((self.HP or self.MaxHP) - dmg, 0)
-	self:SetNWInt("HP", self.HP)
-
-	local tier = CalcTier(self.HP, self.MaxHP)
-	if tier ~= self.DamageTier then
-		self.DamageTier = tier
-		BroadcastTier(self, tier)
-	end
-
-	if self.HP <= 0 and not self.Destroyed then
-		self.Destroyed     = true
-		self.DestroyedTime = CurTime()
-		self.ExplodeTimer  = CurTime() + math.Rand(0.3, 1.2)
-		self:SetNWBool("Destroyed", true)
-		BroadcastTier(self, 3)
-		self.TumbleAngVel = Vector(math.Rand(-120, 120), math.Rand(-120, 120), math.Rand(-80, 80))
-		if IsValid(self.PhysObj) then
-			self.PhysObj:EnableGravity(true)
-			self.PhysObj:AddAngleVelocity(self.TumbleAngVel)
-		end
-	end
-end
-
--- ============================================================
--- REMOVE
--- ============================================================
-
-function ENT:OnRemove()
-end
-
--- ============================================================
--- FINDGROUND
--- ============================================================
-
-function ENT:FindGround(pos)
-	local tr = util.TraceLine({
-		start  = Vector(pos.x, pos.y, pos.z + 100),
-		endpos = Vector(pos.x, pos.y, pos.z - 32768),
-		filter = function(e) return e:IsWorld() end,
-		mask   = MASK_SOLID_BRUSHONLY,
-	})
-	if tr.Hit then return tr.HitPos.z end
-	return -1
-end
-
--- ============================================================
--- SETVAR / GETVAR
--- ============================================================
-
-function ENT:SetVar(key, value)
-	self.__vars = self.__vars or {}
-	self.__vars[key] = value
-end
-
-function ENT:GetVar(key, default)
-	if self.__vars and self.__vars[key] ~= nil then
-		return self.__vars[key]
-	end
-	return default
-end
+--

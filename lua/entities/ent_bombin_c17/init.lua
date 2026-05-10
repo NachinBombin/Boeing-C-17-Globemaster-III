@@ -60,6 +60,11 @@ local CFG_W1_JASSM_Delay      = 0
 local CFG_W1_JASSM_TailOffset = Vector(-360, 0, -70)
 local CFG_W1_JASSM_AltOffset  = 500
 
+-- Minimum freefall clearance above IgnitionAlt:
+-- ensures the missile has at least this many units to fall before
+-- the engine can possibly ignite.
+local CFG_W1_JASSM_MIN_FREEFALL_CLEARANCE = 600
+
 -- ---------- W2 -- Heavy ordnance ----------
 local CFG_W2_Count   = 2
 local CFG_W2_Delay   = 4.0
@@ -672,7 +677,22 @@ function ENT:SpawnOneJASSM(dropIndex)
     local callDir = Angle(0, self.flightYaw, 0):Forward()
     local groundZ = self:FindGround(dropPos)
     if groundZ == -1 then groundZ = self.CenterPos.z end
-    local dropHeightAboveGround = math.max(dropPos.z - groundZ, 800)
+    local rawDropHeight = math.max(dropPos.z - groundZ, 800)
+
+    -- Fix: clamp SkyHeightAdd so IgnitionAlt (ground + SHA * IGNITION_ALT_FRAC)
+    -- is always at least CFG_W1_JASSM_MIN_FREEFALL_CLEARANCE units below the
+    -- drop position.  Without this, a low-orbiting C-17 can produce an
+    -- IgnitionAlt >= dropPos.z and the engine fires on the very first
+    -- UpdateFreefall tick.
+    --
+    -- IgnitionAlt = groundZ + SHA * IGNITION_ALT_FRAC
+    -- We need: dropPos.z - IgnitionAlt >= MIN_FREEFALL_CLEARANCE
+    --   => SHA * IGNITION_ALT_FRAC <= dropPos.z - groundZ - MIN_FREEFALL_CLEARANCE
+    --   => SHA <= (dropPos.z - groundZ - MIN_FREEFALL_CLEARANCE) / IGNITION_ALT_FRAC
+    -- IGNITION_ALT_FRAC is 0.35 (defined in ent_bombin_gbu53_owned/init.lua)
+    local IGNITION_ALT_FRAC = 0.35
+    local maxSHA = (rawDropHeight - CFG_W1_JASSM_MIN_FREEFALL_CLEARANCE) / IGNITION_ALT_FRAC
+    local dropHeightAboveGround = math.min(rawDropHeight, math.max(maxSHA, 0))
 
     missile:SetPos(dropPos)
     missile:SetAngles(callDir:Angle())
@@ -776,7 +796,14 @@ function ENT:SpawnOneGBU53Pallet(palletIndex)
     pallet.Lifetime     = math.min(self.Lifetime, 60)
     pallet.Speed        = 420
     pallet.OrbitRadius  = self.OrbitRadius
-    pallet.SkyHeightAdd = math.max(dropPos.z - self:FindGround(dropPos), 1200)
+    local groundZ = self:FindGround(dropPos)
+    -- Bug D fix: guard against FindGround returning -1 (out-of-world trace).
+    -- Fall back to a safe minimum rather than producing groundZ = dropPos.z+1.
+    if groundZ == -1 then
+        pallet.SkyHeightAdd = 1200
+    else
+        pallet.SkyHeightAdd = math.max(dropPos.z - groundZ, 1200)
+    end
     pallet:SetOwner(self)
     pallet.IsOnPlane = true
     pallet.Launcher  = self
