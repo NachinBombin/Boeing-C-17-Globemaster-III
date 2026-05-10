@@ -42,9 +42,6 @@ util.AddNetworkString("bombin_gbu53owned_damage_tier")
 
 -- ============================================================
 -- FIRE EFFECT HELPER  (mirrors JASSM FireEffect exactly)
--- Using util.Effect with EffectData scale/magnitude/radius set
--- prevents the index-buffer crash that raw HelicopterMegaBomb
--- calls caused when the effect had too many indices.
 -- ============================================================
 local function FireEffect(origin, effect, scale)
 	local ed = EffectData()
@@ -271,28 +268,38 @@ end
 
 -- ============================================================
 -- SALVO SPAWN
+-- FIX (Bug 3): SetVar() calls MUST happen after Spawn()+Activate().
+-- Spawn() calls Initialize() which calls self:GetVar() to read the
+-- orbit parameters. If SetVar() runs before Spawn() then __vars is
+-- wiped by Initialize()'s first-run self.__vars initialization and
+-- all values fall back to defaults. Moving SetVar() post-Activate()
+-- and immediately calling IgniteEngine() last ensures Initialize()
+-- has already run and the vars are read from the direct field
+-- assignments via self.X (same pattern as SpawnOneGBU53Pallet).
+-- Additionally: copy critical params as direct fields first so
+-- Initialize() can read them from self.X before GetVar() runs.
 -- ============================================================
 
 function ENT:SpawnSalvo()
 	for i = 2, SALVO_COUNT do
 		local delay = (i - 1) * SALVO_DELAY_BASE + math.Rand(0, SALVO_DELAY_JITTER)
-		local idx   = i
+		local capturedI = i
 		timer.Simple(delay, function()
 			if not IsValid(self) then return end
 
 			local child = ents.Create("ent_bombin_gbu53_owned")
 			if not IsValid(child) then return end
 
-			child:SetVar("CenterPos",            self.BaseCenterPos)
-			child:SetVar("CallDir",              self.CallDir)
-			child:SetVar("Lifetime",             self.Lifetime)
-			child:SetVar("SkyHeightAdd",         self.SkyHeightAdd)
-			child:SetVar("OrbitRadius",          self:GetVar("OrbitRadius", 2500))
-			child:SetVar("Speed",                self:GetVar("Speed",        250))
-			child:SetVar("DIVE_ExplosionDamage", self.DIVE_ExplosionDamage)
-			child:SetVar("DIVE_ExplosionRadius", self.DIVE_ExplosionRadius)
-			child:SetVar("SalvoIndex",           idx)
-			child:SetVar("IsSalvoChild",         true)
+			-- Set direct fields BEFORE Spawn so Initialize() reads them correctly.
+			child.SpawnedFromPlane = true
+			child.CenterPos    = self.BaseCenterPos
+			child.CallDir      = self.CallDir
+			child.Lifetime     = self.Lifetime
+			child.SkyHeightAdd = self.SkyHeightAdd
+			child.Speed        = self.Speed
+			child.OrbitRadius  = self.OrbitRadius
+			child.IsSalvoChild = true
+			child.SalvoIndex   = capturedI
 
 			local scatter = Vector(math.Rand(-120, 120), math.Rand(-120, 120), 0)
 			child:SetPos(Vector(
@@ -302,8 +309,13 @@ function ENT:SpawnSalvo()
 			))
 			child:Spawn()
 			child:Activate()
+
+			-- SetVar() after Activate() for any values Initialize() reads via GetVar().
+			child:SetVar("DIVE_ExplosionDamage", self.DIVE_ExplosionDamage)
+			child:SetVar("DIVE_ExplosionRadius", self.DIVE_ExplosionRadius)
+
 			child:IgniteEngine()
-			self:Debug("Salvo child " .. idx .. " ignited")
+			self:Debug("Salvo child " .. capturedI .. " ignited")
 		end)
 	end
 end
@@ -384,7 +396,6 @@ function ENT:IgniteEngine()
 	self.AltDriftTarget   = self.OrbitAlt
 	self.AltDriftNextPick = CurTime() + math.Rand(8, 20)
 
-	-- Ignition burst: match JASSM sounds exactly
 	FireEffect(pos + self:GetForward() * -40, "HelicopterMegaBomb", 2)
 	sound.Play("ambient/fire/gas_burst1.wav",       pos, 100, math.random(90, 110), 1.0)
 	sound.Play("ambient/fire/fire_large_loop1.wav", pos,  85, 130,                  0.6)
@@ -595,11 +606,7 @@ function ENT:UpdateDive(ct)
 end
 
 -- ============================================================
--- EXPLODE  —  mirrors JASSM FireEffect pattern exactly
--- FIX: util.BlastDamage attacker is now self (not GetOwner()).
---      GetOwner() returns the chute entity, which is already
---      removed by the time DiveExplode fires.  NULL entity as
---      the attacker arg crashes BlastDamage at [C]:-1.
+-- EXPLODE
 -- ============================================================
 
 function ENT:DiveExplode(pos)

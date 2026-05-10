@@ -55,9 +55,6 @@ local TARGET_REACQUIRE_INTERVAL  = 0.35
 local TARGET_PASS_BIAS           = 0.55
 
 -- ---------- W1 -- JASSM parachute drop ----------
--- Critical fix: use a real tail release point instead of a tiny -60 local offset.
--- The model is scaled to 1.8, and LocalToWorld does NOT account for visual scale.
--- A small offset was spawning the payload inside the fuselage.
 local CFG_W1_JASSM_Count      = 1
 local CFG_W1_JASSM_Delay      = 0
 local CFG_W1_JASSM_TailOffset = Vector(-360, 0, -70)
@@ -79,13 +76,20 @@ local CFG_W2_Pool    = {
 }
 
 -- ---------- W3 -- GBU-53 parachute cluster ----------
--- Same release-point fix as JASSM, but with extra downward clearance so the
--- palette/chute/visual munition combo starts fully below the aircraft.
+-- FIX (Bug 1): CFG_W3_DropOffset reduced from Vector(-340,0,-140).
+-- At MODEL_SCALE 1.8 the C-17 fuselage is ~360 units long in world
+-- space, but LocalToWorld does NOT scale - it operates in model-local
+-- coords regardless of SetModelScale. So -340 local X was already
+-- well past the tail. The real issue was that after the offset the
+-- BodyClearance subtracted another 260 units of Z, putting the drop
+-- point roughly half a map-unit below and far behind the plane when
+-- rendered at scale. Corrected offset: -180 local X (just behind the
+-- rear cargo ramp), -60 Z (below belly), 80 unit body clearance.
 local CFG_W3_GBU53_Count       = 3
 local CFG_W3_GBU53_Delay       = 1.2
 local CFG_W3_AltStagger        = 400
-local CFG_W3_DropOffset        = Vector(-340, 0, -140)
-local CFG_W3_BodyClearance     = 260
+local CFG_W3_DropOffset        = Vector(-180, 0, -60)
+local CFG_W3_BodyClearance     = 80
 local CFG_W3_NoCollideHoldTime = 1.8
 
 -- ---------- W6 -- Retarded / Parachute bombs ----------
@@ -598,13 +602,6 @@ function ENT:SpawnCarpetBomb(entClass, dropPos, aimPos)
     end
 end
 
--- ============================================================
--- W1: JASSM PARACHUTE DROP
--- Critical fix:
--- 1) Use a real tail offset outside the fuselage.
--- 2) Pass init data exactly how ent_bombin_jassm_owned expects it: direct fields,
---    not SetVar(). This makes the loitering logic byte-for-byte compatible in behavior.
--- ============================================================
 function ENT:SpawnOneJASSM(dropIndex)
     dropIndex = dropIndex or 0
 
@@ -690,10 +687,7 @@ end
 
 -- ============================================================
 -- W3: GBU-53 PARACHUTE CLUSTER DROP
--- Critical fix:
--- 1) Real aft/below release point so the combo starts outside the aircraft.
--- 2) Keep owner on the loitering missile entity, not the plane.
--- 3) Pass direct fields to match ent_bombin_gbu53_owned Initialize().
+-- FIX (Bug 1): DropOffset corrected - see CFG_W3_DropOffset comment.
 -- ============================================================
 function ENT:SpawnOneGBU53Pallet(palletIndex)
     palletIndex = palletIndex or 0
