@@ -41,6 +41,7 @@ local HORIZ_GLIDE_RAMP     = 1.4   -- seconds to reach max horiz speed
 -- Ignition altitude above the calculated ground
 -- Range: SkyHeightAdd * 0.35  (≈875 u above ground for default 2500)
 local IGNITION_ALT_FRAC    = 0.35
+local ORBIT_ALT_RISE       = 600
 
 ENT.WeaponWindow  = 8
 ENT.FadeDuration  = 0.0   -- no fade-in; appears solid from drop
@@ -110,6 +111,7 @@ function ENT:Initialize()
 	local ignBase = ground + (self.SkyHeightAdd * IGNITION_ALT_FRAC)
 	local ignVar  = self.SkyHeightAdd * IGNITION_ALT_FRAC * 0.25
 	self.IgnitionAlt = ignBase + math.Rand(-ignVar, ignVar)
+	self.OrbitAlt    = self.IgnitionAlt + ORBIT_ALT_RISE
 
 	self.DieTime   = CurTime() + self.Lifetime
 	self.SpawnTime = CurTime()
@@ -196,8 +198,8 @@ function ENT:Initialize()
 
 	self.GlideBleedRate = GLIDE_BLEED_RATE
 
-	self.AltDriftCurrent  = self.sky
-	self.AltDriftTarget   = self.sky
+	self.AltDriftCurrent  = self.OrbitAlt
+	self.AltDriftTarget   = self.OrbitAlt
 	self.AltDriftNextPick = CurTime() + math.Rand(8, 20)
 	self.AltDriftRange    = 700
 	self.AltDriftLerp     = 0.003
@@ -263,6 +265,7 @@ end
 -- ============================================================
 
 function ENT:SpawnChute()
+	if IsValid(self.ChuteEnt) then return end
 	local chute = ents.Create("ent_bombin_gbu53_chute_owned")
 	if not IsValid(chute) then
 		self:Debug("Failed to create chute entity")
@@ -355,9 +358,10 @@ function ENT:IgniteEngine()
 	)
 	self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDir
 
-	-- Set orbit altitude start to current position (climbs naturally via AltDrift)
-	self.AltDriftCurrent = pos.z
-	self.AltDriftTarget  = pos.z + 600   -- climb 600 u after ignition
+	-- Climb smoothly toward a fixed orbit altitude above ignition
+	self.AltDriftCurrent = self.OrbitAlt
+	self.AltDriftTarget  = self.OrbitAlt
+	self.AltDriftNextPick = CurTime() + math.Rand(8, 20)
 
 	-- Ignition flash effect
 	local ed = EffectData()
@@ -414,7 +418,7 @@ function ENT:Think()
 	-- Alt drift
 	if ct >= self.AltDriftNextPick then
 		self.AltDriftNextPick = ct + math.Rand(8, 20)
-		self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
+		self.AltDriftTarget   = self.OrbitAlt + math.Rand(-self.AltDriftRange, self.AltDriftRange)
 	end
 	self.AltDriftCurrent = Lerp(self.AltDriftLerp, self.AltDriftCurrent, self.AltDriftTarget)
 
