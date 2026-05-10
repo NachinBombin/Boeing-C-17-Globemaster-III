@@ -32,12 +32,14 @@ local SALVO_COUNT          = 4
 local SALVO_DELAY_BASE     = 0.5
 local SALVO_DELAY_JITTER   = 0.0
 
--- Fix: increased effect scale and added a secondary large bloom so
--- the ignition is visible from a distance and not buried inside the model.
+-- Primary ignition flash: MuzzleFlash scaled up, offset so it clears
+-- the model geometry and is visible at range.
+-- Secondary: NPC_Shield_Impact — a tight, bright nozzle ring that reads
+-- well at distance without producing a screen-filling explosion.
 local IGNITION_EFFECT_NAME        = "MuzzleFlash"
 local IGNITION_EFFECT_SCALE       = 6
-local IGNITION_EFFECT_NAME_LARGE  = "HelicopterMegaBomb"
-local IGNITION_EFFECT_SCALE_LARGE = 1.4
+local IGNITION_EFFECT_NAME_LARGE  = "NPC_Shield_Impact"
+local IGNITION_EFFECT_SCALE_LARGE = 1.8
 
 -- Fix: minimum freefall duration (seconds) before engine ignition is
 -- allowed, regardless of altitude.  Prevents instant-ignite on the
@@ -481,15 +483,15 @@ function ENT:IgniteEngine()
 	self.AltDriftTarget   = self.OrbitAlt
 	self.AltDriftNextPick = CurTime() + math.Rand(8, 20)
 
-	-- Fix: primary ignition flash — scaled up and offset forward so
-	-- it's visible outside the model geometry.
+	-- Primary: MuzzleFlash offset behind nozzle so it clears the model.
+	-- Secondary: NPC_Shield_Impact — tight bright ring, readable at
+	-- distance without producing a screen-filling blast.
 	local fwd = self:GetForward()
 	local ignitePt = pos + fwd * -18
 	FireEffect(ignitePt, IGNITION_EFFECT_NAME, IGNITION_EFFECT_SCALE)
-	-- Secondary large bloom a short distance behind the nozzle for
-	-- visibility at range.
 	FireEffect(ignitePt + fwd * -30, IGNITION_EFFECT_NAME_LARGE, IGNITION_EFFECT_SCALE_LARGE)
-	-- Louder, sharper ignition audio.
+
+	-- Ignition audio: sharp gas-burst transient + low thump tail.
 	sound.Play("ambient/fire/gas_burst1.wav",  pos, 105, math.random(95, 108), 1.0)
 	sound.Play("ambient/explosions/exp1.wav",  pos,  90, math.random(115, 130), 0.55)
 	sound.Play("ambient/fire/fire_small1.wav", pos,  82, 120, 0.45)
@@ -707,4 +709,104 @@ end
 
 -- ============================================================
 -- EXPLODE
---
+-- ============================================================
+
+function ENT:DiveExplode(pos)
+	if self.DiveExploded then return end
+	self.DiveExploded = true
+
+	util.BlastDamage(self, self:GetOwner(), pos, self.DIVE_ExplosionRadius, self.DIVE_ExplosionDamage)
+
+	local ed = EffectData()
+	ed:SetOrigin(pos)
+	ed:SetScale(2.5)
+	util.Effect("Explosion", ed, true, true)
+
+	sound.Play("ambient/explosions/explode_" .. math.random(1,5) .. ".wav", pos, 145, math.random(85, 100), 1.0)
+
+	if IsValid(self.ChuteEnt) then self.ChuteEnt:Remove() end
+	self:Remove()
+end
+
+function ENT:CrashExplode(pos)
+	if self.ExplodedAlready then return end
+	self.ExplodedAlready = true
+
+	util.BlastDamage(self, self:GetOwner(), pos, self.DIVE_ExplosionRadius * 0.5, self.DIVE_ExplosionDamage * 0.3)
+
+	local ed = EffectData()
+	ed:SetOrigin(pos)
+	ed:SetScale(1.2)
+	util.Effect("Explosion", ed, true, true)
+
+	sound.Play("ambient/explosions/explode_" .. math.random(1,5) .. ".wav", pos, 120, math.random(90, 110), 0.7)
+
+	if IsValid(self.ChuteEnt) then self.ChuteEnt:Remove() end
+	self:Remove()
+end
+
+-- ============================================================
+-- DAMAGE / DESTRUCTION
+-- ============================================================
+
+function ENT:OnTakeDamage(dmginfo)
+	if self.Destroyed then return end
+
+	local dmg = dmginfo:GetDamage()
+	self.HP = (self.HP or self.MaxHP) - dmg
+	self:SetNWInt("HP", math.max(0, self.HP))
+
+	local tier = CalcTier(math.max(0, self.HP), self.MaxHP)
+	if tier ~= self.DamageTier then
+		self.DamageTier = tier
+		BroadcastTier(self, tier)
+	end
+
+	if self.HP <= 0 then
+		self:Destroy()
+	end
+end
+
+function ENT:Destroy()
+	self.Destroyed     = true
+	self.DestroyedTime = CurTime()
+	self.ExplodeTimer  = CurTime() + math.Rand(0.4, 1.2)
+
+	self:SetNWBool("Destroyed", true)
+
+	self.TumbleAngVel = Vector(
+		math.Rand(-120, 120),
+		math.Rand(-120, 120),
+		math.Rand(-80,   80)
+	)
+
+	if IsValid(self.PhysObj) then
+		self.PhysObj:EnableGravity(true)
+	end
+
+	if IsValid(self.ChuteEnt) then self.ChuteEnt:Remove() end
+end
+
+-- ============================================================
+-- GROUND FINDER
+-- ============================================================
+
+function ENT:FindGround(pos)
+	local tr = util.TraceLine({
+		start  = Vector(pos.x, pos.y, pos.z + 100),
+		endpos  = Vector(pos.x, pos.y, pos.z - 32000),
+		filter = self,
+		mask   = MASK_SOLID_BRUSHONLY,
+	})
+	return tr.Hit and tr.HitPos.z or -1
+end
+
+-- ============================================================
+-- GENERIC VAR HELPERS
+-- ============================================================
+
+function ENT:SetVar(key, val) self["_var_" .. key] = val end
+function ENT:GetVar(key, default)
+	local v = self["_var_" .. key]
+	return (v ~= nil) and v or default
+end
