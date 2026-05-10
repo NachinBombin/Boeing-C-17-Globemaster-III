@@ -76,6 +76,9 @@ local CFG_W2_Pool    = {
 }
 
 -- ---------- W3 -- GBU-53 parachute cluster ----------
+-- AltStagger staggers each successive pallet further below the drop
+-- point so they separate cleanly during free-fall before chute deploy.
+-- This is intentional, not a geometry error.
 local CFG_W3_GBU53_Count       = 3
 local CFG_W3_GBU53_Delay       = 1.2
 local CFG_W3_AltStagger        = 400
@@ -231,6 +234,10 @@ function ENT:Initialize()
         self.PhysObj:SetVelocity(initVel)
     end
 
+    -- Bug 4 fix: desired velocity is computed in Think/UpdateOrbit and
+    -- stored here; PhysicsUpdate applies it at the physics tick rate.
+    self.DesiredVelocity = Vector(0, 0, 0)
+
     self.OrbitAngle    = math.atan2(spawnOffset.y, spawnOffset.x)
     self.OrbitAngSpeed = (self.Speed / self.OrbitRadius) * self.OrbitDirection
 
@@ -303,9 +310,6 @@ function ENT:UpdateOrbit(ct, dt)
 
     self.OrbitAngle = self.OrbitAngle + self.OrbitAngSpeed * dt
 
-    local desX = self.DynamicCenterPos.x + math.cos(self.OrbitAngle) * self.OrbitRadius
-    local desY = self.DynamicCenterPos.y + math.sin(self.OrbitAngle) * self.OrbitRadius
-
     if ct >= self.AltDriftNextPick then
         self.AltDriftNextPick = ct + math.Rand(12, 30)
         self.AltDriftTarget   = self.sky + math.Rand(-self.AltDriftRange, self.AltDriftRange)
@@ -315,9 +319,9 @@ function ENT:UpdateOrbit(ct, dt)
     self.JitterPhase = self.JitterPhase + dt * 1.3
     local jitterZ = math.sin(self.JitterPhase) * self.JitterAmplitude
 
-    local desZ  = self.AltDriftCurrent + jitterZ
+    local desZ   = self.AltDriftCurrent + jitterZ
     local curPos = self:GetPos()
-    local velZ  = math.Clamp((desZ - curPos.z) * 8, -120, 120)
+    local velZ   = math.Clamp((desZ - curPos.z) * 8, -120, 120)
 
     if ct - self.SkyProbeLastHit > 0.3 then
         local fwd = Angle(0, self.flightYaw, 0):Forward()
@@ -348,18 +352,29 @@ function ENT:UpdateOrbit(ct, dt)
     local rollLerp    = (math.abs(targetRoll) > math.abs(self.SmoothedRoll)) and ROLL_LERP_IN or ROLL_LERP_OUT
     self.SmoothedRoll = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
 
+    -- Bug 4 fix: compute desired velocity here; PhysicsUpdate applies it.
+    -- This decouples orbit steering from Think() tick timing and prevents
+    -- desync / involuntary PhysObj sleep kicks.
     local curVel  = phys:GetVelocity()
     local desVelX = math.cos(math.rad(desiredYaw)) * self.Speed
     local desVelY = math.sin(math.rad(desiredYaw)) * self.Speed
-    local newVel  = Vector(
+    self.DesiredVelocity = Vector(
         Lerp(0.12, curVel.x, desVelX),
         Lerp(0.12, curVel.y, desVelY),
         velZ
     )
-    phys:SetVelocity(newVel)
 
     self.ang = Angle(-self.SmoothedRoll, self.flightYaw + MODEL_YAW_OFFSET, -self.SmoothedPitch)
     self:SetAngles(self.ang)
+end
+
+-- Bug 4 fix: velocity is applied here, at the physics tick rate,
+-- instead of being force-set from the Think loop.
+function ENT:PhysicsUpdate(phys, dt)
+    if self.Destroyed then return end
+    if not self.DesiredVelocity then return end
+    if phys:IsAsleep() then phys:Wake() end
+    phys:SetVelocity(self.DesiredVelocity)
 end
 
 function ENT:UpdateFade(dt)
@@ -372,12 +387,18 @@ function ENT:UpdateFade(dt)
     end
 end
 
+-- Bug 1 fix: build an available-weapons list that excludes "jassm"
+-- when stock is depleted, then pick randomly from that list.
+-- The old code did a single re-roll that could still land on "jassm".
 function ENT:PickNewWeapon()
-    if #WEAPON_ROSTER == 0 then return end
-    local w = WEAPON_ROSTER[math.random(#WEAPON_ROSTER)]
-    if w == "jassm" and self.JASSM_Stock <= 0 then
-        w = WEAPON_ROSTER[math.random(#WEAPON_ROSTER)]
+    local available = {}
+    for _, w in ipairs(WEAPON_ROSTER) do
+        if w ~= "jassm" or self.JASSM_Stock > 0 then
+            table.insert(available, w)
+        end
     end
+    if #available == 0 then return end
+    local w = available[math.random(#available)]
     self.WPN_Active     = w
     self.WPN_ShotsFired = 0
     self.WPN_NextShot   = CurTime()
@@ -385,10 +406,15 @@ function ENT:PickNewWeapon()
     self:Debug("Weapon window: " .. w)
 end
 
+-- Bug 3 fix: added no-target guard before PickNewWeapon.
+-- Previously the plane opened weapon windows even with zero alive
+-- players, burning shots at CenterPos and wasting cooldown cycles.
 function ENT:UpdateWeapons(ct)
     if ct < self.WPN_PeaceUntil then return end
 
     if not self.WPN_Active then
+        -- Do not open a weapon window if there are no valid targets.
+        if not IsValid(self:RefreshTarget(ct)) then return end
         self:PickNewWeapon()
         return
     end
@@ -437,9 +463,6 @@ function ENT:Think()
 
     self:NextThink(ct + 0.015)
     return true
-end
-
-function ENT:PhysicsUpdate(phys, dt)
 end
 
 function ENT:OnTakeDamage(dmginfo)
@@ -558,16 +581,6 @@ end
 
 -- ============================================================
 -- SPAWN HELPERS
--- FIX: Restored arming sequence stripped during weapon redesign.
---   1. bomb.IsOnPlane / bomb.Launcher / bomb:SetOwner set BEFORE Spawn()
---      -> SW uses these for damage attribution and platform awareness
---   2. isRetarded bodygroup applied after Activate()
---      -> deploys visual air-brake / retarder fins
---   3. bomb:Arm() called if available, else bomb.Armed = true
---      -> activates air-cushion deployment and arms the impact fuze
---         so the bomb actually explodes on contact
---   4. constraint.NoCollide + 0.6s removal timer
---      -> prevents bomb clipping back through the fuselage on exit
 -- ============================================================
 function ENT:SpawnDartBomb(entClass, dropPos, targetPos, isRetarded)
     local bomb = ents.Create(entClass)
