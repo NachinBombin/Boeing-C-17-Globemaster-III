@@ -34,6 +34,15 @@ local SALVO_DELAY_JITTER   = 0.0
 local IGNITION_EFFECT_NAME = "MuzzleFlash"
 local IGNITION_EFFECT_SCALE = 1
 
+-- Pallet bay offsets on the C-17 (local space, scale=1.8).
+-- Index matches (capturedI - 1) mod #SALVO_PALLET_OFFSETS.
+-- These mirror the drop offsets used in UpdateW3() on the parent plane.
+local SALVO_PALLET_OFFSETS = {
+    Vector(-180,   60, -60),   -- slot 2
+    Vector(-180,  -60, -60),   -- slot 3
+    Vector(-180,    0, -140),  -- slot 4  (lower centreline)
+}
+
 ENT.WeaponWindow  = 8
 ENT.FadeDuration  = 0.0
 
@@ -43,7 +52,7 @@ ENT.DIVE_TrackInterval = 0.1
 util.AddNetworkString("bombin_gbu53owned_damage_tier")
 
 -- ============================================================
--- FIRE EFFECT HELPER  (mirrors JASSM FireEffect exactly)
+-- FIRE EFFECT HELPER
 -- ============================================================
 local function FireEffect(origin, effect, scale)
 	local ed = EffectData()
@@ -129,8 +138,31 @@ function ENT:Initialize()
 	self.Speed       = baseSpeed  * math.Rand(0.85, 1.15)
 	self.OrbitDir    = (math.random(0,1) == 0) and 1 or -1
 
+	-- --------------------------------------------------------
+	-- Spawn position:
+	-- Primary missile : use sky column above CenterPos (unchanged).
+	-- Salvo children  : use the exact pallet world position passed
+	--                   by SpawnSalvo() via SetVar("ReleasePos").
+	--                   This eliminates the previous
+	--                   (BaseCenterPos + scatter, IgnitionAlt) hack
+	--                   that caused visual teleporting.
+	-- --------------------------------------------------------
 	local spawnPos
-	if self.SpawnedFromPlane then
+	if self.IsSalvoChild then
+		local rel = self:GetVar("ReleasePos", nil)
+		if rel then
+			spawnPos = rel
+		else
+			-- Fallback: scatter around tail (should not normally happen)
+			local tailOffset = self.CallDir * -200
+			local scatter    = Vector(math.Rand(-120, 120), math.Rand(-120, 120), 0)
+			spawnPos = Vector(
+				self.CenterPos.x + tailOffset.x + scatter.x,
+				self.CenterPos.y + tailOffset.y + scatter.y,
+				self.sky
+			)
+		end
+	elseif self.SpawnedFromPlane then
 		spawnPos = self:GetPos()
 	else
 		local tailOffset = self.CallDir * -200
@@ -156,8 +188,6 @@ function ENT:Initialize()
 	self:SetPos(spawnPos)
 	self:SetBodygroup(1, 0)
 
-	-- Hide the missile model during freefall while the chute combo is visible.
-	-- IsSalvoChild missiles ignite immediately (no chute), so they stay visible.
 	if not self.IsSalvoChild then
 		self:SetRenderMode(RENDERMODE_NONE)
 	else
@@ -277,21 +307,50 @@ end
 
 -- ============================================================
 -- SALVO SPAWN
+--
+-- planeEnt  (Entity|nil) : reference to the parent C-17 entity.
+--   When valid, each child is placed at the real pallet world-space
+--   position at the moment of release, so the live missile appears
+--   exactly where the visual pallet was dropped.
+--   If planeEnt is invalid/nil the old scatter fallback is used.
 -- ============================================================
 
-function ENT:SpawnSalvo()
+function ENT:SpawnSalvo(planeEnt)
 	for i = 2, SALVO_COUNT do
-		local delay = (i - 1) * SALVO_DELAY_BASE + math.Rand(0, SALVO_DELAY_JITTER)
-		local capturedI = i
+		local delay      = (i - 1) * SALVO_DELAY_BASE + math.Rand(0, SALVO_DELAY_JITTER)
+		local capturedI  = i
 		timer.Simple(delay, function()
 			if not IsValid(self) then return end
+
+			-- ------------------------------------------------
+			-- Compute real pallet release position.
+			-- The offset index cycles through SALVO_PALLET_OFFSETS
+			-- (slots 2, 3, 4 → indices 1, 2, 3 → capturedI-1).
+			-- ------------------------------------------------
+			local offIdx     = ((capturedI - 2) % #SALVO_PALLET_OFFSETS) + 1
+			local palletOff  = SALVO_PALLET_OFFSETS[offIdx]
+			local releasePos
+
+			if IsValid(planeEnt) then
+				-- LocalToWorld in the C-17's current frame at the moment
+				-- the timer fires (matches when the visual pallet departs).
+				releasePos = planeEnt:LocalToWorld(palletOff)
+			else
+				-- Fallback: scatter around tail of BaseCenterPos.
+				local scatter = Vector(math.Rand(-120, 120), math.Rand(-120, 120), 0)
+				releasePos = Vector(
+					self.BaseCenterPos.x + scatter.x,
+					self.BaseCenterPos.y + scatter.y,
+					self.IgnitionAlt
+				)
+			end
 
 			local child = ents.Create("ent_bombin_gbu53_owned")
 			if not IsValid(child) then return end
 
-			-- Use SetVar so Initialize() reads these correctly via GetVar.
 			child:SetVar("IsSalvoChild",          true)
 			child:SetVar("SalvoIndex",             capturedI)
+			child:SetVar("ReleasePos",             releasePos)   -- real pallet pos
 			child:SetVar("CenterPos",              self.BaseCenterPos)
 			child:SetVar("CallDir",                self.CallDir)
 			child:SetVar("Lifetime",               self.Lifetime)
@@ -301,19 +360,15 @@ function ENT:SpawnSalvo()
 			child:SetVar("DIVE_ExplosionDamage",   self.DIVE_ExplosionDamage)
 			child:SetVar("DIVE_ExplosionRadius",   self.DIVE_ExplosionRadius)
 
-			child.SpawnedFromPlane = true
-
-			local scatter = Vector(math.Rand(-120, 120), math.Rand(-120, 120), 0)
-			child:SetPos(Vector(
-				self.BaseCenterPos.x + scatter.x,
-				self.BaseCenterPos.y + scatter.y,
-				self.IgnitionAlt
-			))
+			-- Pre-set position so Initialize() finds it via self:GetPos()
+			-- (SpawnedFromPlane path) only if ReleasePos branch fails;
+			-- the ReleasePos SetVar is the authoritative path.
+			child:SetPos(releasePos)
 			child:Spawn()
 			child:Activate()
 
 			child:IgniteEngine()
-			self:Debug("Salvo child " .. capturedI .. " ignited")
+			self:Debug("Salvo child " .. capturedI .. " ignited at " .. tostring(releasePos))
 		end)
 	end
 end
@@ -366,16 +421,23 @@ function ENT:IgniteEngine()
 
 	self:Debug("Engine ignited [salvo " .. self.SalvoIndex .. "] at Z=" .. math.Round(self:GetPos().z))
 
-	-- Missile is now flying under its own power — make it visible.
 	self:SetRenderMode(RENDERMODE_NORMAL)
-
 	self:SetNWBool("EngineOn", true)
 	self:SetBodygroup(1, 1)
 
 	self:PhysicsInit(SOLID_VPHYSICS)
 	self:SetMoveType(MOVETYPE_VPHYSICS)
 	self:SetSolid(SOLID_VPHYSICS)
-	self:SetCollisionGroup(COLLISION_GROUP_INTERACTIVE_DEBRIS)
+
+	-- --------------------------------------------------------
+	-- Collision safety:
+	-- COLLISION_GROUP_IN_VEHICLE lets missiles pass through
+	-- each other and through the parent plane entity while
+	-- still colliding with the world (for detonation traces).
+	-- Upgraded to INTERACTIVE_DEBRIS only on StartDive() so
+	-- the warhead can interact with world geometry on impact.
+	-- --------------------------------------------------------
+	self:SetCollisionGroup(COLLISION_GROUP_IN_VEHICLE)
 
 	self.PhysObj = self:GetPhysicsObject()
 	if IsValid(self.PhysObj) then
@@ -387,6 +449,12 @@ function ENT:IgniteEngine()
 	end
 
 	local pos = self:GetPos()
+
+	-- --------------------------------------------------------
+	-- Orbit angle seeded from actual release position.
+	-- Each child enters its loiter at the bearing it was
+	-- released from, not all converging on the same phase.
+	-- --------------------------------------------------------
 	self.OrbitAngle = math.atan2(
 		pos.y - self.CenterPos.y,
 		pos.x - self.CenterPos.x
@@ -402,7 +470,10 @@ function ENT:IgniteEngine()
 	sound.Play("ambient/fire/fire_small1.wav", pos, 78, 120, 0.35)
 
 	if not self.IsSalvoChild then
-		self:SpawnSalvo()
+		-- Pass self (the C-17-spawned primary) so children can
+		-- read LocalToWorld pallet positions while the plane is live.
+		local planeRef = self:GetVar("ParentPlane", nil)
+		self:SpawnSalvo(IsValid(planeRef) and planeRef or nil)
 	end
 end
 
@@ -549,6 +620,9 @@ function ENT:StartDive(ct)
 	self.DiveAimOffset = Vector(math.Rand(-400, 400), math.Rand(-400, 400), 0)
 	self.DiveSpeedCurrent = self.DiveSpeedMin
 	self.DiveWobblePhase  = 0
+
+	-- Upgrade collision so the warhead detonates on world contact.
+	self:SetCollisionGroup(COLLISION_GROUP_INTERACTIVE_DEBRIS)
 
 	local closest, closestDist = nil, math.huge
 	for _, ply in ipairs(player.GetAll()) do
