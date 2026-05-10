@@ -60,10 +60,23 @@ local CFG_W1_JASSM_Delay      = 0
 local CFG_W1_JASSM_TailOffset = Vector(-360, 0, -70)
 local CFG_W1_JASSM_AltOffset  = 500
 
--- Minimum freefall clearance above IgnitionAlt:
--- ensures the missile has at least this many units to fall before
--- the engine can possibly ignite.
-local CFG_W1_JASSM_MIN_FREEFALL_CLEARANCE = 600
+-- ent_bombin_jassm_owned computes:
+--   IgnitionAlt = groundZ + SHA + rand(-SHA*0.25, +SHA*0.25)
+-- Worst-case (highest possible ignition): groundZ + SHA * 1.25
+--
+-- We need: dropPos.z > IgnitionAlt_max
+--   dropPos.z > groundZ + SHA * 1.25
+--   SHA < (dropPos.z - groundZ) / 1.25
+--   SHA_max = (dropHeight - MIN_FREEFALL_CLEARANCE) / 1.25
+--
+-- MIN_FREEFALL_CLEARANCE is the guaranteed gap between dropPos.z and
+-- the worst-case IgnitionAlt, ensuring the missile has meaningful
+-- freefall time before the engine can possibly fire.
+local CFG_W1_JASSM_MIN_FREEFALL_CLEARANCE = 800   -- units
+local CFG_W1_JASSM_SHA_FLOOR              = 400   -- minimum useful SHA
+-- If dropHeight is so small that even SHA_FLOOR would place IgnitionAlt
+-- at or above dropPos.z, the drop is aborted (no stock deducted).
+local CFG_W1_JASSM_MIN_DROP_HEIGHT = CFG_W1_JASSM_SHA_FLOOR * 1.25 + CFG_W1_JASSM_MIN_FREEFALL_CLEARANCE
 
 -- ---------- W2 -- Heavy ordnance ----------
 local CFG_W2_Count   = 2
@@ -677,22 +690,24 @@ function ENT:SpawnOneJASSM(dropIndex)
     local callDir = Angle(0, self.flightYaw, 0):Forward()
     local groundZ = self:FindGround(dropPos)
     if groundZ == -1 then groundZ = self.CenterPos.z end
-    local rawDropHeight = math.max(dropPos.z - groundZ, 800)
+    local dropHeight = math.max(dropPos.z - groundZ, 0)
 
-    -- Fix: clamp SkyHeightAdd so IgnitionAlt (ground + SHA * IGNITION_ALT_FRAC)
-    -- is always at least CFG_W1_JASSM_MIN_FREEFALL_CLEARANCE units below the
-    -- drop position.  Without this, a low-orbiting C-17 can produce an
-    -- IgnitionAlt >= dropPos.z and the engine fires on the very first
-    -- UpdateFreefall tick.
+    -- The real entity computes:
+    --   IgnitionAlt = groundZ + SHA + rand(-SHA*0.25, +SHA*0.25)
+    -- Worst-case (highest possible ignition): groundZ + SHA * 1.25
     --
-    -- IgnitionAlt = groundZ + SHA * IGNITION_ALT_FRAC
-    -- We need: dropPos.z - IgnitionAlt >= MIN_FREEFALL_CLEARANCE
-    --   => SHA * IGNITION_ALT_FRAC <= dropPos.z - groundZ - MIN_FREEFALL_CLEARANCE
-    --   => SHA <= (dropPos.z - groundZ - MIN_FREEFALL_CLEARANCE) / IGNITION_ALT_FRAC
-    -- IGNITION_ALT_FRAC is 0.35 (defined in ent_bombin_gbu53_owned/init.lua)
-    local IGNITION_ALT_FRAC = 0.35
-    local maxSHA = (rawDropHeight - CFG_W1_JASSM_MIN_FREEFALL_CLEARANCE) / IGNITION_ALT_FRAC
-    local dropHeightAboveGround = math.min(rawDropHeight, math.max(maxSHA, 0))
+    -- We need dropPos.z > IgnitionAlt_max, with a safety clearance:
+    --   SHA_max = (dropHeight - CFG_W1_JASSM_MIN_FREEFALL_CLEARANCE) / 1.25
+    --
+    -- If the drop altitude is too low to provide even a minimum useful
+    -- freefall distance, abort the drop entirely (do not deduct stock).
+    if dropHeight < CFG_W1_JASSM_MIN_DROP_HEIGHT then
+        self:Debug("W1 JASSM: drop altitude too low (" .. math.Round(dropHeight) .. "u), aborting drop")
+        return
+    end
+
+    local shaMax = (dropHeight - CFG_W1_JASSM_MIN_FREEFALL_CLEARANCE) / 1.25
+    local sha    = math.Clamp(dropHeight, CFG_W1_JASSM_SHA_FLOOR, shaMax)
 
     missile:SetPos(dropPos)
     missile:SetAngles(callDir:Angle())
@@ -702,7 +717,7 @@ function ENT:SpawnOneJASSM(dropIndex)
     missile.Lifetime     = math.min(self.Lifetime, 35)
     missile.Speed        = 250
     missile.OrbitRadius  = self.OrbitRadius * 0.75
-    missile.SkyHeightAdd = dropHeightAboveGround
+    missile.SkyHeightAdd = sha
     missile:SetOwner(self)
     missile.IsOnPlane = true
     missile.Launcher  = self
@@ -732,10 +747,11 @@ function ENT:SpawnOneJASSM(dropIndex)
         self:Debug("W1 JASSM: ent_bombin_jassm_chute_owned not found - chute missing")
     end
 
+    -- Deduct stock only after a successful spawn (not on aborted drops).
     if self.JASSM_Stock > 0 then
         self.JASSM_Stock = self.JASSM_Stock - 1
     end
-    self:Debug("W1 JASSM drop #" .. (dropIndex+1) .. " pos=" .. tostring(dropPos) .. " dropHeight=" .. math.Round(dropHeightAboveGround))
+    self:Debug("W1 JASSM drop #" .. (dropIndex+1) .. " pos=" .. tostring(dropPos) .. " SHA=" .. math.Round(sha) .. " dropHeight=" .. math.Round(dropHeight))
 end
 
 function ENT:UpdateJASSM(ct)
