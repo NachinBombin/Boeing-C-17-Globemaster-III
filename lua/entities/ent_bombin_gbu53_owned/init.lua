@@ -152,8 +152,15 @@ function ENT:Initialize()
 	self:SetSolid(SOLID_NONE)
 	self:SetCollisionGroup(COLLISION_GROUP_NONE)
 	self:SetPos(spawnPos)
-	self:SetRenderMode(RENDERMODE_NORMAL)
 	self:SetBodygroup(1, 0)
+
+	-- Hide the missile model during freefall while the chute combo is visible.
+	-- IsSalvoChild missiles ignite immediately (no chute), so they stay visible.
+	if not self.IsSalvoChild then
+		self:SetRenderMode(RENDERMODE_NONE)
+	else
+		self:SetRenderMode(RENDERMODE_NORMAL)
+	end
 
 	self:SetNWInt("HP",    self.MaxHP)
 	self:SetNWInt("MaxHP", self.MaxHP)
@@ -268,16 +275,6 @@ end
 
 -- ============================================================
 -- SALVO SPAWN
--- FIX (Bug 3): SetVar() calls MUST happen after Spawn()+Activate().
--- Spawn() calls Initialize() which calls self:GetVar() to read the
--- orbit parameters. If SetVar() runs before Spawn() then __vars is
--- wiped by Initialize()'s first-run self.__vars initialization and
--- all values fall back to defaults. Moving SetVar() post-Activate()
--- and immediately calling IgniteEngine() last ensures Initialize()
--- has already run and the vars are read from the direct field
--- assignments via self.X (same pattern as SpawnOneGBU53Pallet).
--- Additionally: copy critical params as direct fields first so
--- Initialize() can read them from self.X before GetVar() runs.
 -- ============================================================
 
 function ENT:SpawnSalvo()
@@ -290,7 +287,6 @@ function ENT:SpawnSalvo()
 			local child = ents.Create("ent_bombin_gbu53_owned")
 			if not IsValid(child) then return end
 
-			-- Set direct fields BEFORE Spawn so Initialize() reads them correctly.
 			child.SpawnedFromPlane = true
 			child.CenterPos    = self.BaseCenterPos
 			child.CallDir      = self.CallDir
@@ -310,7 +306,6 @@ function ENT:SpawnSalvo()
 			child:Spawn()
 			child:Activate()
 
-			-- SetVar() after Activate() for any values Initialize() reads via GetVar().
 			child:SetVar("DIVE_ExplosionDamage", self.DIVE_ExplosionDamage)
 			child:SetVar("DIVE_ExplosionRadius", self.DIVE_ExplosionRadius)
 
@@ -367,6 +362,9 @@ function ENT:IgniteEngine()
 	self.Phase = "orbit"
 
 	self:Debug("Engine ignited [salvo " .. self.SalvoIndex .. "] at Z=" .. math.Round(self:GetPos().z))
+
+	-- Missile is now flying under its own power — make it visible.
+	self:SetRenderMode(RENDERMODE_NORMAL)
 
 	self:SetNWBool("EngineOn", true)
 	self:SetBodygroup(1, 1)
