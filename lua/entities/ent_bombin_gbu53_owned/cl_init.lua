@@ -2,12 +2,14 @@ include("shared.lua")
 include("cl_trailsystem.lua")
 
 -- ============================================================
--- CLIENT  —  ent_bombin_gbu53_owned
+-- CLIENT  -  ent_bombin_gbu53_owned
 -- ============================================================
 
 local ENGINE_LOOP_SOUND = "ambient/wind/wind_atlas_loop1.wav"
+-- How often the client Think polls for engine-sound state.
+local THINK_INTERVAL    = 0.1
 
--- Vanilla GMod particle systems — guaranteed to exist without addons.
+-- Vanilla GMod particle systems -- guaranteed to exist without addons.
 local TIER_PARTICLES = {
 	[1] = { name = "fire_small_01b",  offset = Vector(0, -30,  5) },
 	[2] = { name = "fire_medium_base", offset = Vector(0, -30, 10) },
@@ -62,6 +64,12 @@ function ENT:Think()
 	if self.GBU53O_EngineSound and not self.GBU53O_EngineSound:IsPlaying() and self.GBU53O_EnginePlaying then
 		self.GBU53O_EngineSound:Play()
 	end
+
+	-- FIX (BUG-6): without NextThink + return true, scripted entity Think()
+	-- is called only once and never polled again.  The engine-sound repair
+	-- path (re-play a dropped loop) would never fire after the first tick.
+	self:NextThink( CurTime() + THINK_INTERVAL )
+	return true
 end
 
 function ENT:OnRemove()

@@ -1,5 +1,5 @@
 -- ============================================================
--- ent_bombin_gbu53_owned  —  SERVER
+-- ent_bombin_gbu53_owned  --  SERVER
 -- GBU-53/B StormBreaker owned variant.
 -- ============================================================
 
@@ -129,8 +129,16 @@ function ENT:Initialize()
 	self.CallDir.z = 0
 	self.CallDir:Normalize()
 
+	-- FIX (BUG-10): FindGround returns -1 when no brush geometry is hit
+	-- within 32000 HU (open skybox maps, flying maps, etc.).
+	-- Using -1 as a real Z produced IgnitionAlt ~32000 HU below the world
+	-- floor.  Fall back to a plausible ground level so the missile still
+	-- has a sane altitude budget on maps without a solid floor.
 	local ground = self:FindGround( self.CenterPos )
-	if ground == -1 then self:Debug( "FindGround failed" ) self:Remove() return end
+	if ground == -1 then
+		self:Debug( "FindGround failed -- using spawn-pos fallback" )
+		ground = self.CenterPos.z - (self.SkyHeightAdd * 0.5)
+	end
 	self.GroundZ = ground
 
 	local altVar = self.SkyHeightAdd * 0.25
@@ -421,7 +429,7 @@ function ENT:IgniteEngine()
 	self:SetSolid( SOLID_VPHYSICS )
 
 	-- Fix: COLLISION_GROUP_DEBRIS_TRIGGER collides with world/static props
-	-- but ignores players and other missiles — correct for loitering altitude.
+	-- but ignores players and other missiles -- correct for loitering altitude.
 	-- Upgraded to COLLISION_GROUP_NONE on StartDive().
 	self:SetCollisionGroup( COLLISION_GROUP_DEBRIS_TRIGGER )
 
@@ -578,37 +586,15 @@ end
 -- ============================================================
 -- WEAPON LOGIC
 -- ============================================================
--- A "weapon window" is the period between when UpdateWeaponLogic picks
--- a peaceful-lapse roll and when the next roll fires (or the missile
--- transitions to a dive).  The cargo doors are OPEN for the entire
--- window — including during the dive itself — and close only once
--- the missile is no longer in an active window (peaceful lapse expired
--- without a follow-up window or dive).
---
--- Timeline per cycle:
---   1. WeaponWindowEnd expires  →  roll dice
---   2a. Roll == 3  →  StartDive()  →  doors OPEN (stay open through dive)
---   2b. Roll != 3  →  set new WeaponWindowEnd (peaceful lapse) → doors CLOSE
---       When WeaponWindowEnd expires again → back to step 1
--- ============================================================
 function ENT:UpdateWeaponLogic( ct )
-	if ct < self.WeaponWindowEnd then
-		-- Still inside the current peaceful lapse window — doors are already
-		-- open (set when the window was created); nothing to do.
-		return
-	end
+	if ct < self.WeaponWindowEnd then return end
 
-	-- Window has expired.  Roll the dice.
 	local roll = math.random( 1, 3 )
 	if roll == 3 then
-		-- ── DIVE: open doors and begin attack. ──────────────────
-		-- Fix (BUG 3): set WeaponWindowEnd so that if Diving is ever
-		-- reset externally the logic won't immediately re-enter StartDive.
-		self.WeaponWindowEnd = ct + 30   -- generous hold; dive removes entity anyway
+		self.WeaponWindowEnd = ct + 30
 		C17_SetCargoDoor( self, true )
 		self:StartDive( ct )
 	else
-		-- ── PEACEFUL LAPSE: doors open while we wait for next roll. ──
 		self.WeaponWindowEnd = ct + math.Rand( 4, 9 )
 		C17_SetCargoDoor( self, true )
 	end
@@ -623,7 +609,6 @@ function ENT:StartDive( ct )
 	self.DiveSpeedCurrent = self.DiveSpeedMin
 	self.DiveWobblePhase  = 0
 
-	-- Full collision on dive so the missile can't pass through the ground.
 	self:SetCollisionGroup( COLLISION_GROUP_NONE )
 
 	local closest, closestDist = nil, math.huge
@@ -688,7 +673,6 @@ function ENT:DiveExplode( pos )
 	if self.DiveExploded then return end
 	self.DiveExploded = true
 
-	-- Fix: SafeAttacker() ensures util.BlastDamage never receives NULL.
 	util.BlastDamage( self, SafeAttacker(self), pos, self.DIVE_ExplosionRadius, self.DIVE_ExplosionDamage )
 
 	local ed = EffectData()
@@ -698,7 +682,6 @@ function ENT:DiveExplode( pos )
 
 	sound.Play( "ambient/explosions/explode_" .. math.random(1,5) .. ".wav", pos, 145, math.random(85,100), 1.0 )
 
-	-- Close doors: this missile is gone, no further window events from it.
 	C17_SetCargoDoor( self, false )
 
 	if IsValid( self.ChuteEnt ) then self.ChuteEnt:Remove() end
@@ -718,7 +701,6 @@ function ENT:CrashExplode( pos )
 
 	sound.Play( "ambient/explosions/explode_" .. math.random(1,5) .. ".wav", pos, 120, math.random(90,110), 0.7 )
 
-	-- Close doors on crash too.
 	C17_SetCargoDoor( self, false )
 
 	if IsValid( self.ChuteEnt ) then self.ChuteEnt:Remove() end
@@ -763,14 +745,12 @@ function ENT:Destroy()
 		self.PhysObj:EnableGravity( true )
 	end
 
-	-- Close doors: missile is destroyed and will no longer fight.
 	C17_SetCargoDoor( self, false )
 
 	if IsValid( self.ChuteEnt ) then self.ChuteEnt:Remove() end
 end
 
 function ENT:OnRemove()
-	-- Catch any removal path not covered by Destroy/DiveExplode/CrashExplode.
 	C17_SetCargoDoor( self, false )
 end
 
