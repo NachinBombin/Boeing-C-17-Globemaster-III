@@ -42,9 +42,14 @@ local CFG_FadeDuration = 3.0
 local CFG_PeacefulMin  = 6
 local CFG_PeacefulMax  = 14
 
--- Drop point in C-17 local space.
--- At MODEL_SCALE=1.8 the belly of the fuselage is ~120u below the
--- entity origin.  -130 clears the hull and exits below the ramp.
+-- Time (seconds) the server waits after opening the cargo door before
+-- the weapon window is allowed to begin firing.  Calculated from the
+-- bone animation durations at DOOR_SPEED = 28 deg/s:
+--   ramp_2  28° / 28 = 1.00 s
+--   ramp_1  28° / 28 = 1.00 s
+--   ramp_1b 100°/ 28 = 3.57 s   → total ≈ 5.57 s  → pad to 6.0 s
+local CFG_DoorOpenDuration = 6.0
+
 local CFG_BombBayLocal = Vector(0, 0, -130)
 
 -- Orbit / target-tracking tuning.
@@ -63,20 +68,11 @@ local CFG_W1_JASSM_Delay      = 0
 local CFG_W1_JASSM_TailOffset = Vector(-360, 0, -70)
 local CFG_W1_JASSM_AltOffset  = 500
 
--- ent_bombin_jassm_owned computes:
---   IgnitionAlt = groundZ + SHA + rand(-SHA*0.25, +SHA*0.25)
--- Worst-case (highest possible ignition): groundZ + SHA * 1.25
---
--- We need: dropPos.z > IgnitionAlt_max
---   dropPos.z > groundZ + SHA * 1.25
---   SHA < (dropPos.z - groundZ) / 1.25
---   SHA_max = (dropHeight - MIN_FREEFALL_CLEARANCE) / 1.25
 local CFG_W1_JASSM_MIN_FREEFALL_CLEARANCE = 800
 local CFG_W1_JASSM_SHA_FLOOR              = 400
 local CFG_W1_JASSM_MIN_DROP_HEIGHT = CFG_W1_JASSM_SHA_FLOOR * 1.25 + CFG_W1_JASSM_MIN_FREEFALL_CLEARANCE
 
 -- ---------- W2 -- Heavy ordnance ----------
--- Entries are structs {class, retarded} to avoid fragile _air_v3 substring heuristic.
 local CFG_W2_Count   = 2
 local CFG_W2_Delay   = 4.0
 local CFG_W2_Scatter = 0
@@ -92,9 +88,6 @@ local CFG_W2_Pool    = {
 }
 
 -- ---------- W3 -- GBU-53 parachute cluster ----------
--- AltStagger staggers each successive pallet further below the drop
--- point so they separate cleanly during free-fall before chute deploy.
--- This is intentional, not a geometry error.
 local CFG_W3_GBU53_Count       = 3
 local CFG_W3_GBU53_Delay       = 1.2
 local CFG_W3_AltStagger        = 400
@@ -118,16 +111,10 @@ local WEAPON_ROSTER = { "jassm", "heavy", "gbu53", "retarded" }
 -- ============================================================
 -- WOOD PALLET PROP
 -- ============================================================
-local PALLET_MODEL    = "models/props/de_prodigy/wood_pallet_01.mdl"
-local PALLET_LIFETIME = 20
--- NoCollide hold time between a pallet and the bomb that just dropped.
--- Keeps the pallet from blowing up the bomb after it goes physics.
+local PALLET_MODEL        = "models/props/de_prodigy/wood_pallet_01.mdl"
+local PALLET_LIFETIME     = 20
 local PALLET_NOCLIDE_HOLD = 2.0
 
--- Spawns a wood pallet as physics debris.
--- bombRef: the bomb entity to NoCollide against (may be nil for pure decoration).
--- Spawned via timer.Simple(0) so it lands in the NEXT physics tick,
--- preventing interpenetration with the bomb that was spawned this tick.
 local function SpawnWoodPallet(pos, vel, bombRef)
     timer.Simple(0, function()
         local p = ents.Create("prop_physics")
@@ -142,8 +129,6 @@ local function SpawnWoodPallet(pos, vel, bombRef)
         if IsValid(ph) then
             ph:SetVelocity(vel or Vector(0,0,0))
         end
-        -- NoCollide between pallet and the bomb so the pallet scatter
-        -- impulse never reaches an armed munition.
         if IsValid(bombRef) then
             local ncHandle = constraint.NoCollide(p, bombRef, 0, 0)
             timer.Simple(PALLET_NOCLIDE_HOLD, function()
@@ -255,11 +240,16 @@ function ENT:Initialize()
     self.JitterPhase      = math.Rand(0, math.pi * 2)
     self.JitterAmplitude  = 8
 
-    self.WPN_Active     = nil
-    self.WPN_ShotsFired = 0
-    self.WPN_NextShot   = 0
-    self.WPN_WindowEnd  = 0
-    self.WPN_PeaceUntil = CurTime() + math.Rand(CFG_PeacefulMin, CFG_PeacefulMax)
+    self.WPN_Active         = nil
+    self.WPN_ShotsFired     = 0
+    self.WPN_NextShot       = 0
+    self.WPN_WindowEnd      = 0
+    self.WPN_PeaceUntil     = CurTime() + math.Rand(CFG_PeacefulMin, CFG_PeacefulMax)
+    -- Door-open delay state.
+    -- true  = door open signal sent, waiting for animation to finish before firing.
+    -- false = door is ready / not in pre-fire wait.
+    self.WPN_WaitingForDoor = false
+    self.WPN_DoorReadyAt    = 0
 
     self.HP           = self.MaxHP
     self.DamageTier   = 0
@@ -447,6 +437,9 @@ function ENT:UpdateFade(dt)
     end
 end
 
+-- ============================================================
+-- WEAPON SELECTION
+-- ============================================================
 function ENT:PickNewWeapon()
     local available = {}
     for _, w in ipairs(WEAPON_ROSTER) do
@@ -458,11 +451,21 @@ function ENT:PickNewWeapon()
     local w = available[math.random(#available)]
     self.WPN_Active     = w
     self.WPN_ShotsFired = 0
-    self.WPN_NextShot   = CurTime()
-    self.WPN_WindowEnd  = CurTime() + 12
-    self:Debug("Weapon window: " .. w)
+    self.WPN_NextShot   = 0        -- will be set once door is ready
+    self.WPN_WindowEnd  = 0        -- will be extended once door is ready
+
+    -- Open the cargo door immediately and start the pre-fire delay.
+    -- Firing will not begin until WPN_DoorReadyAt is reached.
+    self:SetNWBool("CargoDoorOpen", true)
+    self.WPN_WaitingForDoor = true
+    self.WPN_DoorReadyAt    = CurTime() + CFG_DoorOpenDuration
+
+    self:Debug("Weapon window queued (door opening): " .. w)
 end
 
+-- ============================================================
+-- WEAPON UPDATE
+-- ============================================================
 function ENT:UpdateWeapons(ct)
     if ct < self.WPN_PeaceUntil then return end
 
@@ -470,6 +473,16 @@ function ENT:UpdateWeapons(ct)
         if not IsValid(self:RefreshTarget(ct)) then return end
         self:PickNewWeapon()
         return
+    end
+
+    -- Door is still opening — wait before firing.
+    if self.WPN_WaitingForDoor then
+        if ct < self.WPN_DoorReadyAt then return end
+        -- Door animation has finished.  Arm the firing clock.
+        self.WPN_WaitingForDoor = false
+        self.WPN_NextShot       = ct
+        self.WPN_WindowEnd      = ct + 12
+        self:Debug("Door open — weapon window active: " .. self.WPN_Active)
     end
 
     if ct > self.WPN_WindowEnd then
@@ -662,16 +675,11 @@ function ENT:SpawnDartBomb(entClass, dropPos, targetPos, isRetarded)
     bomb:Activate()
     if isRetarded then bomb:SetBodygroup(1, 1) end
 
-    -- NoCollide bomb <-> plane before touching physics or arming.
     local handle = constraint.NoCollide(bomb, self, 0, 0)
     timer.Simple(0.6, function()
         if IsValid(handle) then handle:Remove() end
     end)
 
-    -- Bug C fix: set velocity BEFORE arming.
-    -- Between Spawn/Activate and Arm() the bomb must not be stationary
-    -- and overlapping with anything, otherwise contact resolution
-    -- during that tick detonates it immediately.
     local bPhys = bomb:GetPhysicsObject()
     if IsValid(bPhys) then
         bPhys:SetVelocity(CalcDartVelocity(dropPos, targetPos))
@@ -702,7 +710,6 @@ function ENT:SpawnCarpetBomb(entClass, dropPos, aimPos)
         if IsValid(handle) then handle:Remove() end
     end)
 
-    -- Bug C fix: velocity before arm (same reason as SpawnDartBomb).
     local bPhys = bomb:GetPhysicsObject()
     if IsValid(bPhys) then
         local aircraftFwd = Angle(0, self.flightYaw, 0):Forward() * self.Speed
@@ -784,7 +791,6 @@ function ENT:SpawnOneJASSM(dropIndex)
         self:Debug("W1 JASSM: ent_bombin_jassm_chute_owned not found - chute missing")
     end
 
-    -- JASSM has no live bomb at dropPos; pallet is purely cosmetic here.
     SpawnWoodPallet(dropPos + Vector(0,0,-20), Vector(math.Rand(-60,60), math.Rand(-60,60), -80), nil)
 
     if self.JASSM_Stock > 0 then
@@ -796,7 +802,6 @@ end
 function ENT:UpdateJASSM(ct)
     if self.WPN_ShotsFired >= CFG_W1_JASSM_Count then return true end
     if ct < self.WPN_NextShot then return false end
-    if self.WPN_ShotsFired == 0 then self:SetNWBool("CargoDoorOpen", true) end
     self.WPN_NextShot   = ct + CFG_W1_JASSM_Delay
     self.WPN_ShotsFired = self.WPN_ShotsFired + 1
     self:SpawnOneJASSM(self.WPN_ShotsFired - 1)
@@ -809,7 +814,6 @@ end
 function ENT:UpdateHeavy(ct)
     if self.WPN_ShotsFired >= CFG_W2_Count then return true end
     if ct < self.WPN_NextShot then return false end
-    if self.WPN_ShotsFired == 0 then self:SetNWBool("CargoDoorOpen", true) end
     self.WPN_NextShot   = ct + CFG_W2_Delay
     self.WPN_ShotsFired = self.WPN_ShotsFired + 1
 
@@ -817,7 +821,6 @@ function ENT:UpdateHeavy(ct)
     local dropPos   = self:LocalToWorld(CFG_BombBayLocal)
     local targetPos = self:GetAimPos(CFG_W2_Scatter)
     local bomb      = self:SpawnDartBomb(entry.class, dropPos, targetPos, entry.retarded)
-    -- Pass bomb ref so the pallet gets a NoCollide against it.
     SpawnWoodPallet(dropPos + Vector(0,0,-10), Vector(math.Rand(-80,80), math.Rand(-80,80), -60), bomb)
     return (self.WPN_ShotsFired >= CFG_W2_Count)
 end
@@ -871,7 +874,6 @@ function ENT:SpawnOneGBU53Pallet(palletIndex)
         if IsValid(pHandle) then pHandle:Remove() end
     end)
 
-    -- GBU53 pallet is not an armed bomb; pallet is purely cosmetic.
     SpawnWoodPallet(dropPos + Vector(0,0,-15), Vector(math.Rand(-50,50), math.Rand(-50,50), -70), nil)
     self:Debug("W3 GBU53 pallet #" .. (palletIndex+1) .. " dropped at " .. tostring(dropPos))
 end
@@ -879,7 +881,6 @@ end
 function ENT:UpdateGBU53(ct)
     if self.WPN_ShotsFired >= CFG_W3_GBU53_Count then return true end
     if ct < self.WPN_NextShot then return false end
-    if self.WPN_ShotsFired == 0 then self:SetNWBool("CargoDoorOpen", true) end
     self.WPN_NextShot   = ct + CFG_W3_GBU53_Delay
     self.WPN_ShotsFired = self.WPN_ShotsFired + 1
     self:SpawnOneGBU53Pallet(self.WPN_ShotsFired - 1)
@@ -892,7 +893,6 @@ end
 function ENT:UpdateRetarded(ct)
     if self.WPN_ShotsFired >= CFG_W6_Count then return true end
     if ct < self.WPN_NextShot then return false end
-    if self.WPN_ShotsFired == 0 then self:SetNWBool("CargoDoorOpen", true) end
     self.WPN_NextShot   = ct + CFG_W6_Delay
     self.WPN_ShotsFired = self.WPN_ShotsFired + 1
 
@@ -900,7 +900,6 @@ function ENT:UpdateRetarded(ct)
     local dropPos   = self:LocalToWorld(CFG_BombBayLocal)
     local aimPos    = self:GetAimPos(CFG_W6_Scatter)
     local bomb      = self:SpawnDartBomb(entClass, dropPos, aimPos, true)
-    -- Only drop a pallet on the first shot of each W6 salvo.
     if self.WPN_ShotsFired == 1 then
         SpawnWoodPallet(dropPos + Vector(0,0,-10), Vector(math.Rand(-50,50), math.Rand(-50,50), -60), bomb)
     end
