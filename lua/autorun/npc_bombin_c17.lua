@@ -135,10 +135,19 @@ if SERVER then
     end
 
     -- Manual spawn net receiver
+    -- FIX (BUG-1): Gate on IsAdmin() — any unauthenticated client could
+    -- previously spam-spawn C-17s by sending this net message directly.
     util.AddNetworkString("BombinC17_ManualSpawn")
 
     net.Receive("BombinC17_ManualSpawn", function(len, ply)
         if not IsValid(ply) then return end
+
+        -- Security gate: only admins may manually spawn a C-17.
+        if not ply:IsAdmin() then
+            ply:PrintMessage(HUD_PRINTCENTER, "[Bombin C-17] Admins only!")
+            return
+        end
+
         local tr = util.TraceLine({
             start  = ply:EyePos(),
             endpos = ply:EyePos() + ply:EyeAngles():Forward() * 3000,
