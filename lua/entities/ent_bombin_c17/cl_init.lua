@@ -39,25 +39,27 @@ local DOOR_BONES = {
 -- ============================================================
 -- CARGO LIGHT CONSTANTS
 -- ============================================================
--- A bright red DynamicLight sits at the ramp opening.
--- It pulses slowly using a sine wave to simulate the interior
--- warning lamp seen through the open cargo bay.
-local CARGO_LIGHT_LOCAL    = Vector( -200, 0, -80 )   -- local offset: rear belly of the plane
-local CARGO_LIGHT_RADIUS   = 800                       -- source radius in units
-local CARGO_LIGHT_DECAY    = 1200                      -- falloff rate
-local CARGO_LIGHT_MIN_BRIG = 0.35                      -- brightness floor (0-1)
-local CARGO_LIGHT_MAX_BRIG = 1.0                       -- brightness ceiling (0-1)
-local CARGO_LIGHT_PULSE_HZ = 0.6                       -- pulse cycles per second
+-- A bright pulsing red DynamicLight at the ramp mouth.
+-- Simulates the interior red warning lamp visible through the open bay.
+local CARGO_LIGHT_LOCAL    = Vector( -200, 0, -80 )   -- local offset: rear belly
+local CARGO_LIGHT_RADIUS   = 1400                      -- raised for wider coverage
+local CARGO_LIGHT_DECAY    = 1200
+local CARGO_LIGHT_MIN_BRIG = 0.35
+local CARGO_LIGHT_MAX_BRIG = 1.0
+local CARGO_LIGHT_PULSE_HZ = 0.6                       -- cycles per second
 
 -- ============================================================
 -- CONDENSATION VAPOR CONSTANTS
 -- ============================================================
--- When the cargo door starts opening, a cold-air condensation
--- cloud erupts from the ramp area for VAPOR_DURATION seconds.
--- We emit one smoke particle burst per Draw() frame during that window.
-local VAPOR_DURATION    = 1.5     -- seconds the vapor lasts after door-open trigger
-local VAPOR_LOCAL       = Vector( -200, 0, -90 )   -- local offset: ramp mouth
-local VAPOR_EMIT_RATE   = 0.055   -- min seconds between individual puffs
+-- Cold-air condensation cloud for 1.5 s after the door starts opening.
+-- Uses util.Effect("SmokeTrail") which is a guaranteed client-side effect.
+-- Multiple puffs are fired per interval to make the cloud dense enough
+-- to be visible at flight altitude.
+local VAPOR_DURATION    = 1.5      -- seconds active after door-open trigger
+local VAPOR_LOCAL       = Vector( -200, 0, -90 )   -- local: ramp mouth
+local VAPOR_EMIT_RATE   = 0.03     -- seconds between bursts (faster = denser cloud)
+local VAPOR_PUFFS       = 4        -- parallel puffs emitted per interval
+local VAPOR_SPREAD      = 30       -- unit radius for puff origin scatter
 
 function ENT:Initialize()
 	self:SetBodygroup( 1, 1 )
@@ -69,11 +71,11 @@ function ENT:Initialize()
 	self._DoorWasOpen = false
 
 	-- Cargo light
-	self._CargoLightIdx = nil   -- allocated lazily
+	self._CargoLightIdx = nil
 
 	-- Condensation vapor
-	self._VaporUntil    = 0     -- CurTime() deadline; 0 = inactive
-	self._VaporNextPuff = 0     -- throttle: CurTime() of next allowed puff
+	self._VaporUntil    = 0
+	self._VaporNextPuff = 0
 end
 
 -- ============================================================
@@ -89,12 +91,10 @@ function ENT:UpdateCargoDoors( dt )
 		if self._DoorStage == 0 then
 			self._DoorStage = 1
 		elseif self._DoorStage < 0 then
-			-- Mid-close: resume the correct bone instead of restarting.
 			self._DoorStage = math.abs( self._DoorStage )
 		end
-		-- If _DoorStage > 0 we were already opening — leave it.
 
-		-- Trigger condensation vapor burst on every door-open event.
+		-- Trigger condensation vapor burst.
 		self._VaporUntil    = CurTime() + VAPOR_DURATION
 		self._VaporNextPuff = 0
 	end
@@ -113,16 +113,13 @@ function ENT:UpdateCargoDoors( dt )
 			end
 			self._DoorStage = startClose
 		end
-		-- If _DoorStage < 0 we were already closing — leave it.
 	end
 
-	-- Nothing to animate when fully closed or fully open.
 	if self._DoorStage == 0 or self._DoorStage == 4 then return end
 
 	local step = DOOR_SPEED * dt
 
 	if self._DoorStage > 0 then
-		-- ── OPENING ──────────────────────────────────────────
 		local i      = self._DoorStage
 		local target = DOOR_TARGETS_OPEN[i]
 		local cur    = self._DoorAngles[i]
@@ -135,7 +132,6 @@ function ENT:UpdateCargoDoors( dt )
 			self._DoorAngles[i] = cur + math.min( step, diff )
 		end
 	else
-		-- ── CLOSING ──────────────────────────────────────────
 		local i   = math.abs( self._DoorStage )
 		local cur = self._DoorAngles[i]
 
@@ -151,40 +147,34 @@ end
 -- ============================================================
 -- RED CARGO BAY LIGHT
 -- ============================================================
--- Emits a bright pulsing red DynamicLight at the ramp mouth.
--- Only active while CargoDoorOpen is true.
--- DynamicLight() must be called every frame to keep the light alive;
--- it self-expires after one frame if not refreshed.
 function ENT:UpdateCargoLight()
 	if not self:GetNWBool( "CargoDoorOpen", false ) then return end
 
 	local dl = DynamicLight( self:EntIndex() + 4096 )
 	if not dl then return end
 
-	-- Pulse brightness: smooth sine oscillation between MIN and MAX.
-	local t       = CurTime() * CARGO_LIGHT_PULSE_HZ * math.pi * 2
-	local frac    = ( math.sin( t ) + 1 ) * 0.5   -- 0..1
-	local bright  = CARGO_LIGHT_MIN_BRIG + frac * ( CARGO_LIGHT_MAX_BRIG - CARGO_LIGHT_MIN_BRIG )
+	local t      = CurTime() * CARGO_LIGHT_PULSE_HZ * math.pi * 2
+	local frac   = ( math.sin( t ) + 1 ) * 0.5
+	local bright = CARGO_LIGHT_MIN_BRIG + frac * ( CARGO_LIGHT_MAX_BRIG - CARGO_LIGHT_MIN_BRIG )
 
 	local worldPos = self:LocalToWorld( CARGO_LIGHT_LOCAL )
 
-	dl.pos     = worldPos
-	dl.r       = 255
-	dl.g       = 20
-	dl.b       = 10
-	dl.brightness = bright * 6    -- DynamicLight brightness is > 1 for intensity
-	dl.decay   = CARGO_LIGHT_DECAY
-	dl.size    = CARGO_LIGHT_RADIUS
-	dl.dietime = CurTime() + 0.1  -- refresh next frame; expires if not called
+	dl.pos        = worldPos
+	dl.r          = 255
+	dl.g          = 20
+	dl.b          = 10
+	dl.brightness = bright * 10   -- increased from 6 → 10 for more punch
+	dl.decay      = CARGO_LIGHT_DECAY
+	dl.size       = CARGO_LIGHT_RADIUS
+	dl.dietime    = CurTime() + 0.1
 end
 
 -- ============================================================
 -- CONDENSATION VAPOR
 -- ============================================================
--- Emits a smoke/steam particle effect from the ramp mouth for
--- VAPOR_DURATION seconds after the door-open event fires.
--- We use the built-in "steam" or "smokestack" particle because
--- they are guaranteed present in any GMod install.
+-- util.Effect("SmokeTrail") is a reliable client-side GMod effect.
+-- We scatter VAPOR_PUFFS origins around the ramp mouth per interval
+-- so the cloud is thick and visible at altitude.
 function ENT:UpdateVapor()
 	local ct = CurTime()
 	if ct >= self._VaporUntil then return end
@@ -192,51 +182,43 @@ function ENT:UpdateVapor()
 
 	self._VaporNextPuff = ct + VAPOR_EMIT_RATE
 
-	local worldPos = self:LocalToWorld( VAPOR_LOCAL )
+	local basePos  = self:LocalToWorld( VAPOR_LOCAL )
+	-- Normal points rearward in world space so the cloud trails behind the plane.
+	local rearNorm = self:LocalToWorldAngles( Angle( 10, 180, 0 ) ):Forward()
 
-	-- EffectData: origin at ramp, normal pointing backward+down so
-	-- the puff drifts away from the tail and hangs in the slipstream.
-	local ed = EffectData()
-	ed:SetOrigin( worldPos )
-	ed:SetNormal( ( self:LocalToWorldAngles( Angle(20, 180, 0) ) ):Forward() )
-	ed:SetScale( 1.4 )
-	ed:SetMagnitude( 1.0 )
-	ed:SetRadius( 28 )
-	util.Effect( "steam", ed )
+	for _ = 1, VAPOR_PUFFS do
+		local scatter = Vector(
+			math.Rand( -VAPOR_SPREAD, VAPOR_SPREAD ),
+			math.Rand( -VAPOR_SPREAD, VAPOR_SPREAD ),
+			math.Rand( -VAPOR_SPREAD * 0.5, VAPOR_SPREAD * 0.5 )
+		)
+		local ed = EffectData()
+		ed:SetOrigin( basePos + scatter )
+		ed:SetNormal( rearNorm )
+		ed:SetScale( 2.5 )        -- larger puffs
+		ed:SetMagnitude( 1.2 )
+		ed:SetRadius( 48 )
+		util.Effect( "SmokeTrail", ed )
+	end
 end
 
 function ENT:Draw()
-	-- --------------------------------------------------------
-	-- Roll: server encodes Angle(-SmoothedRoll, yaw+offset, -SmoothedPitch).
-	-- --------------------------------------------------------
 	local roll = self:GetAngles().p
 
-	-- --------------------------------------------------------
-	-- Fan rotation
-	-- --------------------------------------------------------
 	self._FanAngle = ( self._FanAngle or 0 ) + FAN_RPM * FrameTime()
 	if self._FanAngle > 360 then self._FanAngle = self._FanAngle - 360 end
 	local fanZ = self._FanAngle
 
-	-- --------------------------------------------------------
-	-- Flap deflection
-	-- --------------------------------------------------------
 	local rollNorm  = math.Clamp( roll / ROLL_MAX, -1, 1 )
 	local tLeft     = math.Clamp( -rollNorm, 0, 1 )
 	local tRight    = math.Clamp(  rollNorm, 0, 1 )
 	local flapLeft  = Lerp( tLeft,  FLAP_RETRACTED, FLAP_EXTENDED )
 	local flapRight = Lerp( tRight, FLAP_RETRACTED, FLAP_EXTENDED )
 
-	-- --------------------------------------------------------
-	-- Cargo door animation + FX
-	-- --------------------------------------------------------
 	self:UpdateCargoDoors( FrameTime() )
 	self:UpdateCargoLight()
 	self:UpdateVapor()
 
-	-- --------------------------------------------------------
-	-- Draw model and apply bone overrides
-	-- --------------------------------------------------------
 	self:DrawModel()
 
 	-- Fans
