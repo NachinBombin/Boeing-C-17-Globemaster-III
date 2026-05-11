@@ -42,7 +42,10 @@ local CFG_FadeDuration = 3.0
 local CFG_PeacefulMin  = 6
 local CFG_PeacefulMax  = 14
 
-local CFG_BombBayLocal = Vector(0, 0, -35)
+-- Drop point in C-17 local space.
+-- At MODEL_SCALE=1.8 the belly of the fuselage is ~120u below the
+-- entity origin.  -130 clears the hull and exits below the ramp.
+local CFG_BombBayLocal = Vector(0, 0, -130)
 
 -- Orbit / target-tracking tuning.
 local TARGET_ORBIT_RADIUS        = 1800
@@ -117,21 +120,40 @@ local WEAPON_ROSTER = { "jassm", "heavy", "gbu53", "retarded" }
 -- ============================================================
 local PALLET_MODEL    = "models/props/de_prodigy/wood_pallet_01.mdl"
 local PALLET_LIFETIME = 20
+-- NoCollide hold time between a pallet and the bomb that just dropped.
+-- Keeps the pallet from blowing up the bomb after it goes physics.
+local PALLET_NOCLIDE_HOLD = 2.0
 
-local function SpawnWoodPallet(pos, vel)
-    local p = ents.Create("prop_physics")
-    if not IsValid(p) then return end
-    p:SetModel(PALLET_MODEL)
-    p:SetPos(pos)
-    p:SetAngles(Angle(math.Rand(0,360), math.Rand(0,360), math.Rand(0,360)))
-    p:SetCollisionGroup(COLLISION_GROUP_DEBRIS_TRIGGER)
-    p:Spawn()
-    p:Activate()
-    local ph = p:GetPhysicsObject()
-    if IsValid(ph) then
-        ph:SetVelocity(vel or Vector(0,0,0))
-    end
-    timer.Simple(PALLET_LIFETIME, function() if IsValid(p) then p:Remove() end end)
+-- Spawns a wood pallet as physics debris.
+-- bombRef: the bomb entity to NoCollide against (may be nil for pure decoration).
+-- Spawned via timer.Simple(0) so it lands in the NEXT physics tick,
+-- preventing interpenetration with the bomb that was spawned this tick.
+local function SpawnWoodPallet(pos, vel, bombRef)
+    timer.Simple(0, function()
+        local p = ents.Create("prop_physics")
+        if not IsValid(p) then return end
+        p:SetModel(PALLET_MODEL)
+        p:SetPos(pos)
+        p:SetAngles(Angle(math.Rand(0,360), math.Rand(0,360), math.Rand(0,360)))
+        p:SetCollisionGroup(COLLISION_GROUP_DEBRIS_TRIGGER)
+        p:Spawn()
+        p:Activate()
+        local ph = p:GetPhysicsObject()
+        if IsValid(ph) then
+            ph:SetVelocity(vel or Vector(0,0,0))
+        end
+        -- NoCollide between pallet and the bomb so the pallet scatter
+        -- impulse never reaches an armed munition.
+        if IsValid(bombRef) then
+            local ncHandle = constraint.NoCollide(p, bombRef, 0, 0)
+            timer.Simple(PALLET_NOCLIDE_HOLD, function()
+                if IsValid(ncHandle) then ncHandle:Remove() end
+            end)
+        end
+        timer.Simple(PALLET_LIFETIME, function()
+            if IsValid(p) then p:Remove() end
+        end)
+    end)
 end
 
 util.AddNetworkString("bombin_c17_damage_tier")
@@ -151,9 +173,6 @@ end
 -- ============================================================
 -- CARGO DOOR
 -- ============================================================
--- Called by ent_bombin_gbu53_owned directly (server-to-server).
--- open = true  : ramp opens (weapon window active)
--- open = false : ramp closes (window done / missile dove)
 function C17_SetCargoDoor(planeEnt, open)
     if not IsValid(planeEnt) then return end
     planeEnt:SetNWBool("CargoDoorOpen", open)
@@ -220,7 +239,7 @@ function ENT:Initialize()
 
     self:SetNWInt("HP",    self.MaxHP)
     self:SetNWInt("MaxHP", self.MaxHP)
-    self:SetNWBool("CargoDoorOpen", false)  -- cargo door: starts closed
+    self:SetNWBool("CargoDoorOpen", false)
 
     self.flightYaw    = tangent:Angle().y
     self.PrevTurnRate = 0
@@ -282,7 +301,6 @@ function ENT:Initialize()
         self.PhysObj:SetVelocity(initVel)
     end
 
-    -- Bug 4 fix: desired velocity computed in UpdateOrbit, applied in PhysicsUpdate.
     self.DesiredVelocity = Vector(0, 0, 0)
 
     self.OrbitAngle    = math.atan2(spawnOffset.y, spawnOffset.x)
@@ -399,7 +417,6 @@ function ENT:UpdateOrbit(ct, dt)
     local rollLerp    = (math.abs(targetRoll) > math.abs(self.SmoothedRoll)) and ROLL_LERP_IN or ROLL_LERP_OUT
     self.SmoothedRoll = Lerp(rollLerp, self.SmoothedRoll, targetRoll)
 
-    -- Bug 4 fix: compute desired velocity here; PhysicsUpdate applies it.
     local curVel  = phys:GetVelocity()
     local desVelX = math.cos(math.rad(desiredYaw)) * self.Speed
     local desVelY = math.sin(math.rad(desiredYaw)) * self.Speed
@@ -413,7 +430,6 @@ function ENT:UpdateOrbit(ct, dt)
     self:SetAngles(self.ang)
 end
 
--- Bug 4 fix: velocity applied at physics tick rate.
 function ENT:PhysicsUpdate(phys, dt)
     if self.Destroyed then return end
     if not self.DesiredVelocity then return end
@@ -431,7 +447,6 @@ function ENT:UpdateFade(dt)
     end
 end
 
--- Bug 1 fix: build available list excluding "jassm" when stock=0.
 function ENT:PickNewWeapon()
     local available = {}
     for _, w in ipairs(WEAPON_ROSTER) do
@@ -448,7 +463,6 @@ function ENT:PickNewWeapon()
     self:Debug("Weapon window: " .. w)
 end
 
--- Bug 3 fix: no-target guard before PickNewWeapon.
 function ENT:UpdateWeapons(ct)
     if ct < self.WPN_PeaceUntil then return end
 
@@ -460,7 +474,7 @@ function ENT:UpdateWeapons(ct)
 
     if ct > self.WPN_WindowEnd then
         self.WPN_Active = nil
-        self:SetNWBool("CargoDoorOpen", false)  -- cargo door: close on window expiry
+        self:SetNWBool("CargoDoorOpen", false)
         self.WPN_PeaceUntil = ct + math.Rand(CFG_PeacefulMin, CFG_PeacefulMax)
         return
     end
@@ -476,8 +490,6 @@ function ENT:UpdateWeapons(ct)
 
     if done then
         self.WPN_Active = nil
-        -- W3/GBU-53: door close is deferred to C17_SetCargoDoor() from each missile.
-        -- W1/W2/W6: close door immediately when window is exhausted.
         if w ~= "gbu53" then
             self:SetNWBool("CargoDoorOpen", false)
         end
@@ -531,7 +543,7 @@ function ENT:DestroyPlane()
     if self.Destroyed then return end
     self.Destroyed = true
     self:SetNWBool("Destroyed", true)
-    self:SetNWBool("CargoDoorOpen", false)  -- cargo door: force closed on death
+    self:SetNWBool("CargoDoorOpen", false)
     BroadcastTier(self, 3)
 
     if self.EngineSound then
@@ -649,17 +661,25 @@ function ENT:SpawnDartBomb(entClass, dropPos, targetPos, isRetarded)
     bomb:Spawn()
     bomb:Activate()
     if isRetarded then bomb:SetBodygroup(1, 1) end
-    if bomb.Arm then bomb:Arm()
-    elseif bomb.Armed ~= nil then bomb.Armed = true end
-    local bPhys = bomb:GetPhysicsObject()
-    if IsValid(bPhys) then
-        bPhys:SetVelocity(CalcDartVelocity(dropPos, targetPos))
-    end
-    -- Bug 6 fix: store handle, remove only this NoCollide pair.
+
+    -- NoCollide bomb <-> plane before touching physics or arming.
     local handle = constraint.NoCollide(bomb, self, 0, 0)
     timer.Simple(0.6, function()
         if IsValid(handle) then handle:Remove() end
     end)
+
+    -- Bug C fix: set velocity BEFORE arming.
+    -- Between Spawn/Activate and Arm() the bomb must not be stationary
+    -- and overlapping with anything, otherwise contact resolution
+    -- during that tick detonates it immediately.
+    local bPhys = bomb:GetPhysicsObject()
+    if IsValid(bPhys) then
+        bPhys:SetVelocity(CalcDartVelocity(dropPos, targetPos))
+    end
+
+    if bomb.Arm then bomb:Arm()
+    elseif bomb.Armed ~= nil then bomb.Armed = true end
+
     return bomb
 end
 
@@ -676,19 +696,23 @@ function ENT:SpawnCarpetBomb(entClass, dropPos, aimPos)
     bomb:SetAngles(Angle(90, self.flightYaw, 0))
     bomb:Spawn()
     bomb:Activate()
-    if bomb.Arm then bomb:Arm()
-    elseif bomb.Armed ~= nil then bomb.Armed = true end
+
+    local handle = constraint.NoCollide(bomb, self, 0, 0)
+    timer.Simple(0.6, function()
+        if IsValid(handle) then handle:Remove() end
+    end)
+
+    -- Bug C fix: velocity before arm (same reason as SpawnDartBomb).
     local bPhys = bomb:GetPhysicsObject()
     if IsValid(bPhys) then
         local aircraftFwd = Angle(0, self.flightYaw, 0):Forward() * self.Speed
         aircraftFwd.z = 0
         bPhys:SetVelocity(CalcCarpetImpulse(dropPos, aimPos, aircraftFwd))
     end
-    -- Bug 6 fix: store handle, remove only this NoCollide pair.
-    local handle = constraint.NoCollide(bomb, self, 0, 0)
-    timer.Simple(0.6, function()
-        if IsValid(handle) then handle:Remove() end
-    end)
+
+    if bomb.Arm then bomb:Arm()
+    elseif bomb.Armed ~= nil then bomb.Armed = true end
+
     return bomb
 end
 
@@ -720,7 +744,6 @@ function ENT:SpawnOneJASSM(dropIndex)
         return
     end
 
-    -- Bug 5 fix: math.max(shaMax, SHA_FLOOR), not math.Clamp(dropHeight, ...)
     local shaMax = (dropHeight - CFG_W1_JASSM_MIN_FREEFALL_CLEARANCE) / 1.25
     local sha    = math.max(shaMax, CFG_W1_JASSM_SHA_FLOOR)
 
@@ -739,7 +762,6 @@ function ENT:SpawnOneJASSM(dropIndex)
     missile:Spawn()
     missile:Activate()
 
-    -- Bug 6 fix: store handles, remove individually.
     local mHandle = constraint.NoCollide(missile, self, 0, 0)
     timer.Simple(1.25, function()
         if IsValid(mHandle) then mHandle:Remove() end
@@ -762,7 +784,8 @@ function ENT:SpawnOneJASSM(dropIndex)
         self:Debug("W1 JASSM: ent_bombin_jassm_chute_owned not found - chute missing")
     end
 
-    SpawnWoodPallet(dropPos + Vector(0,0,-20), Vector(math.Rand(-60,60), math.Rand(-60,60), -80))
+    -- JASSM has no live bomb at dropPos; pallet is purely cosmetic here.
+    SpawnWoodPallet(dropPos + Vector(0,0,-20), Vector(math.Rand(-60,60), math.Rand(-60,60), -80), nil)
 
     if self.JASSM_Stock > 0 then
         self.JASSM_Stock = self.JASSM_Stock - 1
@@ -793,8 +816,9 @@ function ENT:UpdateHeavy(ct)
     local entry     = CFG_W2_Pool[math.random(#CFG_W2_Pool)]
     local dropPos   = self:LocalToWorld(CFG_BombBayLocal)
     local targetPos = self:GetAimPos(CFG_W2_Scatter)
-    self:SpawnDartBomb(entry.class, dropPos, targetPos, entry.retarded)
-    SpawnWoodPallet(dropPos + Vector(0,0,-10), Vector(math.Rand(-80,80), math.Rand(-80,80), -60))
+    local bomb      = self:SpawnDartBomb(entry.class, dropPos, targetPos, entry.retarded)
+    -- Pass bomb ref so the pallet gets a NoCollide against it.
+    SpawnWoodPallet(dropPos + Vector(0,0,-10), Vector(math.Rand(-80,80), math.Rand(-80,80), -60), bomb)
     return (self.WPN_ShotsFired >= CFG_W2_Count)
 end
 
@@ -842,13 +866,13 @@ function ENT:SpawnOneGBU53Pallet(palletIndex)
     pallet:Spawn()
     pallet:Activate()
 
-    -- Bug 6 fix: store handle, remove only this NoCollide pair.
     local pHandle = constraint.NoCollide(pallet, self, 0, 0)
     timer.Simple(CFG_W3_NoCollideHoldTime, function()
         if IsValid(pHandle) then pHandle:Remove() end
     end)
 
-    SpawnWoodPallet(dropPos + Vector(0,0,-15), Vector(math.Rand(-50,50), math.Rand(-50,50), -70))
+    -- GBU53 pallet is not an armed bomb; pallet is purely cosmetic.
+    SpawnWoodPallet(dropPos + Vector(0,0,-15), Vector(math.Rand(-50,50), math.Rand(-50,50), -70), nil)
     self:Debug("W3 GBU53 pallet #" .. (palletIndex+1) .. " dropped at " .. tostring(dropPos))
 end
 
@@ -875,9 +899,10 @@ function ENT:UpdateRetarded(ct)
     local entClass = CFG_W6_Pool[math.random(#CFG_W6_Pool)]
     local dropPos   = self:LocalToWorld(CFG_BombBayLocal)
     local aimPos    = self:GetAimPos(CFG_W6_Scatter)
-    self:SpawnDartBomb(entClass, dropPos, aimPos, true)
+    local bomb      = self:SpawnDartBomb(entClass, dropPos, aimPos, true)
+    -- Only drop a pallet on the first shot of each W6 salvo.
     if self.WPN_ShotsFired == 1 then
-        SpawnWoodPallet(dropPos + Vector(0,0,-10), Vector(math.Rand(-50,50), math.Rand(-50,50), -60))
+        SpawnWoodPallet(dropPos + Vector(0,0,-10), Vector(math.Rand(-50,50), math.Rand(-50,50), -60), bomb)
     end
     return (self.WPN_ShotsFired >= CFG_W6_Count)
 end
