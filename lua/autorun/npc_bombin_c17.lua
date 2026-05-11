@@ -84,6 +84,16 @@ if SERVER then
         return flare
     end
 
+    -- FIX (spawn regression): ent_bombin_c17 does NOT have SetVar/GetVar
+    -- helpers (those are defined only on ent_bombin_gbu53_owned).  All
+    -- flight parameters are assigned as plain Lua fields directly on the
+    -- entity table before Spawn() is called; gbu53_owned/init.lua reads
+    -- them via self:GetVar() which maps to self["_var_"..key], so the
+    -- keys must be stored under that same prefix.
+    local function SetC17Var(ent, key, val)
+        ent["_var_" .. key] = val
+    end
+
     local function SpawnC17AtPos(centerPos)
         if not scripted_ents.GetStored("ent_bombin_c17") then
             BSP_Debug("ent_bombin_c17 not registered")
@@ -97,12 +107,12 @@ if SERVER then
 
         c17:SetPos(centerPos)
         c17:SetAngles(randomDir:Angle())
-        c17:SetVar("CenterPos",    centerPos)
-        c17:SetVar("CallDir",      randomDir)
-        c17:SetVar("Lifetime",     cv_life:GetFloat())
-        c17:SetVar("Speed",        cv_speed:GetFloat())
-        c17:SetVar("OrbitRadius",  cv_radius:GetFloat())
-        c17:SetVar("SkyHeightAdd", cv_height:GetFloat())
+        SetC17Var(c17, "CenterPos",    centerPos)
+        SetC17Var(c17, "CallDir",      randomDir)
+        SetC17Var(c17, "Lifetime",     cv_life:GetFloat())
+        SetC17Var(c17, "Speed",        cv_speed:GetFloat())
+        SetC17Var(c17, "OrbitRadius",  cv_radius:GetFloat())
+        SetC17Var(c17, "SkyHeightAdd", cv_height:GetFloat())
         c17:Spawn()
         c17:Activate()
 
@@ -135,14 +145,12 @@ if SERVER then
     end
 
     -- Manual spawn net receiver
-    -- FIX (BUG-1): Gate on IsAdmin() — any unauthenticated client could
-    -- previously spam-spawn C-17s by sending this net message directly.
+    -- FIX (BUG-1): Gate on IsAdmin().
     util.AddNetworkString("BombinC17_ManualSpawn")
 
     net.Receive("BombinC17_ManualSpawn", function(len, ply)
         if not IsValid(ply) then return end
 
-        -- Security gate: only admins may manually spawn a C-17.
         if not ply:IsAdmin() then
             ply:PrintMessage(HUD_PRINTCENTER, "[Bombin C-17] Admins only!")
             return
@@ -170,12 +178,12 @@ if SERVER then
 
         c17:SetPos(centerPos)
         c17:SetAngles(callDir:Angle())
-        c17:SetVar("CenterPos",    centerPos)
-        c17:SetVar("CallDir",      callDir)
-        c17:SetVar("Lifetime",     cv_life:GetFloat())
-        c17:SetVar("Speed",        cv_speed:GetFloat())
-        c17:SetVar("OrbitRadius",  cv_radius:GetFloat())
-        c17:SetVar("SkyHeightAdd", cv_height:GetFloat())
+        SetC17Var(c17, "CenterPos",    centerPos)
+        SetC17Var(c17, "CallDir",      callDir)
+        SetC17Var(c17, "Lifetime",     cv_life:GetFloat())
+        SetC17Var(c17, "Speed",        cv_speed:GetFloat())
+        SetC17Var(c17, "OrbitRadius",  cv_radius:GetFloat())
+        SetC17Var(c17, "SkyHeightAdd", cv_height:GetFloat())
         c17:Spawn()
         c17:Activate()
 

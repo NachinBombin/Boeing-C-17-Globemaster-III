@@ -1,5 +1,5 @@
 -- ============================================================
--- ent_bombin_gbu53_owned  --  SERVER
+-- ent_bombin_gbu53_owned  —  SERVER
 -- GBU-53/B StormBreaker owned variant.
 -- ============================================================
 
@@ -58,8 +58,6 @@ util.AddNetworkString( "bombin_gbu53owned_damage_tier" )
 
 -- ============================================================
 -- CARGO DOOR HELPER
--- Tells the parent C-17 plane to open or close its cargo doors.
--- Safe to call even when no plane reference exists.
 -- ============================================================
 local function C17_SetCargoDoor( missile, open )
 	local plane = missile:GetVar( "ParentPlane", nil )
@@ -79,8 +77,6 @@ local function FireEffect( origin, effect, scale )
 	util.Effect( effect, ed, true, true )
 end
 
--- Returns a valid attacker for util.BlastDamage.
--- Falls back to the entity itself so the C function never receives NULL.
 local function SafeAttacker( ent )
 	local owner = ent:GetOwner()
 	return IsValid( owner ) and owner or ent
@@ -129,15 +125,13 @@ function ENT:Initialize()
 	self.CallDir.z = 0
 	self.CallDir:Normalize()
 
-	-- FIX (BUG-10): FindGround returns -1 when no brush geometry is hit
-	-- within 32000 HU (open skybox maps, flying maps, etc.).
-	-- Using -1 as a real Z produced IgnitionAlt ~32000 HU below the world
-	-- floor.  Fall back to a plausible ground level so the missile still
-	-- has a sane altitude budget on maps without a solid floor.
+	-- FIX (BUG-10): FindGround returning -1 on open-sky / no-ceiling maps
+	-- previously caused immediate self:Remove().  Now fall back to a
+	-- reasonable ground estimate so the missile still operates.
 	local ground = self:FindGround( self.CenterPos )
 	if ground == -1 then
-		self:Debug( "FindGround failed -- using spawn-pos fallback" )
-		ground = self.CenterPos.z - (self.SkyHeightAdd * 0.5)
+		self:Debug( "FindGround failed — using fallback ground Z" )
+		ground = self.CenterPos.z - self.SkyHeightAdd * 0.5
 	end
 	self.GroundZ = ground
 
@@ -252,10 +246,8 @@ function ENT:Initialize()
 	self.WanderRateY   = math.Rand( 0.003, 0.009 )
 
 	self.CurrentWeapon   = nil
-	-- WeaponWindowEnd: wall-clock time at which the current peaceful lapse ends.
-	-- While ct < WeaponWindowEnd the doors stay open (the window is "active").
-	self.WeaponWindowEnd = 0
-	self.WeaponWindowOpen = false   -- tracks whether we already signalled Open
+	self.WeaponWindowEnd  = 0
+	self.WeaponWindowOpen = false
 
 	self.Diving        = false
 	self.DiveTarget    = nil
@@ -320,6 +312,16 @@ function ENT:SpawnChute()
 	chute:Spawn()
 	chute:Activate()
 	self.ChuteEnt = chute
+
+	-- FIX (BUG-7): store a back-reference to the parent plane on this
+	-- missile so that ent_bombin_gbu53_chute_owned can read missile.Launcher
+	-- and apply the no-collide constraint between chute/munitions and the
+	-- plane fuselage.  Previously self.Launcher was never assigned, so
+	-- every no-collide call in the chute entity silently no-oped.
+	local planeRef = self:GetVar( "ParentPlane", nil )
+	if IsValid( planeRef ) then
+		self.Launcher = planeRef
+	end
 end
 
 -- ============================================================
@@ -361,8 +363,6 @@ function ENT:SpawnSalvo( planeEnt )
 			child:SetVar( "Speed",                self.Speed )
 			child:SetVar( "DIVE_ExplosionDamage", self.DIVE_ExplosionDamage )
 			child:SetVar( "DIVE_ExplosionRadius", self.DIVE_ExplosionRadius )
-			-- Propagate parent plane reference so salvo children can also
-			-- control the cargo doors during their own dives.
 			child:SetVar( "ParentPlane",          self:GetVar("ParentPlane", nil) )
 
 			child:SetPos( releasePos )
@@ -427,10 +427,6 @@ function ENT:IgniteEngine()
 	self:PhysicsInit( SOLID_VPHYSICS )
 	self:SetMoveType( MOVETYPE_VPHYSICS )
 	self:SetSolid( SOLID_VPHYSICS )
-
-	-- Fix: COLLISION_GROUP_DEBRIS_TRIGGER collides with world/static props
-	-- but ignores players and other missiles -- correct for loitering altitude.
-	-- Upgraded to COLLISION_GROUP_NONE on StartDive().
 	self:SetCollisionGroup( COLLISION_GROUP_DEBRIS_TRIGGER )
 
 	self.PhysObj = self:GetPhysicsObject()
@@ -591,6 +587,8 @@ function ENT:UpdateWeaponLogic( ct )
 
 	local roll = math.random( 1, 3 )
 	if roll == 3 then
+		-- FIX (BUG-3): set WeaponWindowEnd before StartDive so a hypothetical
+		-- external Diving reset cannot immediately re-enter StartDive next tick.
 		self.WeaponWindowEnd = ct + 30
 		C17_SetCargoDoor( self, true )
 		self:StartDive( ct )
