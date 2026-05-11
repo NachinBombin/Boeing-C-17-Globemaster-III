@@ -15,19 +15,22 @@ local FAN_RPM         = 900
 -- Open order:  ramp_2 (28°) → ramp_1 (28°) → ramp_1b (100°)
 -- Close order: ramp_1b (0°) → ramp_1 (0°)  → ramp_2  (0°)
 --
+-- _DoorStage encoding:
+--   0          = fully closed / idle
+--   1, 2, 3    = opening bone index 1..3
+--   4          = fully open / holding
+--  -1,-2,-3    = closing bone index 1..3 (stored as negative)
+--
 -- DOOR_SPEED: degrees per second for each bone.
 -- Stage transitions happen when the current bone reaches its target
--- within DOOR_THRESHOLD degrees (threshold-based, not timer-based).
+-- within DOOR_THRESHOLD degrees.
 -- ============================================================
-local DOOR_SPEED     = 28          -- deg/s  (full travel in ~1 s for ramp_2/1, ~3.6 s for ramp_1b)
+local DOOR_SPEED     = 28          -- deg/s  (full travel ~1 s for ramp_2/1, ~3.6 s for ramp_1b)
 local DOOR_THRESHOLD = 1.0         -- degrees — close enough to snap and advance stage
 
-local DOOR_TARGETS_OPEN  = { 28, 28, 100 }   -- ramp_2, ramp_1, ramp_1b target when OPEN
-local DOOR_TARGETS_CLOSE = {  0,  0,   0 }   -- all return to 0 when CLOSED
+local DOOR_TARGETS_OPEN = { 28, 28, 100 }   -- ramp_2, ramp_1, ramp_1b open targets
 
--- Bone names indexed to match DOOR_TARGETS arrays.
--- Open  stage index runs 1→2→3.
--- Close stage index runs 3→2→1 (we iterate in reverse).
+-- Bone names indexed to match DOOR_TARGETS_OPEN.
 local DOOR_BONES = {
 	"c17.ramp_2_move",
 	"c17.ramp_1_move",
@@ -38,44 +41,42 @@ function ENT:Initialize()
 	self:SetBodygroup( 1, 1 )
 	self._FanAngle = 0
 
-	-- Cargo door state
 	-- _DoorAngles[i]: current Y angle of bone i
-	-- _DoorStage:     which bone is currently animating
-	--                 opening: 1, 2, 3 (then 4 = fully open / holding)
-	--                 closing: -3, -2, -1 (negative = close stage for bone abs(stage))
-	--                 0 = fully closed / idle
-	self._DoorAngles = { 0, 0, 0 }
-	self._DoorStage  = 0          -- 0 = closed, 4 = fully open
+	-- _DoorStage:     which bone is currently animating (see encoding above)
+	-- _DoorWasOpen:   previous wantOpen value, used to detect transitions
+	self._DoorAngles  = { 0, 0, 0 }
+	self._DoorStage   = 0
 	self._DoorWasOpen = false
 end
 
 -- ============================================================
 -- CARGO DOOR ANIMATOR
 -- Called every Draw() frame with dt = FrameTime().
--- Returns the three current bone Y angles.
 -- ============================================================
 function ENT:UpdateCargoDoors( dt )
 	local wantOpen = self:GetNWBool( "CargoDoorOpen", false )
 
-	-- Detect state transitions and set the correct starting stage.
+	-- ── Transition: closed/closing → opening ────────────────
 	if wantOpen and not self._DoorWasOpen then
-		-- Just opened: begin from wherever we currently are.
-		-- Find the lowest stage that hasn't reached its open target yet.
-		if self._DoorStage <= 0 then
+		self._DoorWasOpen = true
+
+		if self._DoorStage == 0 then
+			-- Fully closed: start from bone 1.
 			self._DoorStage = 1
-		end
-		-- If we were mid-close (negative stage), flip to the matching open stage.
-		if self._DoorStage < 0 then
+		elseif self._DoorStage < 0 then
+			-- Mid-close: resume opening from the bone that is currently moving.
+			-- math.abs converts e.g. -2 → 2 so we continue from that bone.
 			self._DoorStage = math.abs( self._DoorStage )
 		end
-		self._DoorWasOpen = true
-	elseif not wantOpen and self._DoorWasOpen then
-		-- Just closed: begin closing from wherever we are.
-		-- Find the highest bone that is not yet at 0.
-		if self._DoorStage > 0 then
-			-- Convert open stage to the equivalent close stage.
-			-- Close stages are stored as negative: -3 means "closing bone 3".
-			-- Start closing from the furthest-open bone.
+		-- If _DoorStage > 0 we were already opening; leave it as-is.
+	end
+
+	-- ── Transition: opening/open → closing ──────────────────
+	if not wantOpen and self._DoorWasOpen then
+		self._DoorWasOpen = false
+
+		if self._DoorStage == 4 or self._DoorStage > 0 then
+			-- Find the highest bone that is not already at 0 and start closing from there.
 			local startClose = 0
 			for i = 3, 1, -1 do
 				if self._DoorAngles[i] > DOOR_THRESHOLD then
@@ -83,47 +84,40 @@ function ENT:UpdateCargoDoors( dt )
 					break
 				end
 			end
-			self._DoorStage = ( startClose ~= 0 ) and startClose or 0
+			self._DoorStage = startClose  -- 0 if all bones already at rest
 		end
-		self._DoorWasOpen = false
+		-- If _DoorStage < 0 we were already closing; leave it as-is.
 	end
 
-	-- Nothing to animate.
+	-- Nothing to animate when fully closed or fully open.
 	if self._DoorStage == 0 or self._DoorStage == 4 then return end
 
 	local step = DOOR_SPEED * dt
 
 	if self._DoorStage > 0 then
 		-- ── OPENING ─────────────────────────────────────────────
-		local i      = self._DoorStage          -- bone index 1..3
+		local i      = self._DoorStage
 		local target = DOOR_TARGETS_OPEN[i]
 		local cur    = self._DoorAngles[i]
 		local diff   = target - cur
 
-		if math.abs( diff ) <= DOOR_THRESHOLD then
-			-- Snap and advance to next stage.
+		if diff <= DOOR_THRESHOLD then
+			-- Snap to target and advance to next stage.
 			self._DoorAngles[i] = target
-			if i < 3 then
-				self._DoorStage = i + 1
-			else
-				self._DoorStage = 4   -- fully open, hold
-			end
+			self._DoorStage     = ( i < 3 ) and ( i + 1 ) or 4
 		else
 			self._DoorAngles[i] = cur + math.min( step, diff )
 		end
+
 	else
 		-- ── CLOSING ─────────────────────────────────────────────
-		local i      = math.abs( self._DoorStage )   -- bone index 3..1
-		local cur    = self._DoorAngles[i]
+		local i   = math.abs( self._DoorStage )   -- 3, 2, or 1
+		local cur = self._DoorAngles[i]
 
 		if cur <= DOOR_THRESHOLD then
-			-- Snap and advance to previous bone.
+			-- Snap to 0 and advance to the previous bone.
 			self._DoorAngles[i] = 0
-			if i > 1 then
-				self._DoorStage = -( i - 1 )
-			else
-				self._DoorStage = 0   -- fully closed
-			end
+			self._DoorStage     = ( i > 1 ) and -( i - 1 ) or 0
 		else
 			self._DoorAngles[i] = cur - math.min( step, cur )
 		end
@@ -156,8 +150,7 @@ function ENT:Draw()
 	-- --------------------------------------------------------
 	-- Cargo door animation
 	-- --------------------------------------------------------
-	local dt = FrameTime()
-	self:UpdateCargoDoors( dt )
+	self:UpdateCargoDoors( FrameTime() )
 
 	-- --------------------------------------------------------
 	-- Draw model and apply bone overrides
