@@ -2,13 +2,21 @@
 -- ent_bombin_gbu53_chute_owned  --  SERVER
 -- Palette / chute / 4x visual munition combo for C-17 GBU-53.
 --
--- Destruction model:
---   HP_CHUTE  = 100  : chute is shot away. Palette + GBUs free-fall
---                      under raw gravity (drag disabled). Each GBU
---                      explodes individually on ground contact.
---   HP_PALLET = 50   : pallet is hit critically. Mid-air explosion,
---                      chute falls away as debris (same as ignition
---                      detach path). GBUs scatter as debris.
+-- Destruction model (INDEPENDENT HP pools):
+--   HP_CHUTE  = 100  : player shoots the chute region (ChuteEnt or
+--                      ChuteHitbox).  Chute visual removed, drag
+--                      disabled.  Palette + GBUs free-fall under raw
+--                      gravity.  Each GBU detonates on ground contact.
+--
+--   HP_PALLET = 50   : player shoots the palette / GBU region
+--                      (PalletHitbox, munition props, or this entity).
+--                      Mid-air explosion.  Chute falls as debris.
+--                      GBUs scatter.  Can happen WITHOUT the chute
+--                      having been damaged at all.
+--
+--   The two pools are COMPLETELY independent.  No overflow.  No
+--   sequential dependency.  Which pool gets hit depends entirely on
+--   what the player's bullet hits.
 --
 -- Spawn immunity: no damage is processed for SPAWN_IMMUNITY seconds
 -- after Initialize() so the cargo door proximity never kills the combo
@@ -18,8 +26,9 @@
 --   MOVETYPE_VPHYSICS + EnableGravity(true) on the palette root.
 --   Quadratic drag in PhysicsUpdate counters gravity to ~90 u/s
 --   terminal velocity while chute is intact.
---   Children (chute visual, munitions) are SetParent -- zero per-tick math.
---   Sway via AddAngleVelocity so Source interpolates it on clients.
+--   Children (chute visual, munitions) are SetParent -- zero per-tick
+--   position math on children.
+--   Sway via AddAngleVelocity so Source interpolates on clients.
 -- ============================================================
 
 AddCSLuaFile("cl_init.lua")
@@ -47,41 +56,39 @@ local MUNITION_OFFSETS = {
 }
 local MUNITION_YAW_OFFSETS = { 0, 0, 180, 180 }
 
--- HP pools
+-- HP pools -- completely independent, each shot by aiming at the
+-- respective part of the combo.
 local HP_CHUTE  = 100
 local HP_PALLET = 50
 
--- Spawn immunity: damage is ignored for this many seconds after spawn.
--- Matches CFG_W3_NoCollideHoldTime in the C-17 so the plane's own
--- collision never kills the combo at the cargo door.
+-- Spawn immunity window.
 local SPAWN_IMMUNITY = 1.8
 
--- Chute drag tuning (only active while chute is intact).
--- Engine applies gravity via EnableGravity(true).
+-- Chute drag tuning.
 -- At terminal: k * vt^2 == g  =>  k = 600 / (90^2) ~= 0.074
 local CHUTE_DRAG_K       = 0.074
-local CHUTE_TERMINAL_VEL = -90   -- u/s, negative = downward
+local CHUTE_TERMINAL_VEL = -90
 
--- Free-fall (chute dead): gravity only, clamp to sane terminal.
+-- Free-fall terminal (chute dead).
 local FREEFALL_TERMINAL_VEL = -1800
 
--- Ground detonation
-local GROUND_DETONATE_DIST   = 80    -- u above ground triggers GBU explode
+-- Ground detonation.
+local GROUND_DETONATE_DIST   = 80
 local GBU_EXPLODE_DAMAGE     = 600
 local GBU_EXPLODE_RADIUS     = 800
-local GBU_EXPLODE_STEP_DELAY = 0.18  -- stagger per munition
+local GBU_EXPLODE_STEP_DELAY = 0.18
 
--- Pallet midair explosion
+-- Pallet midair explosion.
 local PALLET_EXPLODE_DAMAGE = 300
 local PALLET_EXPLODE_RADIUS = 600
 
--- Sway
+-- Sway.
 local SWAY_AMP  = 2.8
 local SWAY_RATE = 1.1
 
-local THINK_DT          = 1 / 20
-local CHILD_NOCLIP_HOLD = 1.8
-local DEBRIS_LIFETIME   = 14
+local THINK_DT           = 1 / 20
+local CHILD_NOCLIP_HOLD  = 1.8
+local DEBRIS_LIFETIME    = 14
 local RELEASE_STEP_DELAY = 0.5
 
 -- ============================================================
@@ -120,6 +127,7 @@ function ENT:Initialize()
 	self.ChuteDead    = false
 	self.PalletDead   = false
 
+	-- HP pools are independent.
 	self.HP_Chute  = HP_CHUTE
 	self.HP_Pallet = HP_PALLET
 	self.SpawnTime = CurTime()
@@ -142,7 +150,12 @@ function ENT:Initialize()
 end
 
 -- ============================================================
--- CHILDREN
+-- CHILDREN + HITBOXES
+-- Two invisible hitbox entities are spawned and SetParent'd:
+--   ChuteHitbox  -- covers the chute region, routes damage to HP_Chute
+--   PalletHitbox -- covers the pallet region, routes damage to HP_Pallet
+-- The visual chute and munition props remain SOLID_NONE so only the
+-- hitboxes (and the palette root itself for pallet hits) receive damage.
 -- ============================================================
 function ENT:SpawnChildren()
 	local missile  = self:GetOwner()
@@ -150,6 +163,7 @@ function ENT:SpawnChildren()
 	local basePos  = self:GetPos()
 	local baseAng  = self:GetAngles()
 
+	-- Visual chute (no collision -- ChuteHitbox handles damage).
 	local chute = ents.Create("prop_physics")
 	if IsValid(chute) then
 		chute:SetModel(CHUTE_MODEL)
@@ -166,16 +180,82 @@ function ENT:SpawnChildren()
 		chute:SetLocalPos(CHUTE_ABOVE_PALETTE)
 		chute:SetLocalAngles(Angle(0, 0, 0))
 		self.ChuteEnt = chute
+	end
+
+	-- Chute hitbox: invisible solid sphere in the chute region.
+	-- Damage to this entity is routed to HP_Chute.
+	local cHitbox = ents.Create("prop_physics")
+	if IsValid(cHitbox) then
+		cHitbox:SetModel("models/hunter/misc/sphere075x075.mdl")
+		cHitbox:SetPos(basePos + CHUTE_ABOVE_PALETTE)
+		cHitbox:SetAngles(Angle(0, 0, 0))
+		cHitbox:Spawn()
+		cHitbox:Activate()
+		cHitbox:SetModelScale(3.5, 0)  -- covers chute canopy area
+		cHitbox:SetMoveType(MOVETYPE_NONE)
+		cHitbox:SetSolid(SOLID_VPHYSICS)
+		cHitbox:SetCollisionGroup(COLLISION_GROUP_NONE)
+		cHitbox:SetRenderMode(RENDERMODE_NONE)  -- invisible
+		cHitbox:DrawShadow(false)
+		cHitbox:SetParent(self)
+		cHitbox:SetLocalPos(CHUTE_ABOVE_PALETTE)
+		cHitbox:SetLocalAngles(Angle(0, 0, 0))
+		self.ChuteHitbox = cHitbox
+
+		-- Route damage to the chute HP pool.
+		local comboRef = self
+		cHitbox.OnTakeDamage = function(hb, dmginfo)
+			if IsValid(comboRef) then
+				comboRef:TakeChuteHit(dmginfo:GetDamage())
+			end
+		end
 
 		if IsValid(launcher) then
-			constraint.NoCollide(chute, launcher, 0, 0)
-			local cRef = chute
+			constraint.NoCollide(cHitbox, launcher, 0, 0)
+			local ref = cHitbox
 			timer.Simple(CHILD_NOCLIP_HOLD, function()
-				if IsValid(cRef) then constraint.RemoveConstraints(cRef, "NoCollide") end
+				if IsValid(ref) then constraint.RemoveConstraints(ref, "NoCollide") end
 			end)
 		end
 	end
 
+	-- Pallet hitbox: flat box covering the palette + GBU zone.
+	-- Damage routes to HP_Pallet.
+	local pHitbox = ents.Create("prop_physics")
+	if IsValid(pHitbox) then
+		pHitbox:SetModel("models/hunter/blocks/cube075x075x075.mdl")
+		pHitbox:SetPos(basePos + Vector(0, 0, 8))
+		pHitbox:SetAngles(Angle(0, 0, 0))
+		pHitbox:Spawn()
+		pHitbox:Activate()
+		pHitbox:SetModelScale(2.2, 0)  -- covers pallet footprint
+		pHitbox:SetMoveType(MOVETYPE_NONE)
+		pHitbox:SetSolid(SOLID_VPHYSICS)
+		pHitbox:SetCollisionGroup(COLLISION_GROUP_NONE)
+		pHitbox:SetRenderMode(RENDERMODE_NONE)
+		pHitbox:DrawShadow(false)
+		pHitbox:SetParent(self)
+		pHitbox:SetLocalPos(Vector(0, 0, 8))
+		pHitbox:SetLocalAngles(Angle(0, 0, 0))
+		self.PalletHitbox = pHitbox
+
+		local comboRef = self
+		pHitbox.OnTakeDamage = function(hb, dmginfo)
+			if IsValid(comboRef) then
+				comboRef:TakePalletHit(dmginfo:GetDamage())
+			end
+		end
+
+		if IsValid(launcher) then
+			constraint.NoCollide(pHitbox, launcher, 0, 0)
+			local ref = pHitbox
+			timer.Simple(CHILD_NOCLIP_HOLD, function()
+				if IsValid(ref) then constraint.RemoveConstraints(ref, "NoCollide") end
+			end)
+		end
+	end
+
+	-- Visual munition props (SOLID_NONE, damage-less -- pallet hitbox covers them).
 	for i = 1, 4 do
 		local mun = ents.Create("prop_physics")
 		if not IsValid(mun) then continue end
@@ -207,53 +287,59 @@ function ENT:SpawnChildren()
 end
 
 -- ============================================================
--- DAMAGE / DESTRUCTION
+-- DAMAGE ROUTING
+-- Called by hitbox OnTakeDamage callbacks and by this entity's own
+-- OnTakeDamage (fallback for direct palette body hits).
+-- Spawn immunity is enforced here, once, for both paths.
 -- ============================================================
-function ENT:OnTakeDamage(dmginfo)
-	-- Spawn immunity: ignore all damage for the first SPAWN_IMMUNITY
-	-- seconds so the cargo door can't kill the combo on ejection.
-	if (CurTime() - self.SpawnTime) < SPAWN_IMMUNITY then return end
-	if self.PalletDead then return end
+local function IsImmune(self)
+	return (CurTime() - self.SpawnTime) < SPAWN_IMMUNITY
+end
 
-	local dmg = dmginfo:GetDamage()
+function ENT:TakeChuteHit(dmg)
+	if IsImmune(self) or self.ChuteDead or self.PalletDead then return end
 
-	if not self.ChuteDead then
-		-- Damage chute first.
-		self.HP_Chute = self.HP_Chute - dmg
-		if self.HP_Chute <= 0 then
-			-- Overflow damage bleeds into pallet.
-			self.HP_Pallet = self.HP_Pallet + self.HP_Chute -- HP_Chute is negative
-			self:DestroyChute()
-			if self.HP_Pallet <= 0 then
-				self:DestroyPallet()
-			end
-		end
-	else
-		-- Chute already gone, damage goes to pallet.
-		self.HP_Pallet = self.HP_Pallet - dmg
-		if self.HP_Pallet <= 0 then
-			self:DestroyPallet()
-		end
+	self.HP_Chute = self.HP_Chute - dmg
+	if self.HP_Chute <= 0 then
+		self:DestroyChute()
 	end
 end
 
+function ENT:TakePalletHit(dmg)
+	if IsImmune(self) or self.PalletDead then return end
+
+	self.HP_Pallet = self.HP_Pallet - dmg
+	if self.HP_Pallet <= 0 then
+		self:DestroyPallet()
+	end
+end
+
+-- Fallback: direct hits on the palette root entity itself (not a
+-- hitbox child) are treated as pallet hits.
+function ENT:OnTakeDamage(dmginfo)
+	self:TakePalletHit(dmginfo:GetDamage())
+end
+
 -- ============================================================
--- CHUTE DESTROYED
--- Chute visual is removed. Palette + GBUs free-fall under raw
--- gravity (drag disabled). Each GBU detonates on ground contact.
+-- CHUTE DESTROYED (HP_Chute <= 0)
+-- Chute visual + hitbox removed.  Drag disabled.  Palette tumbles
+-- into free-fall.  Ground contact triggers GBU detonations.
 -- ============================================================
 function ENT:DestroyChute()
 	if self.ChuteDead then return end
 	self.ChuteDead = true
 
-	-- Remove chute visual.
+	if IsValid(self.ChuteHitbox) then
+		self.ChuteHitbox:SetParent(nil)
+		self.ChuteHitbox:Remove()
+		self.ChuteHitbox = nil
+	end
 	if IsValid(self.ChuteEnt) then
 		self.ChuteEnt:SetParent(nil)
 		self.ChuteEnt:Remove()
 		self.ChuteEnt = nil
 	end
 
-	-- Stop angular damping so the palette tumbles naturally.
 	local phys = self:GetPhysicsObject()
 	if IsValid(phys) then
 		phys:SetDamping(0, 0)
@@ -264,32 +350,42 @@ function ENT:DestroyChute()
 		))
 	end
 
-	-- Visual/audio feedback.
 	FireExplosionEffect(self:GetPos() + CHUTE_ABOVE_PALETTE, 1.0)
-	sound.Play("ambient/explosions/explode_" .. math.random(1,5) .. ".wav",
+	sound.Play("ambient/explosions/explode_" .. math.random(1, 5) .. ".wav",
 		self:GetPos(), 110, math.random(100, 118), 0.8)
-
 end
 
 -- ============================================================
--- PALLET DESTROYED
--- Mid-air explosion. Chute falls as debris. GBUs scatter.
+-- PALLET DESTROYED (HP_Pallet <= 0)
+-- Mid-air explosion.  Chute falls as debris.  GBUs scatter.
+-- This can happen at any time regardless of chute state.
 -- ============================================================
 function ENT:DestroyPallet()
 	if self.PalletDead then return end
 	self.PalletDead = true
-	self.Detached   = true  -- stop PhysicsUpdate logic
+	self.Detached   = true
 
 	local pos = self:GetPos()
 	local ang = self:GetAngles()
 
-	-- Mid-air explosion.
 	util.BlastDamage(self, SafeAttacker(self), pos, PALLET_EXPLODE_RADIUS, PALLET_EXPLODE_DAMAGE)
 	FireExplosionEffect(pos, 2.2)
-	sound.Play("ambient/explosions/explode_" .. math.random(1,5) .. ".wav",
+	sound.Play("ambient/explosions/explode_" .. math.random(1, 5) .. ".wav",
 		pos, 140, math.random(88, 102), 1.0)
 
-	-- Detach chute as falling debris (mirrors Detach() chute clone path).
+	-- Remove hitboxes so they stop accepting damage.
+	if IsValid(self.ChuteHitbox) then
+		self.ChuteHitbox:SetParent(nil)
+		self.ChuteHitbox:Remove()
+		self.ChuteHitbox = nil
+	end
+	if IsValid(self.PalletHitbox) then
+		self.PalletHitbox:SetParent(nil)
+		self.PalletHitbox:Remove()
+		self.PalletHitbox = nil
+	end
+
+	-- Chute falls as debris (only if it hasn't already been destroyed).
 	local chutePos = pos + CHUTE_ABOVE_PALETTE
 	if IsValid(self.ChuteEnt) then
 		chutePos = self.ChuteEnt:GetPos()
@@ -298,32 +394,35 @@ function ENT:DestroyPallet()
 		self.ChuteEnt = nil
 	end
 
-	local chuteClone = ents.Create("prop_physics")
-	if IsValid(chuteClone) then
-		chuteClone:SetModel(CHUTE_MODEL)
-		chuteClone:SetPos(chutePos)
-		chuteClone:SetAngles(ang)
-		chuteClone:Spawn()
-		chuteClone:Activate()
-		chuteClone:SetModelScale(CHUTE_SCALE, 0)
-		chuteClone:SetCollisionGroup(COLLISION_GROUP_DEBRIS_TRIGGER)
-		local cPhys = chuteClone:GetPhysicsObject()
-		if IsValid(cPhys) then
-			cPhys:Wake()
-			cPhys:SetVelocity(Vector(
-				math.Rand(-80, 80),
-				math.Rand(-80, 80),
-				math.Rand(-60, -20)
-			))
-			cPhys:AddAngleVelocity(Vector(
-				math.Rand(-60, 60),
-				math.Rand(-60, 60),
-				math.Rand(-30, 30)
-			))
+	if not self.ChuteDead then
+		-- Spawn chute debris clone (same as normal detach path).
+		local chuteClone = ents.Create("prop_physics")
+		if IsValid(chuteClone) then
+			chuteClone:SetModel(CHUTE_MODEL)
+			chuteClone:SetPos(chutePos)
+			chuteClone:SetAngles(ang)
+			chuteClone:Spawn()
+			chuteClone:Activate()
+			chuteClone:SetModelScale(CHUTE_SCALE, 0)
+			chuteClone:SetCollisionGroup(COLLISION_GROUP_DEBRIS_TRIGGER)
+			local cPhys = chuteClone:GetPhysicsObject()
+			if IsValid(cPhys) then
+				cPhys:Wake()
+				cPhys:SetVelocity(Vector(
+					math.Rand(-80, 80),
+					math.Rand(-80, 80),
+					math.Rand(-60, -20)
+				))
+				cPhys:AddAngleVelocity(Vector(
+					math.Rand(-60, 60),
+					math.Rand(-60, 60),
+					math.Rand(-30, 30)
+				))
+			end
+			timer.Simple(DEBRIS_LIFETIME, function()
+				if IsValid(chuteClone) then chuteClone:Remove() end
+			end)
 		end
-		timer.Simple(DEBRIS_LIFETIME, function()
-			if IsValid(chuteClone) then chuteClone:Remove() end
-		end)
 	end
 
 	-- Release GBUs as scatter debris.
@@ -354,19 +453,17 @@ function ENT:DestroyPallet()
 		end)
 	end
 
-	-- Palette becomes debris too.
+	-- Palette becomes debris.
 	self:SetCollisionGroup(COLLISION_GROUP_DEBRIS_TRIGGER)
 	local palPhys = self:GetPhysicsObject()
 	if IsValid(palPhys) then
 		palPhys:SetDamping(0, 0)
 		palPhys:Wake()
-		palPhys:SetVelocity(Vector(math.Rand(-80,80), math.Rand(-80,80), math.Rand(-40, 20)))
-		palPhys:AddAngleVelocity(Vector(math.Rand(-50,50), math.Rand(-50,50), math.Rand(-30,30)))
+		palPhys:SetVelocity(Vector(math.Rand(-80, 80), math.Rand(-80, 80), math.Rand(-40, 20)))
+		palPhys:AddAngleVelocity(Vector(math.Rand(-50, 50), math.Rand(-50, 50), math.Rand(-30, 30)))
 	end
 
-	-- Cleanup after debris settles.
-	local totalDebrisTime = DEBRIS_LIFETIME + (4 * RELEASE_STEP_DELAY)
-	timer.Simple(totalDebrisTime, function()
+	timer.Simple(DEBRIS_LIFETIME + (4 * RELEASE_STEP_DELAY), function()
 		for i = 1, 4 do
 			if IsValid(self.MunitionEnts[i]) then self.MunitionEnts[i]:Remove() end
 		end
@@ -375,9 +472,7 @@ function ENT:DestroyPallet()
 end
 
 -- ============================================================
--- PHYSICS UPDATE  (~66 Hz)
--- Only runs while combo is intact (not Detached, not PalletDead).
--- ChuteDead flag disables drag so the palette free-falls.
+-- PHYSICS UPDATE (~66 Hz)
 -- ============================================================
 function ENT:PhysicsUpdate(phys, dt)
 	if self.Detached or self.PalletDead then return end
@@ -391,10 +486,8 @@ function ENT:PhysicsUpdate(phys, dt)
 
 	if phys:IsAsleep() then phys:Wake() end
 
-	local vel = phys:GetVelocity()
-	local vz  = vel.z
-
-	-- XY: track below missile.
+	local vel        = phys:GetVelocity()
+	local vz         = vel.z
 	local missilePos = missile:GetPos()
 	local targetXY   = missilePos + PALETTE_ABOVE_MISSILE
 	local curPos     = self:GetPos()
@@ -403,18 +496,15 @@ function ENT:PhysicsUpdate(phys, dt)
 
 	local newVz
 	if not self.ChuteDead then
-		-- Drag opposes vertical motion, counters engine gravity.
 		local dragDelta = CHUTE_DRAG_K * vz * vz * dt
 		if vz >= 0 then dragDelta = -dragDelta end
 		newVz = math.max(vz + dragDelta, CHUTE_TERMINAL_VEL)
 	else
-		-- Chute gone: free-fall, no drag, just clamp to sane terminal.
 		newVz = math.max(vz, FREEFALL_TERMINAL_VEL)
 	end
 
 	phys:SetVelocity(Vector(vxCorrect, vyCorrect, newVz))
 
-	-- Sway (only while chute is alive).
 	if not self.ChuteDead then
 		self.SwayClock = (self.SwayClock or 0) + SWAY_RATE * dt
 		local targetPitch = math.sin(self.SwayClock) * SWAY_AMP
@@ -427,9 +517,7 @@ function ENT:PhysicsUpdate(phys, dt)
 end
 
 -- ============================================================
--- THINK  (1/20 s)
--- Handles: missile-gone cleanup, out-of-world guard,
--- and ground-contact detonation when chute is dead.
+-- THINK (1/20 s)
 -- ============================================================
 function ENT:Think()
 	if self.PalletDead then return end
@@ -445,7 +533,7 @@ function ENT:Think()
 		return
 	end
 
-	-- Ground-contact detonation: only when free-falling (chute dead).
+	-- Ground-contact detonation while free-falling (chute dead, not yet detached).
 	if self.ChuteDead and not self.Detached then
 		local pos = self:GetPos()
 		local tr  = util.TraceLine({
@@ -456,6 +544,7 @@ function ENT:Think()
 				for i = 1, 4 do
 					if e == self.MunitionEnts[i] then return false end
 				end
+				if e == self.PalletHitbox then return false end
 				return true
 			end,
 			mask = MASK_SOLID,
@@ -471,25 +560,29 @@ function ENT:Think()
 end
 
 -- ============================================================
--- GROUND DETONATION (chute-dead free-fall hits ground)
--- Each GBU explodes with a small stagger.
+-- GROUND DETONATION
 -- ============================================================
 function ENT:GroundDetonation()
 	if self.PalletDead then return end
 	self.PalletDead = true
 	self.Detached   = true
 
+	if IsValid(self.PalletHitbox) then
+		self.PalletHitbox:SetParent(nil)
+		self.PalletHitbox:Remove()
+		self.PalletHitbox = nil
+	end
+
 	local basePos = self:GetPos()
 
 	for i = 1, 4 do
-		local mun     = self.MunitionEnts[i]
-		local off     = MUNITION_OFFSETS[i]
-		local capturedPos = IsValid(mun) and mun:GetPos() or (basePos + off)
+		local mun         = self.MunitionEnts[i]
+		local capturedPos = IsValid(mun) and mun:GetPos() or (basePos + MUNITION_OFFSETS[i])
 		timer.Simple((i - 1) * GBU_EXPLODE_STEP_DELAY, function()
 			util.BlastDamage(self, SafeAttacker(self), capturedPos,
 				GBU_EXPLODE_RADIUS, GBU_EXPLODE_DAMAGE)
 			FireExplosionEffect(capturedPos, 2.0)
-			sound.Play("ambient/explosions/explode_" .. math.random(1,5) .. ".wav",
+			sound.Play("ambient/explosions/explode_" .. math.random(1, 5) .. ".wav",
 				capturedPos, 140, math.random(88, 104), 1.0)
 			if IsValid(mun) then
 				mun:SetParent(nil)
@@ -498,18 +591,29 @@ function ENT:GroundDetonation()
 		end)
 	end
 
-	local totalDelay = 4 * GBU_EXPLODE_STEP_DELAY
-	timer.Simple(totalDelay + 0.1, function()
+	timer.Simple(4 * GBU_EXPLODE_STEP_DELAY + 0.1, function()
 		if IsValid(self) then self:Remove() end
 	end)
 end
 
 -- ============================================================
--- DETACH  (missile engine ignited — normal release path)
+-- DETACH (missile engine ignited -- normal release path)
 -- ============================================================
 function ENT:Detach()
 	if self.Detached then return end
 	self.Detached = true
+
+	-- Remove hitboxes: combo is no longer a valid target.
+	if IsValid(self.ChuteHitbox) then
+		self.ChuteHitbox:SetParent(nil)
+		self.ChuteHitbox:Remove()
+		self.ChuteHitbox = nil
+	end
+	if IsValid(self.PalletHitbox) then
+		self.PalletHitbox:SetParent(nil)
+		self.PalletHitbox:Remove()
+		self.PalletHitbox = nil
+	end
 
 	local pos = self:GetPos()
 	local ang = self:GetAngles()
@@ -534,16 +638,8 @@ function ENT:Detach()
 		local cPhys = chuteClone:GetPhysicsObject()
 		if IsValid(cPhys) then
 			cPhys:Wake()
-			cPhys:SetVelocity(Vector(
-				math.Rand(-80, 80),
-				math.Rand(-80, 80),
-				math.Rand(-60, -20)
-			))
-			cPhys:AddAngleVelocity(Vector(
-				math.Rand(-60, 60),
-				math.Rand(-60, 60),
-				math.Rand(-30, 30)
-			))
+			cPhys:SetVelocity(Vector(math.Rand(-80,80), math.Rand(-80,80), math.Rand(-60,-20)))
+			cPhys:AddAngleVelocity(Vector(math.Rand(-60,60), math.Rand(-60,60), math.Rand(-30,30)))
 		end
 		self.ChuteClone = chuteClone
 	end
@@ -576,11 +672,7 @@ function ENT:Detach()
 					scatter.y + math.Rand(-30,30),
 					math.Rand(-20,20)
 				))
-				mPhys:AddAngleVelocity(Vector(
-					math.Rand(-80,80),
-					math.Rand(-80,80),
-					math.Rand(-50,50)
-				))
+				mPhys:AddAngleVelocity(Vector(math.Rand(-80,80), math.Rand(-80,80), math.Rand(-50,50)))
 			end
 		end)
 	end
@@ -603,12 +695,13 @@ function ENT:FullRemove()
 	self.Detached   = true
 	self.PalletDead = true
 
-	if IsValid(self.ChuteEnt) then
-		self.ChuteEnt:SetParent(nil)
-		self.ChuteEnt:Remove()
-		self.ChuteEnt = nil
+	for _, field in ipairs({"ChuteEnt", "ChuteHitbox", "PalletHitbox", "ChuteClone"}) do
+		if IsValid(self[field]) then
+			self[field]:SetParent(nil)
+			self[field]:Remove()
+			self[field] = nil
+		end
 	end
-	if IsValid(self.ChuteClone) then self.ChuteClone:Remove() self.ChuteClone = nil end
 	for i = 1, 4 do
 		if IsValid(self.MunitionEnts[i]) then
 			self.MunitionEnts[i]:SetParent(nil)
@@ -621,12 +714,12 @@ end
 
 function ENT:OnRemove()
 	if self.Detached then return end
-
-	if IsValid(self.ChuteEnt) then
-		self.ChuteEnt:SetParent(nil)
-		self.ChuteEnt:Remove()
+	for _, field in ipairs({"ChuteEnt", "ChuteHitbox", "PalletHitbox", "ChuteClone"}) do
+		if IsValid(self[field]) then
+			self[field]:SetParent(nil)
+			self[field]:Remove()
+		end
 	end
-	if IsValid(self.ChuteClone) then self.ChuteClone:Remove() end
 	for i = 1, 4 do
 		if IsValid(self.MunitionEnts[i]) then
 			self.MunitionEnts[i]:SetParent(nil)
