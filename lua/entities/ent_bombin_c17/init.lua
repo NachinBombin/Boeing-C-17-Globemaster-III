@@ -15,7 +15,7 @@ local MODEL_YAW_OFFSET = -90
 
 local ROLL_SUSTAINED_GAIN = 2.2
 local ROLL_TRANSIENT_GAIN = 55.0
-local ROLL_MAX            = 22.0
+local ROLL_MAX            = 19.0
 local ROLL_LERP_IN        = 0.08
 local ROLL_LERP_OUT       = 0.012
 
@@ -37,7 +37,7 @@ local DART_SPEED  = 4500
 local GRAVITY_EST = 580
 
 -- ---------- General config ----------
-local CFG_MaxHP        = 450
+local CFG_MaxHP        = 3500
 local CFG_FadeDuration = 3.0
 local CFG_PeacefulMin  = 6
 local CFG_PeacefulMax  = 14
@@ -45,7 +45,7 @@ local CFG_PeacefulMax  = 14
 -- Drop point in C-17 local space.
 -- At MODEL_SCALE=1.8 the belly of the fuselage is ~120u below the
 -- entity origin.  -130 clears the hull and exits below the ramp.
-local CFG_BombBayLocal = Vector(0, 0, -130)
+local CFG_BombBayLocal = Vector(100,100, -30)
 
 -- Orbit / target-tracking tuning.
 local TARGET_ORBIT_RADIUS        = 1800
@@ -60,7 +60,7 @@ local TARGET_PASS_BIAS           = 0.55
 -- ---------- W1 -- JASSM parachute drop ----------
 local CFG_W1_JASSM_Count      = 1
 local CFG_W1_JASSM_Delay      = 0
-local CFG_W1_JASSM_TailOffset = Vector(-360, 0, -70)
+local CFG_W1_JASSM_TailOffset = Vector(0,100, -70)
 local CFG_W1_JASSM_AltOffset  = 500
 
 -- ent_bombin_jassm_owned computes:
@@ -98,7 +98,7 @@ local CFG_W2_Pool    = {
 local CFG_W3_GBU53_Count       = 3
 local CFG_W3_GBU53_Delay       = 1.2
 local CFG_W3_AltStagger        = 400
-local CFG_W3_DropOffset        = Vector(-180, 0, -60)
+local CFG_W3_DropOffset        = Vector(0, 50, -60)
 local CFG_W3_BodyClearance     = 80
 local CFG_W3_NoCollideHoldTime = 1.8
 
