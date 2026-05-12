@@ -2,25 +2,31 @@
 -- ent_bombin_gbu53_chute_owned  --  SERVER
 -- Palette / chute / 4x visual munition combo for C-17 GBU-53.
 --
+-- Destruction model:
+--   HP_CHUTE  = 100  : chute is shot away. Palette + GBUs free-fall
+--                      under raw gravity (drag disabled). Each GBU
+--                      explodes individually on ground contact.
+--   HP_PALLET = 50   : pallet is hit critically. Mid-air explosion,
+--                      chute falls away as debris (same as ignition
+--                      detach path). GBUs scatter as debris.
+--
+-- Spawn immunity: no damage is processed for SPAWN_IMMUNITY seconds
+-- after Initialize() so the cargo door proximity never kills the combo
+-- right as it leaves the plane.
+--
 -- Physics model:
---   The palette root is MOVETYPE_VPHYSICS with gravity enabled.
---   EnableGravity(true) means the engine already applies gravity
---   every physics tick. PhysicsUpdate must NOT re-apply gravity
---   manually -- doing so was causing ~2x faster fall than intended.
---
---   Only the chute drag force (opposing Z velocity) is applied in
---   PhysicsUpdate, targeting ~90 u/s terminal velocity.
---   This gives Source Engine real velocity data for smooth client
---   interpolation, eliminating the choppy MOVETYPE_NONE + SetPos.
---
---   Munitions are SetParent children with fixed local offsets.
---   Chute visual is also a SetParent child.
---   Sway is driven via AddAngleVelocity (not SetAngles teleport).
+--   MOVETYPE_VPHYSICS + EnableGravity(true) on the palette root.
+--   Quadratic drag in PhysicsUpdate counters gravity to ~90 u/s
+--   terminal velocity while chute is intact.
+--   Children (chute visual, munitions) are SetParent -- zero per-tick math.
+--   Sway via AddAngleVelocity so Source interpolates it on clients.
 -- ============================================================
 
 AddCSLuaFile("cl_init.lua")
 AddCSLuaFile("shared.lua")
 include("shared.lua")
+
+util.AddNetworkString("bombin_gbu53chute_damage_tier")
 
 local PALETTE_MODEL  = "models/props_phx/construct/metal_wire1x1x2.mdl"
 local MUNITION_MODEL = "models/sw/usa/bombs/guided/gbu53.mdl"
@@ -41,25 +47,57 @@ local MUNITION_OFFSETS = {
 }
 local MUNITION_YAW_OFFSETS = { 0, 0, 180, 180 }
 
--- Chute drag tuning.
--- The engine applies gravity naturally (EnableGravity(true)).
--- We only need to counteract it enough to reach terminal velocity.
--- Terminal velocity target: ~90 u/s downward.
--- At terminal: drag_accel == gravity  =>  k * vt^2 == g
--- GMod gravity ~600 u/s^2, vt = 90  =>  k = 600 / (90^2) ~= 0.074
--- PhysicsUpdate receives dt and sets velocity directly, so:
---   drag_vel_delta = k * vz^2 * dt  (opposing direction)
+-- HP pools
+local HP_CHUTE  = 100
+local HP_PALLET = 50
+
+-- Spawn immunity: damage is ignored for this many seconds after spawn.
+-- Matches CFG_W3_NoCollideHoldTime in the C-17 so the plane's own
+-- collision never kills the combo at the cargo door.
+local SPAWN_IMMUNITY = 1.8
+
+-- Chute drag tuning (only active while chute is intact).
+-- Engine applies gravity via EnableGravity(true).
+-- At terminal: k * vt^2 == g  =>  k = 600 / (90^2) ~= 0.074
 local CHUTE_DRAG_K       = 0.074
-local CHUTE_TERMINAL_VEL = -90   -- negative = downward (u/s)
+local CHUTE_TERMINAL_VEL = -90   -- u/s, negative = downward
 
--- Sway tuning
-local SWAY_AMP  = 2.8   -- degrees peak
-local SWAY_RATE = 1.1   -- rad/s
+-- Free-fall (chute dead): gravity only, clamp to sane terminal.
+local FREEFALL_TERMINAL_VEL = -1800
 
-local THINK_DT           = 1 / 20
-local CHILD_NOCLIP_HOLD  = 1.8
-local DEBRIS_LIFETIME    = 14
+-- Ground detonation
+local GROUND_DETONATE_DIST   = 80    -- u above ground triggers GBU explode
+local GBU_EXPLODE_DAMAGE     = 600
+local GBU_EXPLODE_RADIUS     = 800
+local GBU_EXPLODE_STEP_DELAY = 0.18  -- stagger per munition
+
+-- Pallet midair explosion
+local PALLET_EXPLODE_DAMAGE = 300
+local PALLET_EXPLODE_RADIUS = 600
+
+-- Sway
+local SWAY_AMP  = 2.8
+local SWAY_RATE = 1.1
+
+local THINK_DT          = 1 / 20
+local CHILD_NOCLIP_HOLD = 1.8
+local DEBRIS_LIFETIME   = 14
 local RELEASE_STEP_DELAY = 0.5
+
+-- ============================================================
+-- HELPERS
+-- ============================================================
+local function SafeAttacker(ent)
+	local owner = ent:GetOwner()
+	return IsValid(owner) and owner or ent
+end
+
+local function FireExplosionEffect(pos, scale)
+	local ed = EffectData()
+	ed:SetOrigin(pos)
+	ed:SetScale(scale)
+	util.Effect("Explosion", ed, true, true)
+end
 
 -- ============================================================
 -- INITIALIZE
@@ -68,7 +106,6 @@ function ENT:Initialize()
 	self:SetModel(PALETTE_MODEL)
 	self:SetModelScale(PALETTE_SCALE, 0)
 
-	-- Physics-based fall: vphysics + gravity so Source interpolates movement.
 	self:PhysicsInit(SOLID_VPHYSICS)
 	self:SetMoveType(MOVETYPE_VPHYSICS)
 	self:SetSolid(SOLID_VPHYSICS)
@@ -80,14 +117,18 @@ function ENT:Initialize()
 	self.ChuteEnt     = nil
 	self.ChuteClone   = nil
 	self.Detached     = false
+	self.ChuteDead    = false
+	self.PalletDead   = false
+
+	self.HP_Chute  = HP_CHUTE
+	self.HP_Pallet = HP_PALLET
+	self.SpawnTime = CurTime()
 
 	local phys = self:GetPhysicsObject()
 	if IsValid(phys) then
 		phys:Wake()
 		phys:EnableGravity(true)
-		-- Seed with a small downward velocity so drag kicks in immediately.
 		phys:SetVelocity(Vector(0, 0, -10))
-		-- Reduce angular damping so our sway drive isn't fought by the engine.
 		phys:SetDamping(0.05, 0.8)
 	end
 
@@ -97,6 +138,7 @@ function ENT:Initialize()
 	end)
 
 	self:EmitSound("npc/combine_soldier/zipline_clip1.wav", 75, 108, 0.85)
+	self:NextThink(CurTime() + THINK_DT)
 end
 
 -- ============================================================
@@ -108,7 +150,6 @@ function ENT:SpawnChildren()
 	local basePos  = self:GetPos()
 	local baseAng  = self:GetAngles()
 
-	-- Chute: cosmetic child, parented so it follows vphysics interpolation.
 	local chute = ents.Create("prop_physics")
 	if IsValid(chute) then
 		chute:SetModel(CHUTE_MODEL)
@@ -135,13 +176,11 @@ function ENT:SpawnChildren()
 		end
 	end
 
-	-- Munitions: parented children with fixed local offsets.
 	for i = 1, 4 do
 		local mun = ents.Create("prop_physics")
 		if not IsValid(mun) then continue end
 
 		local off = MUNITION_OFFSETS[i]
-
 		mun:SetModel(MUNITION_MODEL)
 		mun:SetPos(basePos + off)
 		mun:SetAngles(Angle(0, baseAng.y + MUNITION_YAW_OFFSETS[i], 0))
@@ -152,11 +191,9 @@ function ENT:SpawnChildren()
 		mun:SetSolid(SOLID_NONE)
 		mun:SetCollisionGroup(COLLISION_GROUP_NONE)
 		mun:DrawShadow(false)
-
 		mun:SetParent(self)
 		mun:SetLocalPos(off)
 		mun:SetLocalAngles(Angle(0, MUNITION_YAW_OFFSETS[i], 0))
-
 		self.MunitionEnts[i] = mun
 
 		if IsValid(launcher) then
@@ -170,19 +207,180 @@ function ENT:SpawnChildren()
 end
 
 -- ============================================================
--- PHYSICS UPDATE  (called every physics tick, ~66Hz)
---
--- Gravity is handled entirely by the engine (EnableGravity(true)).
--- We only apply:
---   1. Quadratic drag on Z to reach terminal velocity.
---   2. XY correction to keep palette below the missile.
---   3. Sway via AddAngleVelocity.
---
--- DO NOT subtract CHUTE_GRAVITY * dt here -- the engine already does
--- that. Adding it again was causing the palette to fall ~2x too fast.
+-- DAMAGE / DESTRUCTION
+-- ============================================================
+function ENT:OnTakeDamage(dmginfo)
+	-- Spawn immunity: ignore all damage for the first SPAWN_IMMUNITY
+	-- seconds so the cargo door can't kill the combo on ejection.
+	if (CurTime() - self.SpawnTime) < SPAWN_IMMUNITY then return end
+	if self.PalletDead then return end
+
+	local dmg = dmginfo:GetDamage()
+
+	if not self.ChuteDead then
+		-- Damage chute first.
+		self.HP_Chute = self.HP_Chute - dmg
+		if self.HP_Chute <= 0 then
+			-- Overflow damage bleeds into pallet.
+			self.HP_Pallet = self.HP_Pallet + self.HP_Chute -- HP_Chute is negative
+			self:DestroyChute()
+			if self.HP_Pallet <= 0 then
+				self:DestroyPallet()
+			end
+		end
+	else
+		-- Chute already gone, damage goes to pallet.
+		self.HP_Pallet = self.HP_Pallet - dmg
+		if self.HP_Pallet <= 0 then
+			self:DestroyPallet()
+		end
+	end
+end
+
+-- ============================================================
+-- CHUTE DESTROYED
+-- Chute visual is removed. Palette + GBUs free-fall under raw
+-- gravity (drag disabled). Each GBU detonates on ground contact.
+-- ============================================================
+function ENT:DestroyChute()
+	if self.ChuteDead then return end
+	self.ChuteDead = true
+
+	-- Remove chute visual.
+	if IsValid(self.ChuteEnt) then
+		self.ChuteEnt:SetParent(nil)
+		self.ChuteEnt:Remove()
+		self.ChuteEnt = nil
+	end
+
+	-- Stop angular damping so the palette tumbles naturally.
+	local phys = self:GetPhysicsObject()
+	if IsValid(phys) then
+		phys:SetDamping(0, 0)
+		phys:AddAngleVelocity(Vector(
+			math.Rand(-60, 60),
+			math.Rand(-60, 60),
+			math.Rand(-40, 40)
+		))
+	end
+
+	-- Visual/audio feedback.
+	FireExplosionEffect(self:GetPos() + CHUTE_ABOVE_PALETTE, 1.0)
+	sound.Play("ambient/explosions/explode_" .. math.random(1,5) .. ".wav",
+		self:GetPos(), 110, math.random(100, 118), 0.8)
+
+end
+
+-- ============================================================
+-- PALLET DESTROYED
+-- Mid-air explosion. Chute falls as debris. GBUs scatter.
+-- ============================================================
+function ENT:DestroyPallet()
+	if self.PalletDead then return end
+	self.PalletDead = true
+	self.Detached   = true  -- stop PhysicsUpdate logic
+
+	local pos = self:GetPos()
+	local ang = self:GetAngles()
+
+	-- Mid-air explosion.
+	util.BlastDamage(self, SafeAttacker(self), pos, PALLET_EXPLODE_RADIUS, PALLET_EXPLODE_DAMAGE)
+	FireExplosionEffect(pos, 2.2)
+	sound.Play("ambient/explosions/explode_" .. math.random(1,5) .. ".wav",
+		pos, 140, math.random(88, 102), 1.0)
+
+	-- Detach chute as falling debris (mirrors Detach() chute clone path).
+	local chutePos = pos + CHUTE_ABOVE_PALETTE
+	if IsValid(self.ChuteEnt) then
+		chutePos = self.ChuteEnt:GetPos()
+		self.ChuteEnt:SetParent(nil)
+		self.ChuteEnt:Remove()
+		self.ChuteEnt = nil
+	end
+
+	local chuteClone = ents.Create("prop_physics")
+	if IsValid(chuteClone) then
+		chuteClone:SetModel(CHUTE_MODEL)
+		chuteClone:SetPos(chutePos)
+		chuteClone:SetAngles(ang)
+		chuteClone:Spawn()
+		chuteClone:Activate()
+		chuteClone:SetModelScale(CHUTE_SCALE, 0)
+		chuteClone:SetCollisionGroup(COLLISION_GROUP_DEBRIS_TRIGGER)
+		local cPhys = chuteClone:GetPhysicsObject()
+		if IsValid(cPhys) then
+			cPhys:Wake()
+			cPhys:SetVelocity(Vector(
+				math.Rand(-80, 80),
+				math.Rand(-80, 80),
+				math.Rand(-60, -20)
+			))
+			cPhys:AddAngleVelocity(Vector(
+				math.Rand(-60, 60),
+				math.Rand(-60, 60),
+				math.Rand(-30, 30)
+			))
+		end
+		timer.Simple(DEBRIS_LIFETIME, function()
+			if IsValid(chuteClone) then chuteClone:Remove() end
+		end)
+	end
+
+	-- Release GBUs as scatter debris.
+	for i = 1, 4 do
+		local mun = self.MunitionEnts[i]
+		local scatterDir = MUNITION_OFFSETS[i]:GetNormalized()
+		timer.Simple((i - 1) * RELEASE_STEP_DELAY, function()
+			if not IsValid(mun) then return end
+			mun:SetParent(nil)
+			mun:SetMoveType(MOVETYPE_VPHYSICS)
+			mun:SetSolid(SOLID_VPHYSICS)
+			mun:SetCollisionGroup(COLLISION_GROUP_DEBRIS_TRIGGER)
+			local mPhys = mun:GetPhysicsObject()
+			if IsValid(mPhys) then
+				mPhys:Wake()
+				local scatter = scatterDir * math.Rand(40, 100)
+				mPhys:SetVelocity(Vector(
+					scatter.x + math.Rand(-30, 30),
+					scatter.y + math.Rand(-30, 30),
+					math.Rand(-20, 20)
+				))
+				mPhys:AddAngleVelocity(Vector(
+					math.Rand(-80, 80),
+					math.Rand(-80, 80),
+					math.Rand(-50, 50)
+				))
+			end
+		end)
+	end
+
+	-- Palette becomes debris too.
+	self:SetCollisionGroup(COLLISION_GROUP_DEBRIS_TRIGGER)
+	local palPhys = self:GetPhysicsObject()
+	if IsValid(palPhys) then
+		palPhys:SetDamping(0, 0)
+		palPhys:Wake()
+		palPhys:SetVelocity(Vector(math.Rand(-80,80), math.Rand(-80,80), math.Rand(-40, 20)))
+		palPhys:AddAngleVelocity(Vector(math.Rand(-50,50), math.Rand(-50,50), math.Rand(-30,30)))
+	end
+
+	-- Cleanup after debris settles.
+	local totalDebrisTime = DEBRIS_LIFETIME + (4 * RELEASE_STEP_DELAY)
+	timer.Simple(totalDebrisTime, function()
+		for i = 1, 4 do
+			if IsValid(self.MunitionEnts[i]) then self.MunitionEnts[i]:Remove() end
+		end
+		if IsValid(self) then self:Remove() end
+	end)
+end
+
+-- ============================================================
+-- PHYSICS UPDATE  (~66 Hz)
+-- Only runs while combo is intact (not Detached, not PalletDead).
+-- ChuteDead flag disables drag so the palette free-falls.
 -- ============================================================
 function ENT:PhysicsUpdate(phys, dt)
-	if self.Detached then return end
+	if self.Detached or self.PalletDead then return end
 
 	local missile = self:GetOwner()
 	if not IsValid(missile) then return end
@@ -196,43 +394,45 @@ function ENT:PhysicsUpdate(phys, dt)
 	local vel = phys:GetVelocity()
 	local vz  = vel.z
 
-	-- XY correction: keep palette tracking below the missile.
+	-- XY: track below missile.
 	local missilePos = missile:GetPos()
 	local targetXY   = missilePos + PALETTE_ABOVE_MISSILE
 	local curPos     = self:GetPos()
 	local vxCorrect  = (targetXY.x - curPos.x) * 12
 	local vyCorrect  = (targetXY.y - curPos.y) * 12
 
-	-- Quadratic drag on Z, opposing vertical velocity.
-	-- drag_delta (u/s) = k * vz^2 * dt, sign opposes motion.
-	local dragDelta = CHUTE_DRAG_K * vz * vz * dt
-	if vz < 0 then
-		dragDelta =  dragDelta  -- falling: drag pushes +Z (upward)
+	local newVz
+	if not self.ChuteDead then
+		-- Drag opposes vertical motion, counters engine gravity.
+		local dragDelta = CHUTE_DRAG_K * vz * vz * dt
+		if vz >= 0 then dragDelta = -dragDelta end
+		newVz = math.max(vz + dragDelta, CHUTE_TERMINAL_VEL)
 	else
-		dragDelta = -dragDelta  -- rising: drag pushes -Z (downward)
+		-- Chute gone: free-fall, no drag, just clamp to sane terminal.
+		newVz = math.max(vz, FREEFALL_TERMINAL_VEL)
 	end
-
-	-- New vertical velocity: engine already stepped gravity into vel.z,
-	-- we just add the drag correction on top.
-	local newVz = math.max(vz + dragDelta, CHUTE_TERMINAL_VEL)
 
 	phys:SetVelocity(Vector(vxCorrect, vyCorrect, newVz))
 
-	-- Sway: oscillate pitch via angular velocity so Source interpolates it.
-	self.SwayClock = (self.SwayClock or 0) + SWAY_RATE * dt
-	local targetPitch = math.sin(self.SwayClock) * SWAY_AMP
-	local curAng      = self:GetAngles()
-	local missileAng  = missile:GetAngles()
-	local desiredAng  = Angle(targetPitch, missileAng.y, 0)
-	local angDiff     = desiredAng - curAng
-	phys:AddAngleVelocity(Vector(angDiff.p * 8, angDiff.y * 8, angDiff.r * 8))
+	-- Sway (only while chute is alive).
+	if not self.ChuteDead then
+		self.SwayClock = (self.SwayClock or 0) + SWAY_RATE * dt
+		local targetPitch = math.sin(self.SwayClock) * SWAY_AMP
+		local curAng      = self:GetAngles()
+		local missileAng  = missile:GetAngles()
+		local desiredAng  = Angle(targetPitch, missileAng.y, 0)
+		local angDiff     = desiredAng - curAng
+		phys:AddAngleVelocity(Vector(angDiff.p * 8, angDiff.y * 8, angDiff.r * 8))
+	end
 end
 
 -- ============================================================
--- THINK  (low-frequency bookkeeping)
+-- THINK  (1/20 s)
+-- Handles: missile-gone cleanup, out-of-world guard,
+-- and ground-contact detonation when chute is dead.
 -- ============================================================
 function ENT:Think()
-	if self.Detached then return end
+	if self.PalletDead then return end
 
 	local missile = self:GetOwner()
 	if not IsValid(missile) then
@@ -245,38 +445,67 @@ function ENT:Think()
 		return
 	end
 
+	-- Ground-contact detonation: only when free-falling (chute dead).
+	if self.ChuteDead and not self.Detached then
+		local pos = self:GetPos()
+		local tr  = util.TraceLine({
+			start  = pos,
+			endpos = pos + Vector(0, 0, -(GROUND_DETONATE_DIST + 10)),
+			filter = function(e)
+				if e == self then return false end
+				for i = 1, 4 do
+					if e == self.MunitionEnts[i] then return false end
+				end
+				return true
+			end,
+			mask = MASK_SOLID,
+		})
+		if tr.Hit then
+			self:GroundDetonation()
+			return
+		end
+	end
+
 	self:NextThink(CurTime() + THINK_DT)
 	return true
 end
 
 -- ============================================================
--- DEBRIS RELEASE
+-- GROUND DETONATION (chute-dead free-fall hits ground)
+-- Each GBU explodes with a small stagger.
 -- ============================================================
-local function ReleaseMunition(mun, scatterDir)
-	if not IsValid(mun) then return end
-	mun:SetParent(nil)
-	mun:SetMoveType(MOVETYPE_VPHYSICS)
-	mun:SetSolid(SOLID_VPHYSICS)
-	mun:SetCollisionGroup(COLLISION_GROUP_DEBRIS_TRIGGER)
-	local mPhys = mun:GetPhysicsObject()
-	if IsValid(mPhys) then
-		mPhys:Wake()
-		local scatter = scatterDir * math.Rand(40, 100)
-		mPhys:SetVelocity(Vector(
-			scatter.x + math.Rand(-30, 30),
-			scatter.y + math.Rand(-30, 30),
-			math.Rand(-20, 20)
-		))
-		mPhys:AddAngleVelocity(Vector(
-			math.Rand(-80, 80),
-			math.Rand(-80, 80),
-			math.Rand(-50, 50)
-		))
+function ENT:GroundDetonation()
+	if self.PalletDead then return end
+	self.PalletDead = true
+	self.Detached   = true
+
+	local basePos = self:GetPos()
+
+	for i = 1, 4 do
+		local mun     = self.MunitionEnts[i]
+		local off     = MUNITION_OFFSETS[i]
+		local capturedPos = IsValid(mun) and mun:GetPos() or (basePos + off)
+		timer.Simple((i - 1) * GBU_EXPLODE_STEP_DELAY, function()
+			util.BlastDamage(self, SafeAttacker(self), capturedPos,
+				GBU_EXPLODE_RADIUS, GBU_EXPLODE_DAMAGE)
+			FireExplosionEffect(capturedPos, 2.0)
+			sound.Play("ambient/explosions/explode_" .. math.random(1,5) .. ".wav",
+				capturedPos, 140, math.random(88, 104), 1.0)
+			if IsValid(mun) then
+				mun:SetParent(nil)
+				mun:Remove()
+			end
+		end)
 	end
+
+	local totalDelay = 4 * GBU_EXPLODE_STEP_DELAY
+	timer.Simple(totalDelay + 0.1, function()
+		if IsValid(self) then self:Remove() end
+	end)
 end
 
 -- ============================================================
--- DETACH  (missile engine ignited)
+-- DETACH  (missile engine ignited — normal release path)
 -- ============================================================
 function ENT:Detach()
 	if self.Detached then return end
@@ -293,7 +522,6 @@ function ENT:Detach()
 		self.ChuteEnt = nil
 	end
 
-	-- Spawn a physics-enabled chute clone that falls away.
 	local chuteClone = ents.Create("prop_physics")
 	if IsValid(chuteClone) then
 		chuteClone:SetModel(CHUTE_MODEL)
@@ -320,30 +548,48 @@ function ENT:Detach()
 		self.ChuteClone = chuteClone
 	end
 
-	-- Palette itself becomes physics debris.
 	self:SetCollisionGroup(COLLISION_GROUP_DEBRIS_TRIGGER)
 	local palPhys = self:GetPhysicsObject()
 	if IsValid(palPhys) then
 		palPhys:Wake()
 		palPhys:EnableGravity(true)
 		palPhys:SetDamping(0, 0)
-		palPhys:SetVelocity(Vector(math.Rand(-60, 60), math.Rand(-60, 60), math.Rand(-30, 10)))
-		palPhys:AddAngleVelocity(Vector(math.Rand(-40, 40), math.Rand(-40, 40), math.Rand(-20, 20)))
+		palPhys:SetVelocity(Vector(math.Rand(-60,60), math.Rand(-60,60), math.Rand(-30,10)))
+		palPhys:AddAngleVelocity(Vector(math.Rand(-40,40), math.Rand(-40,40), math.Rand(-20,20)))
 	end
 
 	for i = 1, 4 do
 		local mun = self.MunitionEnts[i]
 		local scatterDir = MUNITION_OFFSETS[i]:GetNormalized()
 		timer.Simple((i - 1) * RELEASE_STEP_DELAY, function()
-			ReleaseMunition(mun, scatterDir)
+			if not IsValid(mun) then return end
+			mun:SetParent(nil)
+			mun:SetMoveType(MOVETYPE_VPHYSICS)
+			mun:SetSolid(SOLID_VPHYSICS)
+			mun:SetCollisionGroup(COLLISION_GROUP_DEBRIS_TRIGGER)
+			local mPhys = mun:GetPhysicsObject()
+			if IsValid(mPhys) then
+				mPhys:Wake()
+				local scatter = scatterDir * math.Rand(40, 100)
+				mPhys:SetVelocity(Vector(
+					scatter.x + math.Rand(-30,30),
+					scatter.y + math.Rand(-30,30),
+					math.Rand(-20,20)
+				))
+				mPhys:AddAngleVelocity(Vector(
+					math.Rand(-80,80),
+					math.Rand(-80,80),
+					math.Rand(-50,50)
+				))
+			end
 		end)
 	end
 
-	sound.Play("npc/combine_soldier/zipline_clip2.wav", pos, 82, math.random(93, 110), 1.0)
+	sound.Play("npc/combine_soldier/zipline_clip2.wav", pos, 82, math.random(93,110), 1.0)
 
 	local debrisRefs = { self, chuteClone }
 	for i = 1, 4 do debrisRefs[#debrisRefs + 1] = self.MunitionEnts[i] end
-	timer.Simple(DEBRIS_LIFETIME + ((#self.MunitionEnts - 1) * RELEASE_STEP_DELAY), function()
+	timer.Simple(DEBRIS_LIFETIME + (4 * RELEASE_STEP_DELAY), function()
 		for _, e in ipairs(debrisRefs) do
 			if IsValid(e) then e:Remove() end
 		end
@@ -354,7 +600,8 @@ end
 -- CLEANUP
 -- ============================================================
 function ENT:FullRemove()
-	self.Detached = true
+	self.Detached   = true
+	self.PalletDead = true
 
 	if IsValid(self.ChuteEnt) then
 		self.ChuteEnt:SetParent(nil)
