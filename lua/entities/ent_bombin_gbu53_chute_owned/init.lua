@@ -2,17 +2,20 @@
 -- ent_bombin_gbu53_chute_owned  --  SERVER
 -- Palette / chute / 4x visual munition combo for C-17 GBU-53.
 --
--- Physics model (post-fix):
+-- Physics model:
 --   The palette root is MOVETYPE_VPHYSICS with gravity enabled.
---   A quadratic drag force is applied every PhysicsUpdate tick to
---   simulate chute deceleration, targeting ~90 u/s terminal velocity.
---   This gives Source Engine real velocity data for interpolation on
---   clients, eliminating the choppy MOVETYPE_NONE + SetPos teleport.
+--   EnableGravity(true) means the engine already applies gravity
+--   every physics tick. PhysicsUpdate must NOT re-apply gravity
+--   manually -- doing so was causing ~2x faster fall than intended.
 --
---   Munitions are SetParent children with fixed local offsets, so
---   they follow the palette with zero per-tick math.
+--   Only the chute drag force (opposing Z velocity) is applied in
+--   PhysicsUpdate, targeting ~90 u/s terminal velocity.
+--   This gives Source Engine real velocity data for smooth client
+--   interpolation, eliminating the choppy MOVETYPE_NONE + SetPos.
 --
---   The chute visual model is also a SetParent child (unchanged).
+--   Munitions are SetParent children with fixed local offsets.
+--   Chute visual is also a SetParent child.
+--   Sway is driven via AddAngleVelocity (not SetAngles teleport).
 -- ============================================================
 
 AddCSLuaFile("cl_init.lua")
@@ -39,22 +42,21 @@ local MUNITION_OFFSETS = {
 local MUNITION_YAW_OFFSETS = { 0, 0, 180, 180 }
 
 -- Chute drag tuning.
+-- The engine applies gravity naturally (EnableGravity(true)).
+-- We only need to counteract it enough to reach terminal velocity.
 -- Terminal velocity target: ~90 u/s downward.
--- F_drag = CHUTE_DRAG_K * v^2  (opposes velocity direction)
--- At terminal: F_drag = gravity_force  =>  k = g / v_t^2
--- GMod default gravity ~600 u/s^2, v_t = 90 u/s  => k = 600/8100 ~= 0.074
--- Physobj mass is ~50 kg (prop_physics default); engine multiplies force
--- by mass internally via ApplyForceCenter, so we pass acceleration directly.
+-- At terminal: drag_accel == gravity  =>  k * vt^2 == g
+-- GMod gravity ~600 u/s^2, vt = 90  =>  k = 600 / (90^2) ~= 0.074
+-- PhysicsUpdate receives dt and sets velocity directly, so:
+--   drag_vel_delta = k * vz^2 * dt  (opposing direction)
 local CHUTE_DRAG_K       = 0.074
-local CHUTE_GRAVITY      = 600
-local CHUTE_TERMINAL_VEL = -90   -- negative = downward
+local CHUTE_TERMINAL_VEL = -90   -- negative = downward (u/s)
 
--- Sway: angular oscillation driven via AddAngleVelocity so the engine
--- can interpolate it on clients (unlike SetAngles teleport).
-local SWAY_AMP        = 2.8   -- degrees peak
-local SWAY_RATE       = 1.1   -- rad/s
-local THINK_DT        = 1 / 20  -- Think tick for non-physics bookkeeping
+-- Sway tuning
+local SWAY_AMP  = 2.8   -- degrees peak
+local SWAY_RATE = 1.1   -- rad/s
 
+local THINK_DT           = 1 / 20
 local CHILD_NOCLIP_HOLD  = 1.8
 local DEBRIS_LIFETIME    = 14
 local RELEASE_STEP_DELAY = 0.5
@@ -85,7 +87,7 @@ function ENT:Initialize()
 		phys:EnableGravity(true)
 		-- Seed with a small downward velocity so drag kicks in immediately.
 		phys:SetVelocity(Vector(0, 0, -10))
-		-- Disable angular damping so our sway drive is not fought by the engine.
+		-- Reduce angular damping so our sway drive isn't fought by the engine.
 		phys:SetDamping(0.05, 0.8)
 	end
 
@@ -134,8 +136,6 @@ function ENT:SpawnChildren()
 	end
 
 	-- Munitions: parented children with fixed local offsets.
-	-- SetParent keeps them rigidly attached to the palette without any
-	-- per-tick world-space math, and they inherit the physics interpolation.
 	for i = 1, 4 do
 		local mun = ents.Create("prop_physics")
 		if not IsValid(mun) then continue end
@@ -153,7 +153,6 @@ function ENT:SpawnChildren()
 		mun:SetCollisionGroup(COLLISION_GROUP_NONE)
 		mun:DrawShadow(false)
 
-		-- Parent to palette so munitions move with it for free.
 		mun:SetParent(self)
 		mun:SetLocalPos(off)
 		mun:SetLocalAngles(Angle(0, MUNITION_YAW_OFFSETS[i], 0))
@@ -172,9 +171,15 @@ end
 
 -- ============================================================
 -- PHYSICS UPDATE  (called every physics tick, ~66Hz)
--- Applies chute drag and sway angle velocity.
--- Source Engine uses the velocity set here for client interpolation,
--- which is what eliminates the choppy visual.
+--
+-- Gravity is handled entirely by the engine (EnableGravity(true)).
+-- We only apply:
+--   1. Quadratic drag on Z to reach terminal velocity.
+--   2. XY correction to keep palette below the missile.
+--   3. Sway via AddAngleVelocity.
+--
+-- DO NOT subtract CHUTE_GRAVITY * dt here -- the engine already does
+-- that. Adding it again was causing the palette to fall ~2x too fast.
 -- ============================================================
 function ENT:PhysicsUpdate(phys, dt)
 	if self.Detached then return end
@@ -189,28 +194,29 @@ function ENT:PhysicsUpdate(phys, dt)
 	if phys:IsAsleep() then phys:Wake() end
 
 	local vel = phys:GetVelocity()
+	local vz  = vel.z
 
-	-- Lock XY to follow the missile horizontally (palette hangs directly below).
-	-- Only the Z axis is free (controlled by drag).
+	-- XY correction: keep palette tracking below the missile.
 	local missilePos = missile:GetPos()
 	local targetXY   = missilePos + PALETTE_ABOVE_MISSILE
 	local curPos     = self:GetPos()
-	local xyCorrect  = Vector(
-		(targetXY.x - curPos.x) * 12,
-		(targetXY.y - curPos.y) * 12,
-		0
-	)
+	local vxCorrect  = (targetXY.x - curPos.x) * 12
+	local vyCorrect  = (targetXY.y - curPos.y) * 12
 
-	-- Vertical drag: F = k * vz^2, opposing motion.
-	local vz     = vel.z
-	local dragZ  = CHUTE_DRAG_K * vz * vz
-	if vz < 0 then dragZ = dragZ end   -- drag opposes downward vel: +Z force
-	if vz > 0 then dragZ = -dragZ end  -- drag opposes upward vel:   -Z force
+	-- Quadratic drag on Z, opposing vertical velocity.
+	-- drag_delta (u/s) = k * vz^2 * dt, sign opposes motion.
+	local dragDelta = CHUTE_DRAG_K * vz * vz * dt
+	if vz < 0 then
+		dragDelta =  dragDelta  -- falling: drag pushes +Z (upward)
+	else
+		dragDelta = -dragDelta  -- rising: drag pushes -Z (downward)
+	end
 
-	-- Clamp to terminal velocity.
-	local newVz = math.max(vz - CHUTE_GRAVITY * dt + dragZ * dt, CHUTE_TERMINAL_VEL)
+	-- New vertical velocity: engine already stepped gravity into vel.z,
+	-- we just add the drag correction on top.
+	local newVz = math.max(vz + dragDelta, CHUTE_TERMINAL_VEL)
 
-	phys:SetVelocity(Vector(xyCorrect.x, xyCorrect.y, newVz))
+	phys:SetVelocity(Vector(vxCorrect, vyCorrect, newVz))
 
 	-- Sway: oscillate pitch via angular velocity so Source interpolates it.
 	self.SwayClock = (self.SwayClock or 0) + SWAY_RATE * dt
@@ -219,7 +225,6 @@ function ENT:PhysicsUpdate(phys, dt)
 	local missileAng  = missile:GetAngles()
 	local desiredAng  = Angle(targetPitch, missileAng.y, 0)
 	local angDiff     = desiredAng - curAng
-	-- Drive towards desired angle via angular velocity (interpolation-friendly).
 	phys:AddAngleVelocity(Vector(angDiff.p * 8, angDiff.y * 8, angDiff.r * 8))
 end
 
@@ -235,7 +240,6 @@ function ENT:Think()
 		return
 	end
 
-	-- Out-of-world guard (unchanged from original).
 	if not util.IsInWorld(missile:GetPos()) then
 		self:FullRemove()
 		return
@@ -247,14 +251,10 @@ end
 
 -- ============================================================
 -- DEBRIS RELEASE
--- Fix: COLLISION_GROUP_INTERACTIVE_DEBRIS does not collide with
--- world brushes in GMod's Source fork.  COLLISION_GROUP_DEBRIS_TRIGGER
--- collides with world/static props but ignores players and other
--- debris, which is the correct behaviour for falling prop junk.
 -- ============================================================
 local function ReleaseMunition(mun, scatterDir)
 	if not IsValid(mun) then return end
-	mun:SetParent(nil)   -- detach from palette before going physics
+	mun:SetParent(nil)
 	mun:SetMoveType(MOVETYPE_VPHYSICS)
 	mun:SetSolid(SOLID_VPHYSICS)
 	mun:SetCollisionGroup(COLLISION_GROUP_DEBRIS_TRIGGER)
@@ -320,7 +320,7 @@ function ENT:Detach()
 		self.ChuteClone = chuteClone
 	end
 
-	-- Palette itself becomes physics debris (already vphysics, just flip group).
+	-- Palette itself becomes physics debris.
 	self:SetCollisionGroup(COLLISION_GROUP_DEBRIS_TRIGGER)
 	local palPhys = self:GetPhysicsObject()
 	if IsValid(palPhys) then
@@ -341,7 +341,6 @@ function ENT:Detach()
 
 	sound.Play("npc/combine_soldier/zipline_clip2.wav", pos, 82, math.random(93, 110), 1.0)
 
-	-- Lifetime cleanup.
 	local debrisRefs = { self, chuteClone }
 	for i = 1, 4 do debrisRefs[#debrisRefs + 1] = self.MunitionEnts[i] end
 	timer.Simple(DEBRIS_LIFETIME + ((#self.MunitionEnts - 1) * RELEASE_STEP_DELAY), function()
