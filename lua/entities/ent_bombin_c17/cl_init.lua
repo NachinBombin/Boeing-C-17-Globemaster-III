@@ -32,15 +32,43 @@ local CARGO_LIGHT_MAX_BRIG = 1.0
 local CARGO_LIGHT_PULSE_HZ = 0.6
 
 -- ============================================================
+-- NAV / STROBE LIGHT CONSTANTS
+-- ============================================================
+-- Four lights active only while CargoDoorOpen == true.
+-- Positions are in LOCAL entity space (MODEL_SCALE = 1.8 already baked in).
+--
+--   Left  wingtip  : -Y  (port  side) → RED
+--   Right wingtip  : +Y  (starboard)  → GREEN
+--   Tail fin tip   : +X, +Z           → WHITE
+--   Nose underside : -X, -Z           → RED
+--
+-- Each light uses its own DynamicLight index slot (EntIndex + offset).
+-- Blink is a square wave: on for BLINK_ON seconds, off for BLINK_OFF seconds.
+-- ============================================================
+local NAV_BLINK_ON   = 0.07   -- seconds the light is ON  per cycle (short flash)
+local NAV_BLINK_OFF  = 0.9    -- seconds the light is OFF per cycle
+local NAV_RADIUS     = 80     -- very small — tight pinpoint
+local NAV_BRIGHTNESS = 12     -- very bright for its size
+local NAV_DECAY      = 800
+
+local NAV_LIGHTS = {
+	-- { local_offset, r, g, b, dl_slot_offset, phase_offset }
+	{ Vector(   0, -570, -15 ), 255,   0,   0, 100, 0.00 },  -- left  wingtip  RED
+	{ Vector(   0,  570, -15 ), 0,   255,   0, 101, 0.30 },  -- right wingtip  GREEN
+	{ Vector( 350,    0, 120 ), 255, 255, 255, 102, 0.60 },  -- tail fin       WHITE
+	{ Vector(-350,    0, -55 ), 255,   0,   0, 103, 0.15 },  -- nose underside RED
+}
+
+-- ============================================================
 -- CONDENSATION VAPOR CONSTANTS
 -- ============================================================
-local VAPOR_DURATION   = 1.5      -- seconds the emitter stays active
-local VAPOR_LOCAL      = Vector( -200, 0, -90 )  -- ramp mouth, local space
-local VAPOR_PER_FRAME  = 6        -- particles added per Draw() call
-local VAPOR_LIFETIME   = 0.9      -- each particle lives this long (seconds)
-local VAPOR_SIZE_START = 18       -- starting sprite size
-local VAPOR_SIZE_END   = 55       -- sprite grows as it fades
-local VAPOR_SPEED      = 90       -- base rearward drift speed
+local VAPOR_DURATION   = 1.5
+local VAPOR_LOCAL      = Vector( -200, 0, -90 )
+local VAPOR_PER_FRAME  = 6
+local VAPOR_LIFETIME   = 0.9
+local VAPOR_SIZE_START = 18
+local VAPOR_SIZE_END   = 55
+local VAPOR_SPEED      = 90
 
 function ENT:Initialize()
 	self:SetBodygroup( 1, 1 )
@@ -135,20 +163,54 @@ function ENT:UpdateCargoLight()
 end
 
 -- ============================================================
+-- NAV / STROBE LIGHTS  (wing tips, tail, nose)
+-- ============================================================
+-- Active only while CargoDoorOpen == true.
+-- Each light blinks independently using a per-light phase offset so
+-- they don't all flash simultaneously.
+-- DynamicLight() must be refreshed every frame (dietime trick).
+function ENT:UpdateNavLights()
+	if not self:GetNWBool( "CargoDoorOpen", false ) then return end
+
+	local ct      = CurTime()
+	local period  = NAV_BLINK_ON + NAV_BLINK_OFF
+	local entBase = self:EntIndex()
+
+	for _, light in ipairs( NAV_LIGHTS ) do
+		local localOff, r, g, b, slot, phase = light[1], light[2], light[3], light[4], light[5], light[6]
+
+		-- Per-light phase: offset the clock so they blink at different moments.
+		local t   = ( ct + phase ) % period
+		local isOn = ( t < NAV_BLINK_ON )
+
+		if isOn then
+			local dl = DynamicLight( entBase + slot )
+			if dl then
+				dl.pos        = self:LocalToWorld( localOff )
+				dl.r          = r
+				dl.g          = g
+				dl.b          = b
+				dl.brightness = NAV_BRIGHTNESS
+				dl.decay      = NAV_DECAY
+				dl.size       = NAV_RADIUS
+				dl.dietime    = ct + 0.1
+			end
+		end
+		-- When isOn == false we simply don't refresh the DynamicLight,
+		-- so it expires on its own after 0.1 s — effectively OFF.
+	end
+end
+
+-- ============================================================
 -- CONDENSATION VAPOR
 -- ============================================================
--- Uses a raw ParticleEmitter so we have full control over the sprite:
--- white / light-grey, soft alpha, grows as it drifts rearward.
--- No fire system is used at all.
 function ENT:StartVapor()
-	-- Destroy previous emitter if still alive.
 	if self._VaporEmitter then
 		self._VaporEmitter:Finish()
 		self._VaporEmitter = nil
 	end
 
 	local worldPos = self:LocalToWorld( VAPOR_LOCAL )
-	-- 3D emitter so particles are visible from all angles.
 	self._VaporEmitter = ParticleEmitter( worldPos, true )
 	self._VaporUntil   = CurTime() + VAPOR_DURATION
 end
@@ -157,8 +219,6 @@ function ENT:UpdateVapor()
 	if not self._VaporEmitter then return end
 
 	local ct = CurTime()
-
-	-- Once duration expires, flush the emitter and stop.
 	if ct >= self._VaporUntil then
 		self._VaporEmitter:Finish()
 		self._VaporEmitter = nil
@@ -166,34 +226,26 @@ function ENT:UpdateVapor()
 	end
 
 	local worldPos = self:LocalToWorld( VAPOR_LOCAL )
-	-- Rearward direction in world space so puffs trail behind the plane.
 	local rearDir  = self:LocalToWorldAngles( Angle( 5, 180, 0 ) ):Forward()
 
 	for _ = 1, VAPOR_PER_FRAME do
 		local p = self._VaporEmitter:Add( "particles/smokestack", worldPos )
 		if p then
-			-- White / very light grey colour.
 			local shade = math.random( 210, 255 )
 			p:SetColor( shade, shade, shade )
-			-- Semi-transparent, fades to nothing.
 			p:SetStartAlpha( math.random( 160, 200 ) )
 			p:SetEndAlpha( 0 )
-			-- Grows as it dissipates.
 			p:SetStartSize( VAPOR_SIZE_START + math.Rand( -4, 4 ) )
 			p:SetEndSize( VAPOR_SIZE_END + math.Rand( -8, 8 ) )
-			-- Lifetime.
 			p:SetLifeTime( 0 )
 			p:SetDieTime( VAPOR_LIFETIME + math.Rand( -0.2, 0.3 ) )
-			-- Velocity: rearward + small random scatter so it billows.
 			local scatter = Vector(
 				math.Rand( -25, 25 ),
 				math.Rand( -25, 25 ),
 				math.Rand(  -8, 15 )
 			)
 			p:SetVelocity( rearDir * VAPOR_SPEED + scatter )
-			-- Slight upward drift as condensation rises.
 			p:SetGravity( Vector( 0, 0, 18 ) )
-			-- Spin for a natural look.
 			p:SetRoll( math.Rand( 0, 360 ) )
 			p:SetRollDelta( math.Rand( -1.5, 1.5 ) )
 		end
@@ -215,6 +267,7 @@ function ENT:Draw()
 
 	self:UpdateCargoDoors( FrameTime() )
 	self:UpdateCargoLight()
+	self:UpdateNavLights()
 	self:UpdateVapor()
 
 	self:DrawModel()
