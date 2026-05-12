@@ -31,6 +31,7 @@ local MODEL_SCALE = 1.8
 --   W2 "heavy"    -- heavy GP / penetrators
 --   W3 "gbu53"    -- GBU-53 parachute cluster drop
 --   W6 "retarded" -- parachute / retarder bombs
+--   W7 "wp"       -- WP illumination canister (parachute)
 -- ============================================================
 
 local DART_SPEED  = 4500
@@ -113,7 +114,16 @@ local CFG_W6_Pool    = {
     "sw_bomb_mk84_air_v3",
 }
 
-local WEAPON_ROSTER = { "jassm", "heavy", "gbu53", "retarded" }
+-- ---------- W7 -- WP Illumination parachute canister ----------
+-- 4 canisters per pass, 1.5s between each drop.
+-- All spawn from the same cargo door offset as W3.
+local CFG_W7_Count          = 4
+local CFG_W7_Delay          = 1.5
+local CFG_W7_DropOffset     = Vector(0, 50, -60)
+local CFG_W7_BodyClearance  = 80
+local CFG_W7_NoCollideHold  = 1.8
+
+local WEAPON_ROSTER = { "jassm", "heavy", "gbu53", "retarded", "wp" }
 
 -- ============================================================
 -- CARGO DOOR TIMING
@@ -541,6 +551,7 @@ function ENT:UpdateWeapons(ct)
             elseif w == "heavy"    then done = self:UpdateHeavy(ct)
             elseif w == "gbu53"    then done = self:UpdateGBU53(ct)
             elseif w == "retarded" then done = self:UpdateRetarded(ct)
+            elseif w == "wp"       then done = self:UpdateWP(ct)
             end
         end
 
@@ -971,6 +982,55 @@ function ENT:UpdateRetarded(ct)
         SpawnWoodPallet(dropPos + Vector(0,0,-10), Vector(math.Rand(-50,50), math.Rand(-50,50), -60), bomb)
     end
     return (self.WPN_ShotsFired >= CFG_W6_Count)
+end
+
+-- ============================================================
+-- W7: WP ILLUMINATION CANISTER (parachute)
+-- 4 canisters per pass, 1.5s inter-drop delay.
+-- Each canister deploys its own parachute and autonomously ignites
+-- after WP_IGNITE_DELAY seconds, producing omnidirectional white
+-- phosphorus illumination.
+-- ============================================================
+function ENT:SpawnOneWP()
+    local tailWorld = self:LocalToWorld(CFG_W7_DropOffset)
+    local dropPos = Vector(
+        tailWorld.x,
+        tailWorld.y,
+        tailWorld.z - CFG_W7_BodyClearance
+    )
+    if not util.IsInWorld(dropPos) then
+        dropPos = Vector(self.CenterPos.x, self.CenterPos.y, self:GetPos().z - CFG_W7_BodyClearance)
+    end
+
+    local can = ents.Create("ent_bombin_wp_canister")
+    if not IsValid(can) then
+        self:Debug("W7 WP: ent_bombin_wp_canister not found")
+        return
+    end
+
+    can:SetPos(dropPos)
+    can:SetAngles(Angle(0, self.flightYaw, 0))
+    can:SetOwner(self)
+    can.Launcher = self
+    can:Spawn()
+    can:Activate()
+
+    local ncHandle = constraint.NoCollide(can, self, 0, 0)
+    timer.Simple(CFG_W7_NoCollideHold, function()
+        if IsValid(ncHandle) then ncHandle:Remove() end
+    end)
+
+    SpawnWoodPallet(dropPos + Vector(0,0,-15), Vector(math.Rand(-50,50), math.Rand(-50,50), -70), nil)
+    self:Debug("W7 WP canister dropped at " .. tostring(dropPos))
+end
+
+function ENT:UpdateWP(ct)
+    if self.WPN_ShotsFired >= CFG_W7_Count then return true end
+    if ct < self.WPN_NextShot then return false end
+    self.WPN_NextShot   = ct + CFG_W7_Delay
+    self.WPN_ShotsFired = self.WPN_ShotsFired + 1
+    self:SpawnOneWP()
+    return (self.WPN_ShotsFired >= CFG_W7_Count)
 end
 
 function ENT:SetVar(key, value)
