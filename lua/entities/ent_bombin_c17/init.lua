@@ -116,6 +116,18 @@ local CFG_W6_Pool    = {
 local WEAPON_ROSTER = { "jassm", "heavy", "gbu53", "retarded" }
 
 -- ============================================================
+-- CARGO DOOR TIMING
+-- Derived from cl_init.lua constants:
+--   DOOR_SPEED = 28 deg/s
+--   DOOR_TARGETS_OPEN = { 28, 28, 100 }  (three sequential bone targets)
+--   Total travel = 28+28+100 = 156 deg  =>  156/28 = 5.571 s
+-- We use 5.58 s (a small safety margin) so the door is fully open
+-- before the first shot is permitted.  Close time is symmetric.
+-- ============================================================
+local DOOR_OPEN_TIME  = 5.58
+local DOOR_CLOSE_TIME = 5.58
+
+-- ============================================================
 -- WOOD PALLET PROP
 -- ============================================================
 local PALLET_MODEL    = "models/props/de_prodigy/wood_pallet_01.mdl"
@@ -255,10 +267,18 @@ function ENT:Initialize()
     self.JitterPhase      = math.Rand(0, math.pi * 2)
     self.JitterAmplitude  = 8
 
+    -- Weapon state.
+    -- WPN_Phase values:
+    --   nil / false = idle (no active weapon)
+    --   "opening"   = door commanded open, waiting for animation to finish
+    --   "firing"    = door fully open, actively shooting
+    --   "closing"   = all shots done, door commanded closed, waiting for animation
     self.WPN_Active     = nil
+    self.WPN_Phase      = nil
     self.WPN_ShotsFired = 0
     self.WPN_NextShot   = 0
     self.WPN_WindowEnd  = 0
+    self.WPN_PhaseUntil = 0   -- time when current phase (opening/closing) finishes
     self.WPN_PeaceUntil = CurTime() + math.Rand(CFG_PeacefulMin, CFG_PeacefulMax)
 
     self.HP           = self.MaxHP
@@ -447,7 +467,7 @@ function ENT:UpdateFade(dt)
     end
 end
 
-function ENT:PickNewWeapon()
+function ENT:PickNewWeapon(ct)
     local available = {}
     for _, w in ipairs(WEAPON_ROSTER) do
         if w ~= "jassm" or self.JASSM_Stock > 0 then
@@ -457,43 +477,92 @@ function ENT:PickNewWeapon()
     if #available == 0 then return end
     local w = available[math.random(#available)]
     self.WPN_Active     = w
+    self.WPN_Phase      = "opening"
+    self.WPN_PhaseUntil = ct + DOOR_OPEN_TIME
     self.WPN_ShotsFired = 0
-    self.WPN_NextShot   = CurTime()
-    self.WPN_WindowEnd  = CurTime() + 12
-    self:Debug("Weapon window: " .. w)
+    -- WPN_NextShot and WPN_WindowEnd are set when we transition to "firing"
+    self.WPN_NextShot   = 0
+    self.WPN_WindowEnd  = 0
+    -- Open the door now so the animation starts immediately.
+    self:SetNWBool("CargoDoorOpen", true)
+    self:Debug("Weapon window: " .. w .. " | door opening for " .. DOOR_OPEN_TIME .. "s")
 end
 
+-- ============================================================
+-- UpdateWeapons  –  3-phase state machine
+--
+--  Phase "opening":
+--    Door open command sent, waiting DOOR_OPEN_TIME for the client
+--    animation to fully open before the first shot is allowed.
+--
+--  Phase "firing":
+--    Door is fully open.  Each weapon's Update* function fires its
+--    shots.  The weapon window timer only counts during this phase.
+--    When all shots are done (or the window expires), we move to
+--    "closing".
+--
+--  Phase "closing":
+--    All shots fired.  Door close command sent, waiting DOOR_CLOSE_TIME
+--    for the animation to fully close before starting the peace timer.
+--    Only after this phase ends does WPN_PeaceUntil get set.
+-- ============================================================
 function ENT:UpdateWeapons(ct)
+    -- Peace timer: nothing happens until it expires.
     if ct < self.WPN_PeaceUntil then return end
 
+    -- No active weapon: pick one if a target exists.
     if not self.WPN_Active then
         if not IsValid(self:RefreshTarget(ct)) then return end
-        self:PickNewWeapon()
+        self:PickNewWeapon(ct)
         return
     end
 
-    if ct > self.WPN_WindowEnd then
-        self.WPN_Active = nil
-        self:SetNWBool("CargoDoorOpen", false)
-        self.WPN_PeaceUntil = ct + math.Rand(CFG_PeacefulMin, CFG_PeacefulMax)
-        return
+    -- ---- Phase: opening ----
+    if self.WPN_Phase == "opening" then
+        if ct < self.WPN_PhaseUntil then return end  -- still animating
+        -- Door fully open — enter firing phase.
+        self.WPN_Phase     = "firing"
+        self.WPN_NextShot  = ct                        -- first shot may fire this tick
+        self.WPN_WindowEnd = ct + 12
+        self:Debug("Weapon window: " .. self.WPN_Active .. " | door open, firing begins")
+        -- Fall through into the firing block below.
     end
 
-    local w    = self.WPN_Active
-    local done = false
+    -- ---- Phase: firing ----
+    if self.WPN_Phase == "firing" then
+        local w    = self.WPN_Active
+        local done = false
 
-    if     w == "jassm"    then done = self:UpdateJASSM(ct)
-    elseif w == "heavy"    then done = self:UpdateHeavy(ct)
-    elseif w == "gbu53"    then done = self:UpdateGBU53(ct)
-    elseif w == "retarded" then done = self:UpdateRetarded(ct)
-    end
-
-    if done then
-        self.WPN_Active = nil
-        if w ~= "gbu53" then
-            self:SetNWBool("CargoDoorOpen", false)
+        -- Weapon window hard timeout (safety net).
+        if ct > self.WPN_WindowEnd then
+            done = true
+        else
+            if     w == "jassm"    then done = self:UpdateJASSM(ct)
+            elseif w == "heavy"    then done = self:UpdateHeavy(ct)
+            elseif w == "gbu53"    then done = self:UpdateGBU53(ct)
+            elseif w == "retarded" then done = self:UpdateRetarded(ct)
+            end
         end
+
+        if done then
+            -- All shots fired.  Close door and wait for animation.
+            self.WPN_Phase      = "closing"
+            self.WPN_PhaseUntil = ct + DOOR_CLOSE_TIME
+            self:SetNWBool("CargoDoorOpen", false)
+            self:Debug("Weapon window: " .. w .. " | shots done, door closing for " .. DOOR_CLOSE_TIME .. "s")
+        end
+        return
+    end
+
+    -- ---- Phase: closing ----
+    if self.WPN_Phase == "closing" then
+        if ct < self.WPN_PhaseUntil then return end  -- still animating
+        -- Door fully closed — start peace timer.
+        self:Debug("Weapon window: " .. self.WPN_Active .. " | door closed, peace timer started")
+        self.WPN_Active     = nil
+        self.WPN_Phase      = nil
         self.WPN_PeaceUntil = ct + math.Rand(CFG_PeacefulMin, CFG_PeacefulMax)
+        return
     end
 end
 
@@ -544,6 +613,10 @@ function ENT:DestroyPlane()
     self.Destroyed = true
     self:SetNWBool("Destroyed", true)
     self:SetNWBool("CargoDoorOpen", false)
+    -- Cancel any in-flight weapon state so UpdateWeapons never fires again.
+    self.WPN_Active     = nil
+    self.WPN_Phase      = nil
+    self.WPN_PeaceUntil = math.huge
     BroadcastTier(self, 3)
 
     if self.EngineSound then
@@ -792,7 +865,6 @@ end
 function ENT:UpdateJASSM(ct)
     if self.WPN_ShotsFired >= CFG_W1_JASSM_Count then return true end
     if ct < self.WPN_NextShot then return false end
-    if self.WPN_ShotsFired == 0 then self:SetNWBool("CargoDoorOpen", true) end
     self.WPN_NextShot   = ct + CFG_W1_JASSM_Delay
     self.WPN_ShotsFired = self.WPN_ShotsFired + 1
     self:SpawnOneJASSM(self.WPN_ShotsFired - 1)
@@ -805,7 +877,6 @@ end
 function ENT:UpdateHeavy(ct)
     if self.WPN_ShotsFired >= CFG_W2_Count then return true end
     if ct < self.WPN_NextShot then return false end
-    if self.WPN_ShotsFired == 0 then self:SetNWBool("CargoDoorOpen", true) end
     self.WPN_NextShot   = ct + CFG_W2_Delay
     self.WPN_ShotsFired = self.WPN_ShotsFired + 1
 
@@ -873,7 +944,6 @@ end
 function ENT:UpdateGBU53(ct)
     if self.WPN_ShotsFired >= CFG_W3_GBU53_Count then return true end
     if ct < self.WPN_NextShot then return false end
-    if self.WPN_ShotsFired == 0 then self:SetNWBool("CargoDoorOpen", true) end
     self.WPN_NextShot   = ct + CFG_W3_GBU53_Delay
     self.WPN_ShotsFired = self.WPN_ShotsFired + 1
     self:SpawnOneGBU53Pallet(self.WPN_ShotsFired - 1)
@@ -886,7 +956,6 @@ end
 function ENT:UpdateRetarded(ct)
     if self.WPN_ShotsFired >= CFG_W6_Count then return true end
     if ct < self.WPN_NextShot then return false end
-    if self.WPN_ShotsFired == 0 then self:SetNWBool("CargoDoorOpen", true) end
     self.WPN_NextShot   = ct + CFG_W6_Delay
     self.WPN_ShotsFired = self.WPN_ShotsFired + 1
 
