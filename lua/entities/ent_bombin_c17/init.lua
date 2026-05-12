@@ -43,12 +43,22 @@ local CFG_PeacefulMin  = 6
 local CFG_PeacefulMax  = 14
 
 -- Time (seconds) the server waits after opening the cargo door before
--- the weapon window is allowed to begin firing.  Calculated from the
--- bone animation durations at DOOR_SPEED = 28 deg/s:
---   ramp_2  28° / 28 = 1.00 s
---   ramp_1  28° / 28 = 1.00 s
---   ramp_1b 100°/ 28 = 3.57 s   → total ≈ 5.57 s  → pad to 6.0 s
+-- the staging entity is told to start sliding.  Matches the bone
+-- animation durations at DOOR_SPEED = 28 deg/s:
+--   ramp_2  28deg / 28 = 1.00 s
+--   ramp_1  28deg / 28 = 1.00 s
+--   ramp_1b 100deg/ 28 = 3.57 s  -> total ~5.57 s -> pad to 6.0 s
 local CFG_DoorOpenDuration = 6.0
+
+-- ============================================================
+-- PALLET STAGING POSITIONS  (local to plane, scale=1.8 model)
+-- These are read by ent_bombin_pallet_staged too; they are
+-- defined here as documentation / override points.
+-- ============================================================
+-- Interior rest: behind CG on cargo floor centreline.
+local PALLET_STAGE_LOCAL = Vector(200, 0, -55)
+-- Door exit: at the cargo-ramp lip where the pallet falls free.
+local PALLET_EXIT_LOCAL  = Vector(-340, 0, -68)
 
 local CFG_BombBayLocal = Vector(0, 0, -130)
 
@@ -65,7 +75,6 @@ local TARGET_PASS_BIAS           = 0.55
 -- ---------- W1 -- JASSM parachute drop ----------
 local CFG_W1_JASSM_Count      = 1
 local CFG_W1_JASSM_Delay      = 0
-local CFG_W1_JASSM_TailOffset = Vector(-360, 0, -70)
 local CFG_W1_JASSM_AltOffset  = 500
 
 local CFG_W1_JASSM_MIN_FREEFALL_CLEARANCE = 800
@@ -88,12 +97,10 @@ local CFG_W2_Pool    = {
 }
 
 -- ---------- W3 -- GBU-53 parachute cluster ----------
-local CFG_W3_GBU53_Count       = 3
-local CFG_W3_GBU53_Delay       = 1.2
-local CFG_W3_AltStagger        = 400
-local CFG_W3_DropOffset        = Vector(-180, 0, -60)
-local CFG_W3_BodyClearance     = 80
-local CFG_W3_NoCollideHoldTime = 1.8
+local CFG_W3_GBU53_Count   = 3
+local CFG_W3_GBU53_Delay   = 1.2
+local CFG_W3_AltStagger    = 400
+local CFG_W3_BodyClearance = 80
 
 -- ---------- W6 -- Retarded / Parachute bombs ----------
 local CFG_W6_Count   = 6
@@ -107,39 +114,6 @@ local CFG_W6_Pool    = {
 }
 
 local WEAPON_ROSTER = { "jassm", "heavy", "gbu53", "retarded" }
-
--- ============================================================
--- WOOD PALLET PROP
--- ============================================================
-local PALLET_MODEL        = "models/props/de_prodigy/wood_pallet_01.mdl"
-local PALLET_LIFETIME     = 20
-local PALLET_NOCLIDE_HOLD = 2.0
-
-local function SpawnWoodPallet(pos, vel, bombRef)
-    timer.Simple(0, function()
-        local p = ents.Create("prop_physics")
-        if not IsValid(p) then return end
-        p:SetModel(PALLET_MODEL)
-        p:SetPos(pos)
-        p:SetAngles(Angle(math.Rand(0,360), math.Rand(0,360), math.Rand(0,360)))
-        p:SetCollisionGroup(COLLISION_GROUP_DEBRIS_TRIGGER)
-        p:Spawn()
-        p:Activate()
-        local ph = p:GetPhysicsObject()
-        if IsValid(ph) then
-            ph:SetVelocity(vel or Vector(0,0,0))
-        end
-        if IsValid(bombRef) then
-            local ncHandle = constraint.NoCollide(p, bombRef, 0, 0)
-            timer.Simple(PALLET_NOCLIDE_HOLD, function()
-                if IsValid(ncHandle) then ncHandle:Remove() end
-            end)
-        end
-        timer.Simple(PALLET_LIFETIME, function()
-            if IsValid(p) then p:Remove() end
-        end)
-    end)
-end
 
 util.AddNetworkString("bombin_c17_damage_tier")
 util.AddNetworkString("bombin_c17_cargo_door")
@@ -246,10 +220,10 @@ function ENT:Initialize()
     self.WPN_WindowEnd      = 0
     self.WPN_PeaceUntil     = CurTime() + math.Rand(CFG_PeacefulMin, CFG_PeacefulMax)
     -- Door-open delay state.
-    -- true  = door open signal sent, waiting for animation to finish before firing.
-    -- false = door is ready / not in pre-fire wait.
     self.WPN_WaitingForDoor = false
     self.WPN_DoorReadyAt    = 0
+    -- Reference to the currently staged pallet entity.
+    self.WPN_StagedPallet   = nil
 
     self.HP           = self.MaxHP
     self.DamageTier   = 0
@@ -451,16 +425,85 @@ function ENT:PickNewWeapon()
     local w = available[math.random(#available)]
     self.WPN_Active     = w
     self.WPN_ShotsFired = 0
-    self.WPN_NextShot   = 0        -- will be set once door is ready
-    self.WPN_WindowEnd  = 0        -- will be extended once door is ready
+    self.WPN_NextShot   = 0
+    self.WPN_WindowEnd  = 0
 
-    -- Open the cargo door immediately and start the pre-fire delay.
-    -- Firing will not begin until WPN_DoorReadyAt is reached.
+    -- Open the cargo door and start the pre-fire delay.
+    -- Stage the first pallet immediately so it starts riding the plane.
     self:SetNWBool("CargoDoorOpen", true)
     self.WPN_WaitingForDoor = true
     self.WPN_DoorReadyAt    = CurTime() + CFG_DoorOpenDuration
 
-    self:Debug("Weapon window queued (door opening): " .. w)
+    -- Stage a pallet inside the plane right now so it can be seen
+    -- sliding out once the door is ready.
+    self:StagePallet(w)
+
+    self:Debug("Weapon window queued (door opening + pallet staged): " .. w)
+end
+
+-- ============================================================
+-- STAGE PALLET
+-- Creates ent_bombin_pallet_staged parented to this plane,
+-- pre-loaded with all the data the munition entity will need.
+-- Does NOT start the slide yet -- that happens in UpdateWeapons
+-- once WPN_DoorReadyAt is reached.
+-- ============================================================
+function ENT:StagePallet(weaponType)
+    -- Remove any leftover pallet from a previous cycle.
+    if IsValid(self.WPN_StagedPallet) then
+        self.WPN_StagedPallet:Remove()
+        self.WPN_StagedPallet = nil
+    end
+
+    local pallet = ents.Create("ent_bombin_pallet_staged")
+    if not IsValid(pallet) then
+        self:Debug("StagePallet: ent_bombin_pallet_staged not found -- add the entity to your addon")
+        return
+    end
+
+    pallet.PlaneEnt   = self
+    pallet.WeaponType = weaponType
+
+    -- Build ExtraData so the munition entity Initialize() can read them.
+    local callDir   = Angle(0, self.flightYaw, 0):Forward()
+    local groundZ   = self:FindGround(self.CenterPos)
+    if groundZ == -1 then groundZ = self.CenterPos.z end
+
+    local extraData = {
+        CenterPos    = self.CenterPos,
+        CallDir      = callDir,
+        Lifetime     = math.min(self.Lifetime, 60),
+        OrbitRadius  = self.OrbitRadius,
+        Speed        = 250,
+        ParentPlane  = self,
+    }
+
+    -- Weapon-specific overrides.
+    if weaponType == "gbu53" then
+        local sha = math.max(self:GetPos().z - groundZ, 1200)
+        extraData.SkyHeightAdd = sha
+        extraData.Speed        = 420
+    elseif weaponType == "jassm" then
+        local dropHeight = math.max(self:GetPos().z - groundZ, 0)
+        local shaMax     = (dropHeight - CFG_W1_JASSM_MIN_FREEFALL_CLEARANCE) / 1.25
+        local sha        = math.max(shaMax, CFG_W1_JASSM_SHA_FLOOR)
+        extraData.SkyHeightAdd = sha
+        extraData.Speed        = 250
+        extraData.OrbitRadius  = self.OrbitRadius * 0.75
+    end
+
+    pallet.ExtraData = extraData
+
+    -- Place it at the stage-local position in world-space so it gets
+    -- the right initial world position before SetParent is called
+    -- inside Initialize().
+    pallet:SetPos(self:LocalToWorld(PALLET_STAGE_LOCAL))
+    pallet:SetAngles(self:GetAngles())
+    pallet:Spawn()
+    pallet:Activate()
+
+    self.WPN_StagedPallet = pallet
+    self:Debug("Pallet staged inside fuselage for weapon: " .. weaponType)
 end
 
 -- ============================================================
@@ -475,18 +518,22 @@ function ENT:UpdateWeapons(ct)
         return
     end
 
-    -- Door is still opening — wait before firing.
+    -- Door is still opening -- wait before sliding.
     if self.WPN_WaitingForDoor then
         if ct < self.WPN_DoorReadyAt then return end
-        -- Door animation has finished.  Arm the firing clock.
+        -- Door animation has finished.  Tell the staged pallet to slide.
         self.WPN_WaitingForDoor = false
         self.WPN_NextShot       = ct
         self.WPN_WindowEnd      = ct + 12
-        self:Debug("Door open — weapon window active: " .. self.WPN_Active)
+        if IsValid(self.WPN_StagedPallet) then
+            self.WPN_StagedPallet:SlideToExit(ct)
+        end
+        self:Debug("Door open -- pallet sliding to exit: " .. self.WPN_Active)
     end
 
     if ct > self.WPN_WindowEnd then
         self.WPN_Active = nil
+        self.WPN_StagedPallet = nil
         self:SetNWBool("CargoDoorOpen", false)
         self.WPN_PeaceUntil = ct + math.Rand(CFG_PeacefulMin, CFG_PeacefulMax)
         return
@@ -502,7 +549,8 @@ function ENT:UpdateWeapons(ct)
     end
 
     if done then
-        self.WPN_Active = nil
+        self.WPN_Active       = nil
+        self.WPN_StagedPallet = nil
         if w ~= "gbu53" then
             self:SetNWBool("CargoDoorOpen", false)
         end
@@ -559,6 +607,12 @@ function ENT:DestroyPlane()
     self:SetNWBool("CargoDoorOpen", false)
     BroadcastTier(self, 3)
 
+    -- Remove any staged pallet.
+    if IsValid(self.WPN_StagedPallet) then
+        self.WPN_StagedPallet:Remove()
+        self.WPN_StagedPallet = nil
+    end
+
     if self.EngineSound then
         self.EngineSound:Stop()
         self.EngineSound = nil
@@ -600,6 +654,9 @@ function ENT:OnRemove()
     if self.EngineSound then
         self.EngineSound:Stop()
         self.EngineSound = nil
+    end
+    if IsValid(self.WPN_StagedPallet) then
+        self.WPN_StagedPallet:Remove()
     end
 end
 
@@ -650,72 +707,39 @@ function ENT:GetAimPos(scatter)
 end
 
 -- ============================================================
--- SPAWN HELPERS
+-- SPAWN HELPERS  (used by heavy / retarded which have no loitering brain)
+-- The pallet itself is already staged and slides out.  These helpers
+-- spawn the actual bomb entity and attach it to the staged pallet as
+-- a child so it exits the cargo bay with the pallet, then falls free.
 -- ============================================================
-function ENT:SpawnDartBomb(entClass, dropPos, targetPos, isRetarded)
+function ENT:AttachBombToPallet(pallet, entClass, isRetarded)
+    if not IsValid(pallet) then return nil end
     local bomb = ents.Create(entClass)
     if not IsValid(bomb) then
-        self:Debug("SpawnDartBomb: class not found: " .. tostring(entClass))
+        self:Debug("AttachBombToPallet: class not found: " .. tostring(entClass))
         return nil
     end
     bomb.IsOnPlane = true
     bomb.Launcher  = self
     bomb:SetOwner(self)
-    local toTarget = targetPos - dropPos
-    local dropAng
-    if toTarget:LengthSqr() > 1 then
-        toTarget:Normalize()
-        dropAng = toTarget:Angle()
-    else
-        dropAng = Angle(90, 0, 0)
-    end
-    bomb:SetPos(dropPos)
-    bomb:SetAngles(dropAng)
+
+    local worldPos = pallet:GetPos()
+    bomb:SetPos(worldPos)
+    bomb:SetAngles(Angle(90, self.flightYaw, 0))
     bomb:Spawn()
     bomb:Activate()
     if isRetarded then bomb:SetBodygroup(1, 1) end
 
-    local handle = constraint.NoCollide(bomb, self, 0, 0)
-    timer.Simple(0.6, function()
-        if IsValid(handle) then handle:Remove() end
-    end)
+    -- Parent to pallet so it rides the slide.
+    bomb:SetMoveType(MOVETYPE_NONE)
+    bomb:SetSolid(SOLID_NONE)
+    bomb:SetCollisionGroup(COLLISION_GROUP_NONE)
+    bomb:SetParent(pallet)
+    bomb:SetLocalPos(Vector(0, 0, 0))
+    bomb:SetLocalAngles(Angle(90, 0, 0))
 
-    local bPhys = bomb:GetPhysicsObject()
-    if IsValid(bPhys) then
-        bPhys:SetVelocity(CalcDartVelocity(dropPos, targetPos))
-    end
-
-    if bomb.Arm then bomb:Arm()
-    elseif bomb.Armed ~= nil then bomb.Armed = true end
-
-    return bomb
-end
-
-function ENT:SpawnCarpetBomb(entClass, dropPos, aimPos)
-    local bomb = ents.Create(entClass)
-    if not IsValid(bomb) then
-        self:Debug("SpawnCarpetBomb: class not found: " .. tostring(entClass))
-        return nil
-    end
-    bomb.IsOnPlane = true
-    bomb.Launcher  = self
-    bomb:SetOwner(self)
-    bomb:SetPos(dropPos)
-    bomb:SetAngles(Angle(90, self.flightYaw, 0))
-    bomb:Spawn()
-    bomb:Activate()
-
-    local handle = constraint.NoCollide(bomb, self, 0, 0)
-    timer.Simple(0.6, function()
-        if IsValid(handle) then handle:Remove() end
-    end)
-
-    local bPhys = bomb:GetPhysicsObject()
-    if IsValid(bPhys) then
-        local aircraftFwd = Angle(0, self.flightYaw, 0):Forward() * self.Speed
-        aircraftFwd.z = 0
-        bPhys:SetVelocity(CalcCarpetImpulse(dropPos, aimPos, aircraftFwd))
-    end
+    -- Store reference so Release() can enable physics on it.
+    pallet.BombEnt = bomb
 
     if bomb.Arm then bomb:Arm()
     elseif bomb.Armed ~= nil then bomb.Armed = true end
@@ -724,92 +748,26 @@ function ENT:SpawnCarpetBomb(entClass, dropPos, aimPos)
 end
 
 -- ============================================================
--- W1: JASSM PARACHUTE DROP
+-- W1: JASSM
+-- The pallet is already staged by StagePallet().  UpdateJASSM just
+-- guards the stock and returns done when count is reached.
 -- ============================================================
-function ENT:SpawnOneJASSM(dropIndex)
-    dropIndex = dropIndex or 0
-
-    local tailWorld = self:LocalToWorld(CFG_W1_JASSM_TailOffset)
-    local dropPos = Vector(tailWorld.x, tailWorld.y, tailWorld.z - (dropIndex * CFG_W1_JASSM_AltOffset))
-    if not util.IsInWorld(dropPos) then
-        dropPos = Vector(self.CenterPos.x, self.CenterPos.y, self:GetPos().z - (dropIndex * CFG_W1_JASSM_AltOffset))
-    end
-
-    local missile = ents.Create("ent_bombin_jassm_owned")
-    if not IsValid(missile) then
-        self:Debug("W1 JASSM: ent_bombin_jassm_owned not found - dependency missing")
-        return
-    end
-
-    local callDir = Angle(0, self.flightYaw, 0):Forward()
-    local groundZ = self:FindGround(dropPos)
-    if groundZ == -1 then groundZ = self.CenterPos.z end
-    local dropHeight = math.max(dropPos.z - groundZ, 0)
-
-    if dropHeight < CFG_W1_JASSM_MIN_DROP_HEIGHT then
-        self:Debug("W1 JASSM: drop altitude too low (" .. math.Round(dropHeight) .. "u), aborting drop")
-        return
-    end
-
-    local shaMax = (dropHeight - CFG_W1_JASSM_MIN_FREEFALL_CLEARANCE) / 1.25
-    local sha    = math.max(shaMax, CFG_W1_JASSM_SHA_FLOOR)
-
-    missile:SetPos(dropPos)
-    missile:SetAngles(callDir:Angle())
-    missile.SpawnedFromPlane = true
-    missile.CenterPos    = self.CenterPos
-    missile.CallDir      = callDir
-    missile.Lifetime     = math.min(self.Lifetime, 35)
-    missile.Speed        = 250
-    missile.OrbitRadius  = self.OrbitRadius * 0.75
-    missile.SkyHeightAdd = sha
-    missile:SetOwner(self)
-    missile.IsOnPlane = true
-    missile.Launcher  = self
-    missile:Spawn()
-    missile:Activate()
-
-    local mHandle = constraint.NoCollide(missile, self, 0, 0)
-    timer.Simple(1.25, function()
-        if IsValid(mHandle) then mHandle:Remove() end
-    end)
-
-    local chute = ents.Create("ent_bombin_jassm_chute_owned")
-    if IsValid(chute) then
-        chute:SetOwner(missile)
-        chute:SetPos(dropPos + Vector(0, 0, 105))
-        chute:SetAngles(Angle(0, self.flightYaw, 0))
-        chute:Spawn()
-        chute:Activate()
-        local cPlaneHandle   = constraint.NoCollide(chute, self, 0, 0)
-        local cMissileHandle = constraint.NoCollide(chute, missile, 0, 0)
-        timer.Simple(1.25, function()
-            if IsValid(cPlaneHandle)   then cPlaneHandle:Remove()   end
-            if IsValid(cMissileHandle) then cMissileHandle:Remove() end
-        end)
-    else
-        self:Debug("W1 JASSM: ent_bombin_jassm_chute_owned not found - chute missing")
-    end
-
-    SpawnWoodPallet(dropPos + Vector(0,0,-20), Vector(math.Rand(-60,60), math.Rand(-60,60), -80), nil)
-
-    if self.JASSM_Stock > 0 then
-        self.JASSM_Stock = self.JASSM_Stock - 1
-    end
-    self:Debug("W1 JASSM drop #" .. (dropIndex+1) .. " pos=" .. tostring(dropPos) .. " SHA=" .. math.Round(sha) .. " dropHeight=" .. math.Round(dropHeight))
-end
-
 function ENT:UpdateJASSM(ct)
     if self.WPN_ShotsFired >= CFG_W1_JASSM_Count then return true end
     if ct < self.WPN_NextShot then return false end
     self.WPN_NextShot   = ct + CFG_W1_JASSM_Delay
     self.WPN_ShotsFired = self.WPN_ShotsFired + 1
-    self:SpawnOneJASSM(self.WPN_ShotsFired - 1)
+
+    if self.JASSM_Stock > 0 then self.JASSM_Stock = self.JASSM_Stock - 1 end
+    self:Debug("W1 JASSM pallet dispatched (stock=" .. self.JASSM_Stock .. ")")
     return (self.WPN_ShotsFired >= CFG_W1_JASSM_Count)
 end
 
 -- ============================================================
 -- W2: HEAVY ORDNANCE
+-- The pallet slides out; on the first shot the actual bomb entity is
+-- attached to the pallet as a parented child.  Subsequent shots reuse
+-- the same slide (only 1 pallet per window for heavy loads).
 -- ============================================================
 function ENT:UpdateHeavy(ct)
     if self.WPN_ShotsFired >= CFG_W2_Count then return true end
@@ -817,73 +775,49 @@ function ENT:UpdateHeavy(ct)
     self.WPN_NextShot   = ct + CFG_W2_Delay
     self.WPN_ShotsFired = self.WPN_ShotsFired + 1
 
-    local entry     = CFG_W2_Pool[math.random(#CFG_W2_Pool)]
-    local dropPos   = self:LocalToWorld(CFG_BombBayLocal)
-    local targetPos = self:GetAimPos(CFG_W2_Scatter)
-    local bomb      = self:SpawnDartBomb(entry.class, dropPos, targetPos, entry.retarded)
-    SpawnWoodPallet(dropPos + Vector(0,0,-10), Vector(math.Rand(-80,80), math.Rand(-80,80), -60), bomb)
+    -- Attach the bomb to the staged pallet on the first shot.
+    -- For subsequent shots the same pallet may already be sliding /
+    -- released; stage a fresh one.
+    if self.WPN_ShotsFired == 1 then
+        local entry = CFG_W2_Pool[math.random(#CFG_W2_Pool)]
+        if IsValid(self.WPN_StagedPallet) then
+            self:AttachBombToPallet(self.WPN_StagedPallet, entry.class, entry.retarded)
+        end
+    else
+        -- Multi-shot heavy: stage an additional pallet for the next bomb.
+        self:StagePallet("heavy")
+        if IsValid(self.WPN_StagedPallet) then
+            self.WPN_StagedPallet:SlideToExit(ct)
+            local entry = CFG_W2_Pool[math.random(#CFG_W2_Pool)]
+            self:AttachBombToPallet(self.WPN_StagedPallet, entry.class, entry.retarded)
+        end
+    end
+
     return (self.WPN_ShotsFired >= CFG_W2_Count)
 end
 
 -- ============================================================
--- W3: GBU-53 PARACHUTE CLUSTER DROP
+-- W3: GBU-53 PARACHUTE CLUSTER
+-- Each pallet is staged independently with a small alt-stagger via
+-- extra slide delay.  The gbu53_owned entity on the pallet handles
+-- its own freefall -> ignition -> orbit -> dive cycle.
 -- ============================================================
-function ENT:SpawnOneGBU53Pallet(palletIndex)
-    palletIndex = palletIndex or 0
-
-    local tailWorld = self:LocalToWorld(CFG_W3_DropOffset)
-    local dropPos = Vector(
-        tailWorld.x,
-        tailWorld.y,
-        tailWorld.z - CFG_W3_BodyClearance - (palletIndex * CFG_W3_AltStagger)
-    )
-    if not util.IsInWorld(dropPos) then
-        dropPos = Vector(self.CenterPos.x, self.CenterPos.y, self:GetPos().z - CFG_W3_BodyClearance - (palletIndex * CFG_W3_AltStagger))
-    end
-
-    local pallet = ents.Create("ent_bombin_gbu53_owned")
-    if not IsValid(pallet) then
-        self:Debug("W3 GBU53: ent_bombin_gbu53_owned not found")
-        return
-    end
-
-    local callDir = Angle(0, self.flightYaw, 0):Forward()
-
-    pallet:SetPos(dropPos)
-    pallet:SetAngles(Angle(0, self.flightYaw, 0))
-    pallet.SpawnedFromPlane = true
-    pallet.CenterPos    = self.CenterPos
-    pallet.CallDir      = callDir
-    pallet.Lifetime     = math.min(self.Lifetime, 60)
-    pallet.Speed        = 420
-    pallet.OrbitRadius  = self.OrbitRadius
-    local groundZ = self:FindGround(dropPos)
-    if groundZ == -1 then
-        pallet.SkyHeightAdd = 1200
-    else
-        pallet.SkyHeightAdd = math.max(dropPos.z - groundZ, 1200)
-    end
-    pallet:SetOwner(self)
-    pallet.IsOnPlane = true
-    pallet.Launcher  = self
-    pallet:Spawn()
-    pallet:Activate()
-
-    local pHandle = constraint.NoCollide(pallet, self, 0, 0)
-    timer.Simple(CFG_W3_NoCollideHoldTime, function()
-        if IsValid(pHandle) then pHandle:Remove() end
-    end)
-
-    SpawnWoodPallet(dropPos + Vector(0,0,-15), Vector(math.Rand(-50,50), math.Rand(-50,50), -70), nil)
-    self:Debug("W3 GBU53 pallet #" .. (palletIndex+1) .. " dropped at " .. tostring(dropPos))
-end
-
 function ENT:UpdateGBU53(ct)
     if self.WPN_ShotsFired >= CFG_W3_GBU53_Count then return true end
     if ct < self.WPN_NextShot then return false end
     self.WPN_NextShot   = ct + CFG_W3_GBU53_Delay
     self.WPN_ShotsFired = self.WPN_ShotsFired + 1
-    self:SpawnOneGBU53Pallet(self.WPN_ShotsFired - 1)
+
+    -- First pallet is already staged and sliding (from PickNewWeapon).
+    -- Additional pallets get staged and slid now.
+    if self.WPN_ShotsFired > 1 then
+        self:StagePallet("gbu53")
+        if IsValid(self.WPN_StagedPallet) then
+            self.WPN_StagedPallet:SlideToExit(ct)
+        end
+    end
+
+    self:Debug("W3 GBU53 pallet #" .. self.WPN_ShotsFired .. " sliding")
     return (self.WPN_ShotsFired >= CFG_W3_GBU53_Count)
 end
 
@@ -897,12 +831,19 @@ function ENT:UpdateRetarded(ct)
     self.WPN_ShotsFired = self.WPN_ShotsFired + 1
 
     local entClass = CFG_W6_Pool[math.random(#CFG_W6_Pool)]
-    local dropPos   = self:LocalToWorld(CFG_BombBayLocal)
-    local aimPos    = self:GetAimPos(CFG_W6_Scatter)
-    local bomb      = self:SpawnDartBomb(entClass, dropPos, aimPos, true)
+
     if self.WPN_ShotsFired == 1 then
-        SpawnWoodPallet(dropPos + Vector(0,0,-10), Vector(math.Rand(-50,50), math.Rand(-50,50), -60), bomb)
+        if IsValid(self.WPN_StagedPallet) then
+            self:AttachBombToPallet(self.WPN_StagedPallet, entClass, true)
+        end
+    else
+        self:StagePallet("retarded")
+        if IsValid(self.WPN_StagedPallet) then
+            self.WPN_StagedPallet:SlideToExit(ct)
+            self:AttachBombToPallet(self.WPN_StagedPallet, entClass, true)
+        end
     end
+
     return (self.WPN_ShotsFired >= CFG_W6_Count)
 end
 
