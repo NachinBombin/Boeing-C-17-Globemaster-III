@@ -2,34 +2,27 @@
 -- ent_bombin_gbu53_chute_owned  --  SERVER
 -- Palette / chute / 4x visual munition combo for C-17 GBU-53.
 --
--- Root entity: small visible-sized bbox physics cube.
---   base_anim (shared.lua) ensures ENT:OnTakeDamage fires for
---   bullets, explosions and hitscan on the root.
--- Child hitboxes (chute sphere, pallet cube): damage routed via
---   hook.Add("EntityTakeDamage") keyed to entity references.
---   This is the only reliable method for prop_physics children
---   because the Lua .OnTakeDamage field does NOT override the
---   C++ damage pathway on base_entity/prop_physics.
+-- Visual fire damage system mirrors single GBU (ent_bombin_gbu53_owned):
+--   CalcPalletTier / CalcChuteTier -> BroadcastPalletTier / BroadcastChuteTier
+--   broadcast net msgs on every HP change -> client drives CreateParticleSystem.
 -- ============================================================
 
 AddCSLuaFile("cl_init.lua")
 AddCSLuaFile("shared.lua")
 include("shared.lua")
 
-util.AddNetworkString("bombin_gbu53chute_damage_tier")
+util.AddNetworkString("bombin_gbu53chute_damage_tier")   -- legacy, kept for safety
+util.AddNetworkString("bombin_gbu53chute_pallet_tier")   -- pallet fire tiers 0-3
+util.AddNetworkString("bombin_gbu53chute_chute_tier")    -- chute  smoke/fire tiers 0-2
 
--- Physics root model. Must be non-trivially scaled so the physobj
--- has a real surface area for bullet traces and explosion radii.
 local ROOT_MODEL     = "models/hunter/blocks/cube1x1x1.mdl"
 local PALLET_MODEL   = "models/props_phx/construct/metal_wire1x1x2.mdl"
 local MUNITION_MODEL = "models/sw/usa/bombs/guided/gbu53.mdl"
 local CHUTE_MODEL    = "models/v92/parachutez/flying.mdl"
 
-local PALLET_SCALE   = 1.0
-local MUNITION_SCALE = 1.0
-local CHUTE_SCALE    = 2.2
--- Root physics cube scale: roughly matches pallet footprint.
--- Invisible (RENDERMODE_NONE) but sized so traces actually hit it.
+local PALLET_SCALE    = 1.0
+local MUNITION_SCALE  = 1.0
+local CHUTE_SCALE     = 2.2
 local ROOT_PHYS_SCALE = 1.6
 
 local CHUTE_ABOVE_PALETTE   = Vector(0, 0, 90)
@@ -69,6 +62,38 @@ local DEBRIS_LIFETIME    = 14
 local RELEASE_STEP_DELAY = 0.5
 
 -- ============================================================
+-- TIER HELPERS  (identical pattern to ent_bombin_gbu53_owned)
+-- ============================================================
+local function CalcPalletTier(hp, maxHP)
+	local frac = hp / maxHP
+	if frac > 0.66 then return 0 end
+	if frac > 0.33 then return 1 end
+	if hp   > 0    then return 2 end
+	return 3
+end
+
+local function CalcChuteTier(hp, maxHP)
+	local frac = hp / maxHP
+	if frac > 0.5  then return 0 end
+	if hp   > 0    then return 1 end
+	return 2
+end
+
+local function BroadcastPalletTier(ent, tier)
+	net.Start("bombin_gbu53chute_pallet_tier")
+		net.WriteUInt(ent:EntIndex(), 16)
+		net.WriteUInt(tier, 2)
+	net.Broadcast()
+end
+
+local function BroadcastChuteTier(ent, tier)
+	net.Start("bombin_gbu53chute_chute_tier")
+		net.WriteUInt(ent:EntIndex(), 16)
+		net.WriteUInt(tier, 2)
+	net.Broadcast()
+end
+
+-- ============================================================
 -- HELPERS
 -- ============================================================
 local function SafeAttacker(ent)
@@ -88,8 +113,6 @@ end
 -- ============================================================
 function ENT:Initialize()
 	self:SetModel(ROOT_MODEL)
-	-- Scale must be real (non-trivial) so the physobj has surface
-	-- area that bullet traces and explosion BlastDamage can reach.
 	self:SetModelScale(ROOT_PHYS_SCALE, 0)
 	self:SetRenderMode(RENDERMODE_NONE)
 	self:DrawShadow(false)
@@ -99,7 +122,6 @@ function ENT:Initialize()
 	self:SetSolid(SOLID_VPHYSICS)
 	self:SetCollisionGroup(COLLISION_GROUP_NONE)
 
-	-- Synchronous state init (Think may fire before timer.Simple(0))
 	self.SwayClock    = math.Rand(0, math.pi * 2)
 	self.MunitionEnts = {}
 	self.PalletVisual = nil
@@ -112,8 +134,13 @@ function ENT:Initialize()
 	self.PalletDead   = false
 	self.HP_Chute     = HP_CHUTE
 	self.HP_Pallet    = HP_PALLET
+	self.PalletTier   = 0
+	self.ChuteTier    = 0
 	self.SpawnTime    = CurTime()
 	self.PhysVz       = -10
+
+	self:SetNWInt("HP_Pallet", HP_PALLET)
+	self:SetNWInt("HP_Chute",  HP_CHUTE)
 
 	local phys = self:GetPhysicsObject()
 	if IsValid(phys) then
@@ -134,25 +161,20 @@ function ENT:Initialize()
 end
 
 -- ============================================================
--- DAMAGE HOOK REGISTRATION
+-- DAMAGE HOOK
 -- ============================================================
--- prop_physics does NOT call ENT:OnTakeDamage via Lua override.
--- The only reliable method is hook.Add("EntityTakeDamage") with
--- a reference check. We register one hook per combo instance,
--- keyed by EntIndex, and remove it on cleanup.
 function ENT:RegisterDamageHook()
-	local comboRef  = self
-	local hookName  = "GBU53Chute_Damage_" .. self:EntIndex()
+	local comboRef = self
+	local hookName = "GBU53Chute_Damage_" .. self:EntIndex()
 
 	hook.Add("EntityTakeDamage", hookName, function(target, dmginfo)
 		if not IsValid(comboRef) then
 			hook.Remove("EntityTakeDamage", hookName)
 			return
 		end
-
 		if target == comboRef.ChuteHitbox then
 			comboRef:TakeChuteHit(dmginfo:GetDamage())
-			dmginfo:SetDamage(0)  -- suppress default prop damage
+			dmginfo:SetDamage(0)
 		elseif target == comboRef.PalletHitbox then
 			comboRef:TakePalletHit(dmginfo:GetDamage())
 			dmginfo:SetDamage(0)
@@ -171,7 +193,6 @@ function ENT:SpawnChildren()
 	local basePos  = self:GetPos()
 	local baseAng  = self:GetAngles()
 
-	-- Visual pallet (original model), parented, non-solid.
 	local palVis = ents.Create("prop_physics")
 	if IsValid(palVis) then
 		palVis:SetModel(PALLET_MODEL)
@@ -190,7 +211,6 @@ function ENT:SpawnChildren()
 		self.PalletVisual = palVis
 	end
 
-	-- Visual chute, parented, non-solid.
 	local chute = ents.Create("prop_physics")
 	if IsValid(chute) then
 		chute:SetModel(CHUTE_MODEL)
@@ -209,8 +229,6 @@ function ENT:SpawnChildren()
 		self.ChuteEnt = chute
 	end
 
-	-- Invisible chute hitbox: SOLID_VPHYSICS sphere.
-	-- Damage is intercepted via EntityTakeDamage hook (see RegisterDamageHook).
 	local cHitbox = ents.Create("prop_physics")
 	if IsValid(cHitbox) then
 		cHitbox:SetModel("models/hunter/misc/sphere075x075.mdl")
@@ -238,7 +256,6 @@ function ENT:SpawnChildren()
 		end
 	end
 
-	-- Invisible pallet hitbox: SOLID_VPHYSICS box.
 	local pHitbox = ents.Create("prop_physics")
 	if IsValid(pHitbox) then
 		pHitbox:SetModel("models/hunter/blocks/cube075x075x075.mdl")
@@ -266,7 +283,6 @@ function ENT:SpawnChildren()
 		end
 	end
 
-	-- Visual munition props, parented, non-solid.
 	for i = 1, 4 do
 		local mun = ents.Create("prop_physics")
 		if not IsValid(mun) then continue end
@@ -307,16 +323,31 @@ end
 function ENT:TakeChuteHit(dmg)
 	if IsImmune(self) or self.ChuteDead or self.PalletDead then return end
 	self.HP_Chute = self.HP_Chute - dmg
+	self:SetNWInt("HP_Chute", math.max(0, self.HP_Chute))
+
+	local tier = CalcChuteTier(math.max(0, self.HP_Chute), HP_CHUTE)
+	if tier ~= self.ChuteTier then
+		self.ChuteTier = tier
+		BroadcastChuteTier(self, tier)
+	end
+
 	if self.HP_Chute <= 0 then self:DestroyChute() end
 end
 
 function ENT:TakePalletHit(dmg)
 	if IsImmune(self) or self.PalletDead then return end
 	self.HP_Pallet = self.HP_Pallet - dmg
+	self:SetNWInt("HP_Pallet", math.max(0, self.HP_Pallet))
+
+	local tier = CalcPalletTier(math.max(0, self.HP_Pallet), HP_PALLET)
+	if tier ~= self.PalletTier then
+		self.PalletTier = tier
+		BroadcastPalletTier(self, tier)
+	end
+
 	if self.HP_Pallet <= 0 then self:DestroyPallet() end
 end
 
--- Damage to root entity itself (direct hits, blast radius hitting root).
 function ENT:OnTakeDamage(dmginfo)
 	self:TakePalletHit(dmginfo:GetDamage())
 end
@@ -327,6 +358,9 @@ end
 function ENT:DestroyChute()
 	if self.ChuteDead then return end
 	self.ChuteDead = true
+
+	-- Clear chute fire particle on all clients.
+	BroadcastChuteTier(self, 0)
 
 	if IsValid(self.ChuteHitbox) then
 		self.ChuteHitbox:SetParent(nil)
@@ -352,7 +386,9 @@ function ENT:DestroyPallet()
 	self.PalletDead = true
 	self.Detached   = true
 
-	if IsValid(self.DamageHookName) then end  -- handled in OnRemove
+	-- Clear all fire particles on all clients.
+	BroadcastPalletTier(self, 0)
+	BroadcastChuteTier(self, 0)
 
 	local pos = self:GetPos()
 	local ang = self:GetAngles()
