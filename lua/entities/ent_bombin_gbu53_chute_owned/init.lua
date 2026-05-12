@@ -2,13 +2,14 @@
 -- ent_bombin_gbu53_chute_owned  --  SERVER
 -- Palette / chute / 4x visual munition combo for C-17 GBU-53.
 --
--- Root entity: invisible physics cube (guaranteed convex hull).
--- Visual pallet model spawned as a parented child at local (0,0,0)
--- so it renders at the root position without being the physobj.
---
--- Physics: Think() at 20 Hz, phys:SetVelocity() for smooth fall.
--- Sway: SetAngles() each tick -- NOT AddAngleVelocity which
--- accumulates and causes violent spinning.
+-- Root entity: small visible-sized bbox physics cube.
+--   base_anim (shared.lua) ensures ENT:OnTakeDamage fires for
+--   bullets, explosions and hitscan on the root.
+-- Child hitboxes (chute sphere, pallet cube): damage routed via
+--   hook.Add("EntityTakeDamage") keyed to entity references.
+--   This is the only reliable method for prop_physics children
+--   because the Lua .OnTakeDamage field does NOT override the
+--   C++ damage pathway on base_entity/prop_physics.
 -- ============================================================
 
 AddCSLuaFile("cl_init.lua")
@@ -17,16 +18,19 @@ include("shared.lua")
 
 util.AddNetworkString("bombin_gbu53chute_damage_tier")
 
--- Physics root: guaranteed convex hull, invisible.
-local ROOT_MODEL    = "models/hunter/blocks/cube1x1x1.mdl"
--- Visual pallet rendered as a parented child.
-local PALLET_MODEL  = "models/props_phx/construct/metal_wire1x1x2.mdl"
+-- Physics root model. Must be non-trivially scaled so the physobj
+-- has a real surface area for bullet traces and explosion radii.
+local ROOT_MODEL     = "models/hunter/blocks/cube1x1x1.mdl"
+local PALLET_MODEL   = "models/props_phx/construct/metal_wire1x1x2.mdl"
 local MUNITION_MODEL = "models/sw/usa/bombs/guided/gbu53.mdl"
 local CHUTE_MODEL    = "models/v92/parachutez/flying.mdl"
 
 local PALLET_SCALE   = 1.0
 local MUNITION_SCALE = 1.0
 local CHUTE_SCALE    = 2.2
+-- Root physics cube scale: roughly matches pallet footprint.
+-- Invisible (RENDERMODE_NONE) but sized so traces actually hit it.
+local ROOT_PHYS_SCALE = 1.6
 
 local CHUTE_ABOVE_PALETTE   = Vector(0, 0, 90)
 local PALETTE_ABOVE_MISSILE = Vector(0, 0, 110)
@@ -44,22 +48,20 @@ local HP_PALLET = 50
 
 local SPAWN_IMMUNITY = 1.8
 
--- Drag: k * vz^2 opposes gravity.  Terminal ~90 u/s.
-local CHUTE_DRAG_K       = 0.074
-local CHUTE_TERMINAL_VEL = -90
-local FREEFALL_TERMINAL_VEL = -1800
+local CHUTE_DRAG_K           = 0.074
+local CHUTE_TERMINAL_VEL     = -90
+local FREEFALL_TERMINAL_VEL  = -1800
 
 local GROUND_DETONATE_DIST   = 80
 local GBU_EXPLODE_DAMAGE     = 600
 local GBU_EXPLODE_RADIUS     = 800
 local GBU_EXPLODE_STEP_DELAY = 0.18
 
-local PALLET_EXPLODE_DAMAGE = 300
-local PALLET_EXPLODE_RADIUS = 600
+local PALLET_EXPLODE_DAMAGE  = 300
+local PALLET_EXPLODE_RADIUS  = 600
 
--- Sway: gentle pitch oscillation only. No angular velocity.
-local SWAY_AMP  = 3.0   -- degrees
-local SWAY_RATE = 0.8   -- Hz
+local SWAY_AMP   = 3.0
+local SWAY_RATE  = 0.8
 
 local THINK_DT           = 1 / 20
 local CHILD_NOCLIP_HOLD  = 1.8
@@ -85,9 +87,10 @@ end
 -- INITIALIZE
 -- ============================================================
 function ENT:Initialize()
-	-- Invisible physics root with guaranteed convex hull.
 	self:SetModel(ROOT_MODEL)
-	self:SetModelScale(0.01, 0)
+	-- Scale must be real (non-trivial) so the physobj has surface
+	-- area that bullet traces and explosion BlastDamage can reach.
+	self:SetModelScale(ROOT_PHYS_SCALE, 0)
 	self:SetRenderMode(RENDERMODE_NONE)
 	self:DrawShadow(false)
 
@@ -96,7 +99,7 @@ function ENT:Initialize()
 	self:SetSolid(SOLID_VPHYSICS)
 	self:SetCollisionGroup(COLLISION_GROUP_NONE)
 
-	-- All state MUST be set synchronously before NextThink fires.
+	-- Synchronous state init (Think may fire before timer.Simple(0))
 	self.SwayClock    = math.Rand(0, math.pi * 2)
 	self.MunitionEnts = {}
 	self.PalletVisual = nil
@@ -115,15 +118,15 @@ function ENT:Initialize()
 	local phys = self:GetPhysicsObject()
 	if IsValid(phys) then
 		phys:Wake()
-		phys:EnableGravity(false)  -- Z controlled manually
+		phys:EnableGravity(false)
 		phys:SetDamping(0, 0)
 		phys:SetVelocity(Vector(0, 0, -10))
 	end
 
-	-- Children need one frame for Activate() to settle.
 	timer.Simple(0, function()
 		if not IsValid(self) then return end
 		self:SpawnChildren()
+		self:RegisterDamageHook()
 	end)
 
 	self:EmitSound("npc/combine_soldier/zipline_clip1.wav", 75, 108, 0.85)
@@ -131,7 +134,36 @@ function ENT:Initialize()
 end
 
 -- ============================================================
--- CHILDREN + HITBOXES
+-- DAMAGE HOOK REGISTRATION
+-- ============================================================
+-- prop_physics does NOT call ENT:OnTakeDamage via Lua override.
+-- The only reliable method is hook.Add("EntityTakeDamage") with
+-- a reference check. We register one hook per combo instance,
+-- keyed by EntIndex, and remove it on cleanup.
+function ENT:RegisterDamageHook()
+	local comboRef  = self
+	local hookName  = "GBU53Chute_Damage_" .. self:EntIndex()
+
+	hook.Add("EntityTakeDamage", hookName, function(target, dmginfo)
+		if not IsValid(comboRef) then
+			hook.Remove("EntityTakeDamage", hookName)
+			return
+		end
+
+		if target == comboRef.ChuteHitbox then
+			comboRef:TakeChuteHit(dmginfo:GetDamage())
+			dmginfo:SetDamage(0)  -- suppress default prop damage
+		elseif target == comboRef.PalletHitbox then
+			comboRef:TakePalletHit(dmginfo:GetDamage())
+			dmginfo:SetDamage(0)
+		end
+	end)
+
+	self.DamageHookName = hookName
+end
+
+-- ============================================================
+-- CHILDREN
 -- ============================================================
 function ENT:SpawnChildren()
 	local missile  = self:GetOwner()
@@ -139,7 +171,7 @@ function ENT:SpawnChildren()
 	local basePos  = self:GetPos()
 	local baseAng  = self:GetAngles()
 
-	-- Visual pallet prop (the original model), parented to root.
+	-- Visual pallet (original model), parented, non-solid.
 	local palVis = ents.Create("prop_physics")
 	if IsValid(palVis) then
 		palVis:SetModel(PALLET_MODEL)
@@ -158,7 +190,7 @@ function ENT:SpawnChildren()
 		self.PalletVisual = palVis
 	end
 
-	-- Visual chute.
+	-- Visual chute, parented, non-solid.
 	local chute = ents.Create("prop_physics")
 	if IsValid(chute) then
 		chute:SetModel(CHUTE_MODEL)
@@ -177,7 +209,8 @@ function ENT:SpawnChildren()
 		self.ChuteEnt = chute
 	end
 
-	-- Invisible chute hitbox.
+	-- Invisible chute hitbox: SOLID_VPHYSICS sphere.
+	-- Damage is intercepted via EntityTakeDamage hook (see RegisterDamageHook).
 	local cHitbox = ents.Create("prop_physics")
 	if IsValid(cHitbox) then
 		cHitbox:SetModel("models/hunter/misc/sphere075x075.mdl")
@@ -196,13 +229,6 @@ function ENT:SpawnChildren()
 		cHitbox:SetLocalAngles(Angle(0, 0, 0))
 		self.ChuteHitbox = cHitbox
 
-		local comboRef = self
-		cHitbox.OnTakeDamage = function(hb, dmginfo)
-			if IsValid(comboRef) then
-				comboRef:TakeChuteHit(dmginfo:GetDamage())
-			end
-		end
-
 		if IsValid(launcher) then
 			constraint.NoCollide(cHitbox, launcher, 0, 0)
 			local ref = cHitbox
@@ -212,7 +238,7 @@ function ENT:SpawnChildren()
 		end
 	end
 
-	-- Invisible pallet hitbox.
+	-- Invisible pallet hitbox: SOLID_VPHYSICS box.
 	local pHitbox = ents.Create("prop_physics")
 	if IsValid(pHitbox) then
 		pHitbox:SetModel("models/hunter/blocks/cube075x075x075.mdl")
@@ -231,13 +257,6 @@ function ENT:SpawnChildren()
 		pHitbox:SetLocalAngles(Angle(0, 0, 0))
 		self.PalletHitbox = pHitbox
 
-		local comboRef = self
-		pHitbox.OnTakeDamage = function(hb, dmginfo)
-			if IsValid(comboRef) then
-				comboRef:TakePalletHit(dmginfo:GetDamage())
-			end
-		end
-
 		if IsValid(launcher) then
 			constraint.NoCollide(pHitbox, launcher, 0, 0)
 			local ref = pHitbox
@@ -247,7 +266,7 @@ function ENT:SpawnChildren()
 		end
 	end
 
-	-- Visual munition props.
+	-- Visual munition props, parented, non-solid.
 	for i = 1, 4 do
 		local mun = ents.Create("prop_physics")
 		if not IsValid(mun) then continue end
@@ -297,6 +316,7 @@ function ENT:TakePalletHit(dmg)
 	if self.HP_Pallet <= 0 then self:DestroyPallet() end
 end
 
+-- Damage to root entity itself (direct hits, blast radius hitting root).
 function ENT:OnTakeDamage(dmginfo)
 	self:TakePalletHit(dmginfo:GetDamage())
 end
@@ -331,6 +351,8 @@ function ENT:DestroyPallet()
 	if self.PalletDead then return end
 	self.PalletDead = true
 	self.Detached   = true
+
+	if IsValid(self.DamageHookName) then end  -- handled in OnRemove
 
 	local pos = self:GetPos()
 	local ang = self:GetAngles()
@@ -443,7 +465,6 @@ function ENT:Think()
 			return true
 		end
 
-		-- Integrate Z with quadratic drag.
 		local vz = self.PhysVz or -10
 		if not self.ChuteDead then
 			local dragDelta = CHUTE_DRAG_K * vz * vz * THINK_DT
@@ -454,7 +475,6 @@ function ENT:Think()
 		end
 		self.PhysVz = vz
 
-		-- XY: track missile lateral position.
 		local targetXY = missile:GetPos() + PALETTE_ABOVE_MISSILE
 		local curPos   = self:GetPos()
 		local vx = (targetXY.x - curPos.x) * 12
@@ -465,11 +485,9 @@ function ENT:Think()
 			if phys:IsAsleep() then phys:Wake() end
 			phys:SetVelocity(Vector(vx, vy, vz))
 		else
-			-- SetPos fallback.
 			self:SetPos(Vector(targetXY.x, targetXY.y, curPos.z + vz * THINK_DT))
 		end
 
-		-- Sway: direct SetAngles, never AddAngleVelocity (causes spin).
 		if not self.ChuteDead then
 			self.SwayClock = (self.SwayClock or 0) + SWAY_RATE * THINK_DT
 			local pitch    = math.sin(self.SwayClock) * SWAY_AMP
@@ -478,7 +496,6 @@ function ENT:Think()
 		end
 	end
 
-	-- Ground detonation while free-falling.
 	if self.ChuteDead and not self.Detached then
 		local pos = self:GetPos()
 		local tr  = util.TraceLine({
@@ -650,10 +667,16 @@ function ENT:FullRemove()
 			self.MunitionEnts[i] = nil
 		end
 	end
+	if self.DamageHookName then
+		hook.Remove("EntityTakeDamage", self.DamageHookName)
+	end
 	self:Remove()
 end
 
 function ENT:OnRemove()
+	if self.DamageHookName then
+		hook.Remove("EntityTakeDamage", self.DamageHookName)
+	end
 	if self.Detached then return end
 	for _, field in ipairs({"PalletVisual", "ChuteEnt", "ChuteHitbox", "PalletHitbox", "ChuteClone"}) do
 		if IsValid(self[field]) then
