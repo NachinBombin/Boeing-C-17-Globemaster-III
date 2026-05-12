@@ -34,21 +34,17 @@ local CARGO_LIGHT_PULSE_HZ = 0.6
 -- ============================================================
 -- NAV / STROBE LIGHT CONSTANTS
 -- ============================================================
--- DynamicLight slots: we use (EntIndex() * 10 + slotOffset) to avoid
--- collisions with other entities. slotOffset 0-3 for our four lights.
--- Blink: ON for 0.12 s, OFF for 0.85 s per cycle.
 local NAV_BLINK_ON   = 0.12
 local NAV_BLINK_OFF  = 0.85
 local NAV_RADIUS     = 80
 local NAV_BRIGHTNESS = 14
 local NAV_DECAY      = 600
 
--- { local_offset, r, g, b, slotOffset, phaseOffset }
 local NAV_LIGHTS = {
-	{ Vector(   0, -570, -15 ), 255,   0,   0, 0, 0.00 },  -- left  wingtip  RED
-	{ Vector(   0,  570, -15 ),   0, 255,   0, 1, 0.32 },  -- right wingtip  GREEN
-	{ Vector( 350,    0, 120 ), 255, 255, 255, 2, 0.64 },  -- tail fin       WHITE
-	{ Vector(-350,    0, -55 ), 255,   0,   0, 3, 0.16 },  -- nose underside RED
+	{ Vector(   0, -570, -15 ), 255,   0,   0, 0, 0.00 },
+	{ Vector(   0,  570, -15 ),   0, 255,   0, 1, 0.32 },
+	{ Vector( 350,    0, 120 ), 255, 255, 255, 2, 0.64 },
+	{ Vector(-350,    0, -55 ), 255,   0,   0, 3, 0.16 },
 }
 
 -- ============================================================
@@ -61,9 +57,7 @@ local VAPOR_LIFETIME   = 0.9
 local VAPOR_SIZE_START = 18
 local VAPOR_SIZE_END   = 55
 local VAPOR_SPEED      = 90
--- Soft white circle sprite guaranteed to exist in every GMod install.
--- SetLighting(false) prevents world shadows from darkening the sprites.
-local VAPOR_SPRITE = "particle/particle_smokegrenade"
+local VAPOR_SPRITE     = "particle/particle_smokegrenade"
 
 function ENT:Initialize()
 	self:SetBodygroup( 1, 1 )
@@ -165,7 +159,6 @@ function ENT:UpdateNavLights()
 
 	local ct      = CurTime()
 	local period  = NAV_BLINK_ON + NAV_BLINK_OFF
-	-- Use EntIndex * 10 so each plane's slots are well separated.
 	local base    = self:EntIndex() * 10
 
 	for _, light in ipairs( NAV_LIGHTS ) do
@@ -184,7 +177,7 @@ function ENT:UpdateNavLights()
 				dl.brightness = NAV_BRIGHTNESS
 				dl.decay      = NAV_DECAY
 				dl.size       = NAV_RADIUS
-				dl.dietime    = ct + 0.2  -- slightly longer than one frame
+				dl.dietime    = ct + 0.2
 			end
 		end
 	end
@@ -199,11 +192,9 @@ function ENT:StartVapor()
 		self._VaporEmitter = nil
 	end
 
-	local worldPos         = self:LocalToWorld( VAPOR_LOCAL )
-	self._VaporEmitter     = ParticleEmitter( worldPos, true )
-	-- Disable world lighting so sprites stay white regardless of map brightness.
-	self._VaporEmitter:SetLighting( false )
-	self._VaporUntil       = CurTime() + VAPOR_DURATION
+	local worldPos     = self:LocalToWorld( VAPOR_LOCAL )
+	self._VaporEmitter = ParticleEmitter( worldPos, true )
+	self._VaporUntil   = CurTime() + VAPOR_DURATION
 end
 
 function ENT:UpdateVapor()
@@ -230,6 +221,7 @@ function ENT:UpdateVapor()
 			p:SetEndSize( VAPOR_SIZE_END + math.Rand( -8, 8 ) )
 			p:SetLifeTime( 0 )
 			p:SetDieTime( VAPOR_LIFETIME + math.Rand( -0.2, 0.3 ) )
+			p:SetLighting( false )  -- per-particle, this IS valid
 			local scatter = Vector(
 				math.Rand( -25, 25 ),
 				math.Rand( -25, 25 ),
