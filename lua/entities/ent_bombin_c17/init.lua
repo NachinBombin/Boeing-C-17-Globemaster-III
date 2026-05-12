@@ -92,12 +92,12 @@ local CFG_W2_Pool    = {
 }
 
 -- ---------- W3 -- GBU-53 parachute cluster ----------
--- AltStagger staggers each successive pallet further below the drop
--- point so they separate cleanly during free-fall before chute deploy.
--- This is intentional, not a geometry error.
+-- All 3 pallets spawn from the same cargo door position.
+-- Separation happens naturally from the 1.2s inter-shot delay
+-- (CFG_W3_GBU53_Delay): by the time pallet 2 drops, pallet 1 is
+-- already 1.2 seconds into freefall and well clear of the door.
 local CFG_W3_GBU53_Count       = 3
 local CFG_W3_GBU53_Delay       = 1.2
-local CFG_W3_AltStagger        = 400
 local CFG_W3_DropOffset        = Vector(0, 50, -60)
 local CFG_W3_BodyClearance     = 80
 local CFG_W3_NoCollideHoldTime = 1.8
@@ -489,7 +489,7 @@ function ENT:PickNewWeapon(ct)
 end
 
 -- ============================================================
--- UpdateWeapons  –  3-phase state machine
+-- UpdateWeapons  -  3-phase state machine
 --
 --  Phase "opening":
 --    Door open command sent, waiting DOOR_OPEN_TIME for the client
@@ -520,7 +520,7 @@ function ENT:UpdateWeapons(ct)
     -- ---- Phase: opening ----
     if self.WPN_Phase == "opening" then
         if ct < self.WPN_PhaseUntil then return end  -- still animating
-        -- Door fully open — enter firing phase.
+        -- Door fully open - enter firing phase.
         self.WPN_Phase     = "firing"
         self.WPN_NextShot  = ct                        -- first shot may fire this tick
         self.WPN_WindowEnd = ct + 12
@@ -557,7 +557,7 @@ function ENT:UpdateWeapons(ct)
     -- ---- Phase: closing ----
     if self.WPN_Phase == "closing" then
         if ct < self.WPN_PhaseUntil then return end  -- still animating
-        -- Door fully closed — start peace timer.
+        -- Door fully closed - start peace timer.
         self:Debug("Weapon window: " .. self.WPN_Active .. " | door closed, peace timer started")
         self.WPN_Active     = nil
         self.WPN_Phase      = nil
@@ -891,17 +891,21 @@ end
 -- ============================================================
 -- W3: GBU-53 PARACHUTE CLUSTER DROP
 -- ============================================================
-function ENT:SpawnOneGBU53Pallet(palletIndex)
-    palletIndex = palletIndex or 0
-
+function ENT:SpawnOneGBU53Pallet()
+    -- FIX: All pallets spawn from the same cargo door position.
+    -- The original code applied palletIndex * CFG_W3_AltStagger as a
+    -- vertical offset at spawn time, placing pallets 2 and 3 hundreds
+    -- of units below the fuselage before freefall even started.
+    -- The 1.2s inter-shot delay (CFG_W3_GBU53_Delay) already ensures
+    -- each pallet has physically separated before the next one drops.
     local tailWorld = self:LocalToWorld(CFG_W3_DropOffset)
     local dropPos = Vector(
         tailWorld.x,
         tailWorld.y,
-        tailWorld.z - CFG_W3_BodyClearance - (palletIndex * CFG_W3_AltStagger)
+        tailWorld.z - CFG_W3_BodyClearance
     )
     if not util.IsInWorld(dropPos) then
-        dropPos = Vector(self.CenterPos.x, self.CenterPos.y, self:GetPos().z - CFG_W3_BodyClearance - (palletIndex * CFG_W3_AltStagger))
+        dropPos = Vector(self.CenterPos.x, self.CenterPos.y, self:GetPos().z - CFG_W3_BodyClearance)
     end
 
     local pallet = ents.Create("ent_bombin_gbu53_owned")
@@ -938,7 +942,7 @@ function ENT:SpawnOneGBU53Pallet(palletIndex)
     end)
 
     SpawnWoodPallet(dropPos + Vector(0,0,-15), Vector(math.Rand(-50,50), math.Rand(-50,50), -70), nil)
-    self:Debug("W3 GBU53 pallet #" .. (palletIndex+1) .. " dropped at " .. tostring(dropPos))
+    self:Debug("W3 GBU53 pallet dropped at " .. tostring(dropPos))
 end
 
 function ENT:UpdateGBU53(ct)
@@ -946,7 +950,7 @@ function ENT:UpdateGBU53(ct)
     if ct < self.WPN_NextShot then return false end
     self.WPN_NextShot   = ct + CFG_W3_GBU53_Delay
     self.WPN_ShotsFired = self.WPN_ShotsFired + 1
-    self:SpawnOneGBU53Pallet(self.WPN_ShotsFired - 1)
+    self:SpawnOneGBU53Pallet()
     return (self.WPN_ShotsFired >= CFG_W3_GBU53_Count)
 end
 
