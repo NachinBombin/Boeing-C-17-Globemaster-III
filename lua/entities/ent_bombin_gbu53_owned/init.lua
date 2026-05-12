@@ -29,7 +29,7 @@ local IGNITION_ALT_FRAC    = 0.35
 local ORBIT_ALT_RISE       = 600
 
 local SALVO_COUNT          = 4
-local SALVO_DELAY_BASE     = 0.5
+local SALVO_DELAY_BASE     = 1.0
 local SALVO_DELAY_JITTER   = 0.0
 
 local IGNITION_EFFECT_NAME        = "MuzzleFlash"
@@ -316,6 +316,12 @@ end
 
 -- ============================================================
 -- SALVO SPAWN
+-- Fix: each child reads the pallet's LIVE world position at the moment
+-- its timer fires.  The pallet (ChuteEnt, an ent_bombin_gbu53_chute_owned)
+-- is in freefall and moves continuously, so computing releasePos up-front
+-- (or via planeEnt:LocalToWorld at callback time) gives the wrong origin
+-- for munitions 2-4.  Reading self.ChuteEnt:GetPos() inside the callback
+-- guarantees every munition starts from the pallet's current position.
 -- ============================================================
 function ENT:SpawnSalvo( planeEnt )
 	for i = 2, SALVO_COUNT do
@@ -324,19 +330,15 @@ function ENT:SpawnSalvo( planeEnt )
 		timer.Simple( delay, function()
 			if not IsValid( self ) then return end
 
-			local offIdx    = ((capturedI - 2) % #SALVO_PALLET_OFFSETS) + 1
-			local palletOff = SALVO_PALLET_OFFSETS[offIdx]
+			-- Read the pallet's live position at the moment this timer fires.
+			-- The pallet is still falling, so this is always the correct origin.
 			local releasePos
-
-			if IsValid( planeEnt ) then
-				releasePos = planeEnt:LocalToWorld( palletOff )
+			if IsValid( self.ChuteEnt ) then
+				releasePos = self.ChuteEnt:GetPos()
 			else
-				local scatter = Vector( math.Rand(-120,120), math.Rand(-120,120), 0 )
-				releasePos = Vector(
-					self.BaseCenterPos.x + scatter.x,
-					self.BaseCenterPos.y + scatter.y,
-					self.IgnitionAlt
-				)
+				-- Fallback: pallet already gone (early ignition edge-case).
+				-- Use the missile's own current position.
+				releasePos = self:GetPos()
 			end
 
 			local child = ents.Create( "ent_bombin_gbu53_owned" )
