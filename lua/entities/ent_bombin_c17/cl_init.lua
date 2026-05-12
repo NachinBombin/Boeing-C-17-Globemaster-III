@@ -12,8 +12,8 @@ local FAN_RPM         = 900
 -- ============================================================
 -- CARGO DOOR CONSTANTS
 -- ============================================================
-local DOOR_SPEED     = 28
-local DOOR_THRESHOLD = 1.0
+local DOOR_SPEED        = 28
+local DOOR_THRESHOLD    = 1.0
 local DOOR_TARGETS_OPEN = { 28, 28, 100 }
 local DOOR_BONES = {
 	"c17.ramp_2_move",
@@ -34,12 +34,13 @@ local CARGO_LIGHT_PULSE_HZ = 0.6
 -- ============================================================
 -- CONDENSATION VAPOR CONSTANTS
 -- ============================================================
--- A ParticleEffect is attached to the entity so it follows the plane.
--- We create one emitter that auto-stops after VAPOR_DURATION seconds.
-local VAPOR_DURATION    = 1.5
-local VAPOR_LOCAL       = Vector( -200, 0, -90 )  -- ramp mouth in local space
-
-game.AddParticles( "particles/fire_01.pcf" )  -- already loaded; no duplicate cost
+local VAPOR_DURATION   = 1.5      -- seconds the emitter stays active
+local VAPOR_LOCAL      = Vector( -200, 0, -90 )  -- ramp mouth, local space
+local VAPOR_PER_FRAME  = 6        -- particles added per Draw() call
+local VAPOR_LIFETIME   = 0.9      -- each particle lives this long (seconds)
+local VAPOR_SIZE_START = 18       -- starting sprite size
+local VAPOR_SIZE_END   = 55       -- sprite grows as it fades
+local VAPOR_SPEED      = 90       -- base rearward drift speed
 
 function ENT:Initialize()
 	self:SetBodygroup( 1, 1 )
@@ -49,8 +50,8 @@ function ENT:Initialize()
 	self._DoorStage   = 0
 	self._DoorWasOpen = false
 
-	self._VaporEffect  = nil   -- active CNewParticleEffect handle
-	self._VaporStopAt  = 0     -- CurTime() when we call StopEmission
+	self._VaporEmitter = nil
+	self._VaporUntil   = 0
 end
 
 -- ============================================================
@@ -136,46 +137,66 @@ end
 -- ============================================================
 -- CONDENSATION VAPOR
 -- ============================================================
--- Creates a ParticleEffect that is attached to the entity origin so it
--- moves with the plane.  After VAPOR_DURATION seconds StopEmission()
--- is called so no new particles are spawned, but existing ones fade out
--- naturally still attached to the entity.
+-- Uses a raw ParticleEmitter so we have full control over the sprite:
+-- white / light-grey, soft alpha, grows as it drifts rearward.
+-- No fire system is used at all.
 function ENT:StartVapor()
-	-- Stop any previously running vapor first.
-	if IsValid( self._VaporEffect ) then
-		self._VaporEffect:StopEmission()
-		self._VaporEffect = nil
+	-- Destroy previous emitter if still alive.
+	if self._VaporEmitter then
+		self._VaporEmitter:Finish()
+		self._VaporEmitter = nil
 	end
 
-	-- CreateParticleEffect returns a CNewParticleEffect.
-	-- PATTACH_POINT_FOLLOW keeps the control point locked to the entity
-	-- so every particle origin follows the plane.
-	local fx = self:CreateParticleEffect( "fire_medium_02", PATTACH_ABSORIGIN_FOLLOW, 0 )
-	if not IsValid( fx ) then return end
-
-	-- Override control point 0 to the ramp mouth in world space.
-	-- We update this every frame in Draw() so it tracks the bone.
-	fx:SetControlPoint( 0, self:LocalToWorld( VAPOR_LOCAL ) )
-
-	-- Use a white/grey tint so it reads as steam, not fire.
-	-- Control point 1 is the colour tint for fire_medium_02.
-	fx:SetControlPoint( 1, Vector( 220, 220, 220 ) )
-
-	self._VaporEffect = fx
-	self._VaporStopAt = CurTime() + VAPOR_DURATION
+	local worldPos = self:LocalToWorld( VAPOR_LOCAL )
+	-- 3D emitter so particles are visible from all angles.
+	self._VaporEmitter = ParticleEmitter( worldPos, true )
+	self._VaporUntil   = CurTime() + VAPOR_DURATION
 end
 
 function ENT:UpdateVapor()
-	if not IsValid( self._VaporEffect ) then return end
+	if not self._VaporEmitter then return end
 
-	-- Keep the emitter origin glued to the ramp mouth.
-	self._VaporEffect:SetControlPoint( 0, self:LocalToWorld( VAPOR_LOCAL ) )
+	local ct = CurTime()
 
-	-- Stop emitting once the duration has elapsed; particles already
-	-- spawned will continue to drift and fade with the plane.
-	if CurTime() >= self._VaporStopAt then
-		self._VaporEffect:StopEmission()
-		self._VaporEffect = nil
+	-- Once duration expires, flush the emitter and stop.
+	if ct >= self._VaporUntil then
+		self._VaporEmitter:Finish()
+		self._VaporEmitter = nil
+		return
+	end
+
+	local worldPos = self:LocalToWorld( VAPOR_LOCAL )
+	-- Rearward direction in world space so puffs trail behind the plane.
+	local rearDir  = self:LocalToWorldAngles( Angle( 5, 180, 0 ) ):Forward()
+
+	for _ = 1, VAPOR_PER_FRAME do
+		local p = self._VaporEmitter:Add( "particles/smokestack", worldPos )
+		if p then
+			-- White / very light grey colour.
+			local shade = math.random( 210, 255 )
+			p:SetColor( shade, shade, shade )
+			-- Semi-transparent, fades to nothing.
+			p:SetStartAlpha( math.random( 160, 200 ) )
+			p:SetEndAlpha( 0 )
+			-- Grows as it dissipates.
+			p:SetStartSize( VAPOR_SIZE_START + math.Rand( -4, 4 ) )
+			p:SetEndSize( VAPOR_SIZE_END + math.Rand( -8, 8 ) )
+			-- Lifetime.
+			p:SetLifeTime( 0 )
+			p:SetDieTime( VAPOR_LIFETIME + math.Rand( -0.2, 0.3 ) )
+			-- Velocity: rearward + small random scatter so it billows.
+			local scatter = Vector(
+				math.Rand( -25, 25 ),
+				math.Rand( -25, 25 ),
+				math.Rand(  -8, 15 )
+			)
+			p:SetVelocity( rearDir * VAPOR_SPEED + scatter )
+			-- Slight upward drift as condensation rises.
+			p:SetGravity( Vector( 0, 0, 18 ) )
+			-- Spin for a natural look.
+			p:SetRoll( math.Rand( 0, 360 ) )
+			p:SetRollDelta( math.Rand( -1.5, 1.5 ) )
+		end
 	end
 end
 
@@ -229,6 +250,7 @@ end
 -- ============================================================
 -- DAMAGE FX (unchanged)
 -- ============================================================
+game.AddParticles( "particles/fire_01.pcf" )
 PrecacheParticleSystem( "fire_medium_02" )
 
 local TIER_OFFSETS = {
