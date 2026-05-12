@@ -34,29 +34,21 @@ local CARGO_LIGHT_PULSE_HZ = 0.6
 -- ============================================================
 -- NAV / STROBE LIGHT CONSTANTS
 -- ============================================================
--- Four lights active only while CargoDoorOpen == true.
--- Positions are in LOCAL entity space (MODEL_SCALE = 1.8 already baked in).
---
---   Left  wingtip  : -Y  (port  side) → RED
---   Right wingtip  : +Y  (starboard)  → GREEN
---   Tail fin tip   : +X, +Z           → WHITE
---   Nose underside : -X, -Z           → RED
---
--- Each light uses its own DynamicLight index slot (EntIndex + offset).
--- Blink is a square wave: on for BLINK_ON seconds, off for BLINK_OFF seconds.
--- ============================================================
-local NAV_BLINK_ON   = 0.07   -- seconds the light is ON  per cycle (short flash)
-local NAV_BLINK_OFF  = 0.9    -- seconds the light is OFF per cycle
-local NAV_RADIUS     = 80     -- very small — tight pinpoint
-local NAV_BRIGHTNESS = 12     -- very bright for its size
-local NAV_DECAY      = 800
+-- DynamicLight slots: we use (EntIndex() * 10 + slotOffset) to avoid
+-- collisions with other entities. slotOffset 0-3 for our four lights.
+-- Blink: ON for 0.12 s, OFF for 0.85 s per cycle.
+local NAV_BLINK_ON   = 0.12
+local NAV_BLINK_OFF  = 0.85
+local NAV_RADIUS     = 80
+local NAV_BRIGHTNESS = 14
+local NAV_DECAY      = 600
 
+-- { local_offset, r, g, b, slotOffset, phaseOffset }
 local NAV_LIGHTS = {
-	-- { local_offset, r, g, b, dl_slot_offset, phase_offset }
-	{ Vector(   0, -570, -15 ), 255,   0,   0, 100, 0.00 },  -- left  wingtip  RED
-	{ Vector(   0,  570, -15 ), 0,   255,   0, 101, 0.30 },  -- right wingtip  GREEN
-	{ Vector( 350,    0, 120 ), 255, 255, 255, 102, 0.60 },  -- tail fin       WHITE
-	{ Vector(-350,    0, -55 ), 255,   0,   0, 103, 0.15 },  -- nose underside RED
+	{ Vector(   0, -570, -15 ), 255,   0,   0, 0, 0.00 },  -- left  wingtip  RED
+	{ Vector(   0,  570, -15 ),   0, 255,   0, 1, 0.32 },  -- right wingtip  GREEN
+	{ Vector( 350,    0, 120 ), 255, 255, 255, 2, 0.64 },  -- tail fin       WHITE
+	{ Vector(-350,    0, -55 ), 255,   0,   0, 3, 0.16 },  -- nose underside RED
 }
 
 -- ============================================================
@@ -69,6 +61,9 @@ local VAPOR_LIFETIME   = 0.9
 local VAPOR_SIZE_START = 18
 local VAPOR_SIZE_END   = 55
 local VAPOR_SPEED      = 90
+-- Soft white circle sprite guaranteed to exist in every GMod install.
+-- SetLighting(false) prevents world shadows from darkening the sprites.
+local VAPOR_SPRITE = "particle/particle_smokegrenade"
 
 function ENT:Initialize()
 	self:SetBodygroup( 1, 1 )
@@ -163,41 +158,35 @@ function ENT:UpdateCargoLight()
 end
 
 -- ============================================================
--- NAV / STROBE LIGHTS  (wing tips, tail, nose)
+-- NAV / STROBE LIGHTS
 -- ============================================================
--- Active only while CargoDoorOpen == true.
--- Each light blinks independently using a per-light phase offset so
--- they don't all flash simultaneously.
--- DynamicLight() must be refreshed every frame (dietime trick).
 function ENT:UpdateNavLights()
 	if not self:GetNWBool( "CargoDoorOpen", false ) then return end
 
 	local ct      = CurTime()
 	local period  = NAV_BLINK_ON + NAV_BLINK_OFF
-	local entBase = self:EntIndex()
+	-- Use EntIndex * 10 so each plane's slots are well separated.
+	local base    = self:EntIndex() * 10
 
 	for _, light in ipairs( NAV_LIGHTS ) do
-		local localOff, r, g, b, slot, phase = light[1], light[2], light[3], light[4], light[5], light[6]
+		local lpos, r, g, b, slot, phase = light[1], light[2], light[3], light[4], light[5], light[6]
 
-		-- Per-light phase: offset the clock so they blink at different moments.
-		local t   = ( ct + phase ) % period
+		local t    = ( ct + phase * period ) % period
 		local isOn = ( t < NAV_BLINK_ON )
 
 		if isOn then
-			local dl = DynamicLight( entBase + slot )
+			local dl = DynamicLight( base + slot )
 			if dl then
-				dl.pos        = self:LocalToWorld( localOff )
+				dl.pos        = self:LocalToWorld( lpos )
 				dl.r          = r
 				dl.g          = g
 				dl.b          = b
 				dl.brightness = NAV_BRIGHTNESS
 				dl.decay      = NAV_DECAY
 				dl.size       = NAV_RADIUS
-				dl.dietime    = ct + 0.1
+				dl.dietime    = ct + 0.2  -- slightly longer than one frame
 			end
 		end
-		-- When isOn == false we simply don't refresh the DynamicLight,
-		-- so it expires on its own after 0.1 s — effectively OFF.
 	end
 end
 
@@ -210,9 +199,11 @@ function ENT:StartVapor()
 		self._VaporEmitter = nil
 	end
 
-	local worldPos = self:LocalToWorld( VAPOR_LOCAL )
-	self._VaporEmitter = ParticleEmitter( worldPos, true )
-	self._VaporUntil   = CurTime() + VAPOR_DURATION
+	local worldPos         = self:LocalToWorld( VAPOR_LOCAL )
+	self._VaporEmitter     = ParticleEmitter( worldPos, true )
+	-- Disable world lighting so sprites stay white regardless of map brightness.
+	self._VaporEmitter:SetLighting( false )
+	self._VaporUntil       = CurTime() + VAPOR_DURATION
 end
 
 function ENT:UpdateVapor()
@@ -229,7 +220,7 @@ function ENT:UpdateVapor()
 	local rearDir  = self:LocalToWorldAngles( Angle( 5, 180, 0 ) ):Forward()
 
 	for _ = 1, VAPOR_PER_FRAME do
-		local p = self._VaporEmitter:Add( "particles/smokestack", worldPos )
+		local p = self._VaporEmitter:Add( VAPOR_SPRITE, worldPos )
 		if p then
 			local shade = math.random( 210, 255 )
 			p:SetColor( shade, shade, shade )
