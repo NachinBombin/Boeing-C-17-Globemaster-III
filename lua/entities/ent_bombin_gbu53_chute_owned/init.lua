@@ -348,18 +348,14 @@ function ENT:TakePalletHit(dmg)
 	if self.HP_Pallet <= 0 then self:DestroyPallet() end
 end
 
-function ENT:OnTakeDamage(dmginfo)
-	self:TakePalletHit(dmginfo:GetDamage())
-end
-
 -- ============================================================
--- CHUTE DESTROYED
+-- DESTROY CHUTE
 -- ============================================================
 function ENT:DestroyChute()
 	if self.ChuteDead then return end
 	self.ChuteDead = true
 
-	-- Clear chute fire particle on all clients.
+	-- Stop chute particles on all clients
 	BroadcastChuteTier(self, 0)
 
 	if IsValid(self.ChuteHitbox) then
@@ -367,26 +363,28 @@ function ENT:DestroyChute()
 		self.ChuteHitbox:Remove()
 		self.ChuteHitbox = nil
 	end
+
 	if IsValid(self.ChuteEnt) then
 		self.ChuteEnt:SetParent(nil)
 		self.ChuteEnt:Remove()
 		self.ChuteEnt = nil
 	end
 
-	FireExplosionEffect(self:GetPos() + CHUTE_ABOVE_PALETTE, 1.0)
-	sound.Play("ambient/explosions/explode_" .. math.random(1, 5) .. ".wav",
-		self:GetPos(), 110, math.random(100, 118), 0.8)
+	local pos = self:GetPos()
+	sound.Play("physics/metal/metal_canister_impact_hard" .. math.random(1,3) .. ".wav",
+		pos, 85, math.random(80, 100), 1.0)
 end
 
 -- ============================================================
--- PALLET DESTROYED
+-- DESTROY PALLET (mid-air hit)
 -- ============================================================
 function ENT:DestroyPallet()
 	if self.PalletDead then return end
-	self.PalletDead = true
-	self.Detached   = true
+	self.PalletDead  = true
+	self.Detached    = true
+	self.MunitionEnts = self.MunitionEnts or {}  -- guard: may be nil if damaged before SpawnChildren
 
-	-- Clear all fire particles on all clients.
+	-- Clear all fire particles on all clients
 	BroadcastPalletTier(self, 0)
 	BroadcastChuteTier(self, 0)
 
@@ -539,8 +537,9 @@ function ENT:Think()
 			endpos = pos + Vector(0, 0, -(GROUND_DETONATE_DIST + 10)),
 			filter = function(e)
 				if e == self then return false end
+				local mEnts = self.MunitionEnts or {}
 				for i = 1, 4 do
-					if e == self.MunitionEnts[i] then return false end
+					if e == mEnts[i] then return false end
 				end
 				if e == self.PalletHitbox then return false end
 				return true
@@ -599,7 +598,8 @@ end
 -- ============================================================
 function ENT:Detach()
 	if self.Detached then return end
-	self.Detached = true
+	self.Detached     = true
+	self.MunitionEnts = self.MunitionEnts or {}  -- guard
 
 	for _, field in ipairs({"ChuteHitbox", "PalletHitbox"}) do
 		if IsValid(self[field]) then
@@ -686,8 +686,9 @@ end
 -- CLEANUP
 -- ============================================================
 function ENT:FullRemove()
-	self.Detached   = true
-	self.PalletDead = true
+	self.Detached     = true
+	self.PalletDead   = true
+	self.MunitionEnts = self.MunitionEnts or {}  -- guard
 
 	for _, field in ipairs({"PalletVisual", "ChuteEnt", "ChuteHitbox", "PalletHitbox", "ChuteClone"}) do
 		if IsValid(self[field]) then
