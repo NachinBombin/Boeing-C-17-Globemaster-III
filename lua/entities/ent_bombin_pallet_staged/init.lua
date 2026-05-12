@@ -39,9 +39,12 @@ local SLIDE_DURATION = 2.4
 -- +Y  = nose/forward   -Y = tail/aft   -Z = belly-down
 --
 -- Interior rest: on the cargo floor, aft of CG.
-local PALLET_STAGE_LOCAL = Vector(0, -160, -55)
+-- Z = +45: raised +100 from previous -55 to sit on cargo floor,
+--          not clip through the belly skin.
+local PALLET_STAGE_LOCAL = Vector(0, -160, 45)
 -- Cargo-ramp lip: where the pallet tips off and falls clear.
-local PALLET_EXIT_LOCAL  = Vector(0, -420, -68)
+-- Z = +32: same +100 correction applied at the ramp lip.
+local PALLET_EXIT_LOCAL  = Vector(0, -420, 32)
 -- Offset of chute visual above the pallet (local to pallet).
 local CHUTE_LOCAL_ABOVE  = Vector(0, 0, 110)
 

@@ -30,10 +30,10 @@ local MODEL_SCALE       = 1.8
 
 -- ============================================================
 -- PALLET STAGING POSITIONS (entity local-space, scale=1.8)
--- +Y = nose, -Y = tail/ramp
+-- +Y = nose, -Y = tail/ramp, +Z = up inside fuselage
 -- ============================================================
-local PALLET_STAGE_LOCAL = Vector(0, -160, -55)   -- interior rest on cargo floor
-local PALLET_EXIT_LOCAL  = Vector(0, -420, -68)   -- cargo-ramp lip
+local PALLET_STAGE_LOCAL = Vector(0, -160, 45)   -- interior rest on cargo floor
+local PALLET_EXIT_LOCAL  = Vector(0, -420, 32)   -- cargo-ramp lip
 
 -- ============================================================
 -- WEAPON CATALOGUE
@@ -475,9 +475,7 @@ function ENT:UpdateWeapons(ct)
     elseif w == "retarded" then done = self:UpdateRetarded(ct)
     end
 
-    if done then
-        self:CloseWeaponWindow()
-    end
+    if done then self:CloseWeaponWindow() end
 end
 
 function ENT:CloseWeaponWindow()
@@ -567,9 +565,10 @@ function ENT:OnRemove()
 end
 
 -- ============================================================
--- ATTACH BOMB TO PALLET  (heavy / retarded -- no loitering brain)
--- Bomb is parented to the pallet so it slides out with it.
--- Arming happens AFTER Release() moves the bomb clear of the plane.
+-- ATTACH BOMB TO PALLET  (heavy / retarded)
+-- Bomb is parented to the pallet and lies flat on top of it.
+-- Arming is deferred to after Release() so the bomb clears
+-- the fuselage geometry before becoming live.
 -- ============================================================
 function ENT:AttachBombToPallet(pallet, entClass, isRetarded)
     if not IsValid(pallet) then return nil end
@@ -580,15 +579,15 @@ function ENT:AttachBombToPallet(pallet, entClass, isRetarded)
     end
     bomb.IsOnPlane   = true
     bomb.Launcher    = self
-    bomb.DeferredArm = true   -- pallet Release() will arm after ARM_DELAY
+    bomb.DeferredArm = true
     bomb:SetOwner(self)
     bomb:SetPos(pallet:GetPos())
-    bomb:SetAngles(Angle(90, self.flightYaw, 0))
+    bomb:SetAngles(self:GetAngles())
     bomb:Spawn()
     bomb:Activate()
     if isRetarded then bomb:SetBodygroup(1, 1) end
 
-    -- Disable any arming that Spawn()/Activate() may have set.
+    -- Disable any arming that Spawn()/Activate() may have triggered.
     if bomb.Armed ~= nil then bomb.Armed = false end
 
     bomb:SetMoveType(MOVETYPE_NONE)
@@ -596,9 +595,10 @@ function ENT:AttachBombToPallet(pallet, entClass, isRetarded)
     bomb:SetCollisionGroup(COLLISION_GROUP_NONE)
     bomb:SetParent(pallet)
     bomb:SetLocalPos(Vector(0, 0, 0))
-    bomb:SetLocalAngles(Angle(90, 0, 0))
+    -- Angle(0,0,0) = bomb lies flat on the pallet surface.
+    -- Previous Angle(90,0,0) was standing the bomb nose-up (pitch=90).
+    bomb:SetLocalAngles(Angle(0, 0, 0))
 
-    -- Store on pallet so Release() can find it.
     pallet.ExternalBomb = bomb
     return bomb
 end
