@@ -12,24 +12,9 @@ local FAN_RPM         = 900
 -- ============================================================
 -- CARGO DOOR CONSTANTS
 -- ============================================================
--- Open order:  ramp_2 (28°) → ramp_1 (28°) → ramp_1b (100°)
--- Close order: ramp_1b (0°) → ramp_1 (0°)  → ramp_2  (0°)
---
--- _DoorStage encoding:
---   0          = fully closed / idle
---   1, 2, 3    = opening bone index 1..3
---   4          = fully open / holding
---  -1,-2,-3    = closing bone index 1..3 (stored as negative)
---
--- DOOR_SPEED: degrees per second for each bone.
--- Stage transitions happen when the current bone reaches its target
--- within DOOR_THRESHOLD degrees.
--- ============================================================
-local DOOR_SPEED     = 28          -- deg/s  (full travel ~1 s for ramp_2/1, ~3.6 s for ramp_1b)
-local DOOR_THRESHOLD = 1.0         -- degrees — close enough to snap and advance stage
-
-local DOOR_TARGETS_OPEN = { 28, 28, 100 }   -- ramp_2, ramp_1, ramp_1b open targets
-
+local DOOR_SPEED     = 28
+local DOOR_THRESHOLD = 1.0
+local DOOR_TARGETS_OPEN = { 28, 28, 100 }
 local DOOR_BONES = {
 	"c17.ramp_2_move",
 	"c17.ramp_1_move",
@@ -39,43 +24,33 @@ local DOOR_BONES = {
 -- ============================================================
 -- CARGO LIGHT CONSTANTS
 -- ============================================================
--- A bright pulsing red DynamicLight at the ramp mouth.
--- Simulates the interior red warning lamp visible through the open bay.
-local CARGO_LIGHT_LOCAL    = Vector( -200, 0, -80 )   -- local offset: rear belly
-local CARGO_LIGHT_RADIUS   = 1400                      -- raised for wider coverage
+local CARGO_LIGHT_LOCAL    = Vector( -200, 0, -80 )
+local CARGO_LIGHT_RADIUS   = 1400
 local CARGO_LIGHT_DECAY    = 1200
 local CARGO_LIGHT_MIN_BRIG = 0.35
 local CARGO_LIGHT_MAX_BRIG = 1.0
-local CARGO_LIGHT_PULSE_HZ = 0.6                       -- cycles per second
+local CARGO_LIGHT_PULSE_HZ = 0.6
 
 -- ============================================================
 -- CONDENSATION VAPOR CONSTANTS
 -- ============================================================
--- Cold-air condensation cloud for 1.5 s after the door starts opening.
--- Uses util.Effect("SmokeTrail") which is a guaranteed client-side effect.
--- Multiple puffs are fired per interval to make the cloud dense enough
--- to be visible at flight altitude.
-local VAPOR_DURATION    = 1.5      -- seconds active after door-open trigger
-local VAPOR_LOCAL       = Vector( -200, 0, -90 )   -- local: ramp mouth
-local VAPOR_EMIT_RATE   = 0.03     -- seconds between bursts (faster = denser cloud)
-local VAPOR_PUFFS       = 4        -- parallel puffs emitted per interval
-local VAPOR_SPREAD      = 30       -- unit radius for puff origin scatter
+-- A ParticleEffect is attached to the entity so it follows the plane.
+-- We create one emitter that auto-stops after VAPOR_DURATION seconds.
+local VAPOR_DURATION    = 1.5
+local VAPOR_LOCAL       = Vector( -200, 0, -90 )  -- ramp mouth in local space
+
+game.AddParticles( "particles/fire_01.pcf" )  -- already loaded; no duplicate cost
 
 function ENT:Initialize()
 	self:SetBodygroup( 1, 1 )
 	self._FanAngle = 0
 
-	-- Cargo door state
 	self._DoorAngles  = { 0, 0, 0 }
 	self._DoorStage   = 0
 	self._DoorWasOpen = false
 
-	-- Cargo light
-	self._CargoLightIdx = nil
-
-	-- Condensation vapor
-	self._VaporUntil    = 0
-	self._VaporNextPuff = 0
+	self._VaporEffect  = nil   -- active CNewParticleEffect handle
+	self._VaporStopAt  = 0     -- CurTime() when we call StopEmission
 end
 
 -- ============================================================
@@ -84,25 +59,18 @@ end
 function ENT:UpdateCargoDoors( dt )
 	local wantOpen = self:GetNWBool( "CargoDoorOpen", false )
 
-	-- ── Transition: closed/closing → opening ─────────────────
 	if wantOpen and not self._DoorWasOpen then
 		self._DoorWasOpen = true
-
 		if self._DoorStage == 0 then
 			self._DoorStage = 1
 		elseif self._DoorStage < 0 then
 			self._DoorStage = math.abs( self._DoorStage )
 		end
-
-		-- Trigger condensation vapor burst.
-		self._VaporUntil    = CurTime() + VAPOR_DURATION
-		self._VaporNextPuff = 0
+		self:StartVapor()
 	end
 
-	-- ── Transition: opening/open → closing ───────────────────
 	if not wantOpen and self._DoorWasOpen then
 		self._DoorWasOpen = false
-
 		if self._DoorStage == 4 or self._DoorStage > 0 then
 			local startClose = 0
 			for i = 3, 1, -1 do
@@ -118,13 +86,11 @@ function ENT:UpdateCargoDoors( dt )
 	if self._DoorStage == 0 or self._DoorStage == 4 then return end
 
 	local step = DOOR_SPEED * dt
-
 	if self._DoorStage > 0 then
 		local i      = self._DoorStage
 		local target = DOOR_TARGETS_OPEN[i]
 		local cur    = self._DoorAngles[i]
 		local diff   = target - cur
-
 		if diff <= DOOR_THRESHOLD then
 			self._DoorAngles[i] = target
 			self._DoorStage     = ( i < 3 ) and ( i + 1 ) or 4
@@ -134,7 +100,6 @@ function ENT:UpdateCargoDoors( dt )
 	else
 		local i   = math.abs( self._DoorStage )
 		local cur = self._DoorAngles[i]
-
 		if cur <= DOOR_THRESHOLD then
 			self._DoorAngles[i] = 0
 			self._DoorStage     = ( i > 1 ) and -( i - 1 ) or 0
@@ -158,12 +123,11 @@ function ENT:UpdateCargoLight()
 	local bright = CARGO_LIGHT_MIN_BRIG + frac * ( CARGO_LIGHT_MAX_BRIG - CARGO_LIGHT_MIN_BRIG )
 
 	local worldPos = self:LocalToWorld( CARGO_LIGHT_LOCAL )
-
 	dl.pos        = worldPos
 	dl.r          = 255
 	dl.g          = 20
 	dl.b          = 10
-	dl.brightness = bright * 10   -- increased from 6 → 10 for more punch
+	dl.brightness = bright * 10
 	dl.decay      = CARGO_LIGHT_DECAY
 	dl.size       = CARGO_LIGHT_RADIUS
 	dl.dietime    = CurTime() + 0.1
@@ -172,33 +136,46 @@ end
 -- ============================================================
 -- CONDENSATION VAPOR
 -- ============================================================
--- util.Effect("SmokeTrail") is a reliable client-side GMod effect.
--- We scatter VAPOR_PUFFS origins around the ramp mouth per interval
--- so the cloud is thick and visible at altitude.
+-- Creates a ParticleEffect that is attached to the entity origin so it
+-- moves with the plane.  After VAPOR_DURATION seconds StopEmission()
+-- is called so no new particles are spawned, but existing ones fade out
+-- naturally still attached to the entity.
+function ENT:StartVapor()
+	-- Stop any previously running vapor first.
+	if IsValid( self._VaporEffect ) then
+		self._VaporEffect:StopEmission()
+		self._VaporEffect = nil
+	end
+
+	-- CreateParticleEffect returns a CNewParticleEffect.
+	-- PATTACH_POINT_FOLLOW keeps the control point locked to the entity
+	-- so every particle origin follows the plane.
+	local fx = self:CreateParticleEffect( "fire_medium_02", PATTACH_ABSORIGIN_FOLLOW, 0 )
+	if not IsValid( fx ) then return end
+
+	-- Override control point 0 to the ramp mouth in world space.
+	-- We update this every frame in Draw() so it tracks the bone.
+	fx:SetControlPoint( 0, self:LocalToWorld( VAPOR_LOCAL ) )
+
+	-- Use a white/grey tint so it reads as steam, not fire.
+	-- Control point 1 is the colour tint for fire_medium_02.
+	fx:SetControlPoint( 1, Vector( 220, 220, 220 ) )
+
+	self._VaporEffect = fx
+	self._VaporStopAt = CurTime() + VAPOR_DURATION
+end
+
 function ENT:UpdateVapor()
-	local ct = CurTime()
-	if ct >= self._VaporUntil then return end
-	if ct < self._VaporNextPuff then return end
+	if not IsValid( self._VaporEffect ) then return end
 
-	self._VaporNextPuff = ct + VAPOR_EMIT_RATE
+	-- Keep the emitter origin glued to the ramp mouth.
+	self._VaporEffect:SetControlPoint( 0, self:LocalToWorld( VAPOR_LOCAL ) )
 
-	local basePos  = self:LocalToWorld( VAPOR_LOCAL )
-	-- Normal points rearward in world space so the cloud trails behind the plane.
-	local rearNorm = self:LocalToWorldAngles( Angle( 10, 180, 0 ) ):Forward()
-
-	for _ = 1, VAPOR_PUFFS do
-		local scatter = Vector(
-			math.Rand( -VAPOR_SPREAD, VAPOR_SPREAD ),
-			math.Rand( -VAPOR_SPREAD, VAPOR_SPREAD ),
-			math.Rand( -VAPOR_SPREAD * 0.5, VAPOR_SPREAD * 0.5 )
-		)
-		local ed = EffectData()
-		ed:SetOrigin( basePos + scatter )
-		ed:SetNormal( rearNorm )
-		ed:SetScale( 2.5 )        -- larger puffs
-		ed:SetMagnitude( 1.2 )
-		ed:SetRadius( 48 )
-		util.Effect( "SmokeTrail", ed )
+	-- Stop emitting once the duration has elapsed; particles already
+	-- spawned will continue to drift and fade with the plane.
+	if CurTime() >= self._VaporStopAt then
+		self._VaporEffect:StopEmission()
+		self._VaporEffect = nil
 	end
 end
 
@@ -252,7 +229,6 @@ end
 -- ============================================================
 -- DAMAGE FX (unchanged)
 -- ============================================================
-game.AddParticles( "particles/fire_01.pcf" )
 PrecacheParticleSystem( "fire_medium_02" )
 
 local TIER_OFFSETS = {
