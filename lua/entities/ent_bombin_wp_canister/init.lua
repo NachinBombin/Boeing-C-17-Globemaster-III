@@ -5,19 +5,22 @@ include("shared.lua")
 -- ============================================================
 -- CONFIGURATION
 -- ============================================================
-local WP_MODEL        = "models/props_junk/PropaneCanister001a.mdl"
-local WP_CHUTE_MODEL  = "models/v92/parachutez/flying.mdl"  -- same chute as GBU combo
-local WP_CHUTE_SCALE  = 1.4
+local WP_MODEL       = "models/props_junk/PropaneCanister001a.mdl"
+local WP_CHUTE_MODEL = "models/v92/parachutez/flying.mdl"
+local WP_CHUTE_SCALE = 1.4
 
-local WP_IGNITE_DELAY = 4.5    -- seconds after spawn before ignition
-local WP_IGNITE_DUR   = 2.5    -- spark phase duration
-local WP_BURN_LIFE    = 45     -- full burn lifetime
-local WP_DRAG_K       = 0.32   -- parachute drag constant
+local WP_IGNITE_DELAY = 4.5
+local WP_IGNITE_DUR   = 2.5
+local WP_BURN_LIFE    = 45
+
+-- Drag: we target terminal velocity ~70 u/s downward.
+-- PhysicsUpdate applies an upward impulse each tick to clamp velocity.
+-- Using impulse approach (not raw force * mass) avoids the overshoot CTD.
+local WP_TERM_VEL     = -70   -- negative = downward
+
 local WP_CHUTE_OFFSET = Vector(0, 0, 90)
+local THINK_DT        = 0.1
 
-local THINK_DT = 0.1  -- 10 Hz is plenty; avoids net flooding
-
--- State constants (shared with cl_init via NW)
 local STATE_FALLING  = 0
 local STATE_IGNITING = 1
 local STATE_BURNING  = 2
@@ -34,9 +37,7 @@ end
 
 -- ============================================================
 -- INITIALIZE
--- NOTE: Do NOT call self:Spawn() or self:Activate() here.
---       The engine calls Initialize() from inside Spawn() --
---       doing it again causes a recursive double-init CTD.
+-- NOTE: never call self:Spawn()/self:Activate() inside Initialize().
 -- ============================================================
 function ENT:Initialize()
     self:SetModel(WP_MODEL)
@@ -47,9 +48,11 @@ function ENT:Initialize()
 
     local phys = self:GetPhysicsObject()
     if IsValid(phys) then
+        phys:Wake()
         phys:EnableGravity(true)
-        phys:SetMass(80)
-        phys:SetVelocity(Vector(math.Rand(-20,20), math.Rand(-20,20), -80))
+        phys:SetMass(40)
+        phys:SetDamping(0.1, 0.4)
+        phys:SetVelocity(Vector(math.Rand(-20,20), math.Rand(-20,20), -60))
     end
 
     self.WP_State     = STATE_FALLING
@@ -60,7 +63,6 @@ function ENT:Initialize()
     self.WP_SparkNext = 0
     self.WP_ChuteEnt  = nil
 
-    -- Spawn visual chute; deferred one frame so SetParent works correctly
     timer.Simple(0, function()
         if not IsValid(self) then return end
         local chute = ents.Create("prop_physics")
@@ -81,30 +83,38 @@ function ENT:Initialize()
         self.WP_ChuteEnt = chute
     end)
 
-    -- Tell clients: entity is falling (starts particles/light on client side)
     BroadcastState(self, STATE_FALLING)
     self:NextThink(CurTime() + THINK_DT)
 end
 
 -- ============================================================
--- PHYSICS: parachute drag (upward force against downward velocity)
+-- PHYSICS: parachute drag via velocity clamping impulse
+-- PhysicsUpdate fires ~66 Hz. We apply a corrective upward
+-- impulse only when falling faster than terminal velocity.
+-- Impulse = mass * delta_v, so it's frame-rate independent.
 -- ============================================================
 function ENT:PhysicsUpdate(phys)
+    if self.WP_State == STATE_DEAD then return end
     local vel = phys:GetVelocity()
-    if vel.z < 0 then
-        local dragMag = WP_DRAG_K * vel.z * vel.z
-        phys:ApplyForceCenter(Vector(0, 0, dragMag * phys:GetMass()))
+
+    if vel.z < WP_TERM_VEL then
+        -- Apply impulse to bring vz back toward terminal this tick
+        local dv   = WP_TERM_VEL - vel.z   -- positive upward correction needed
+        local mass = phys:GetMass()
+        -- Scale impulse: only apply a fraction per tick so deceleration is gradual
+        local impulse = mass * dv * 0.08
+        phys:ApplyForceCenter(Vector(0, 0, impulse))
     end
-    -- Gentle horizontal damping
-    phys:ApplyForceCenter(Vector(-vel.x * 0.06, -vel.y * 0.06, 0))
+
+    -- Gentle horizontal damping (pendulum sway settling)
+    phys:ApplyForceCenter(Vector(-vel.x * 0.5, -vel.y * 0.5, 0))
 end
 
 -- ============================================================
--- THINK: state machine  (10 Hz)
+-- THINK: state machine (10 Hz)
 -- ============================================================
 function ENT:Think()
     if self.WP_State == STATE_DEAD then return end
-
     local ct  = CurTime()
     local pos = self:GetPos()
 
@@ -118,19 +128,16 @@ function ENT:Think()
         end
 
     elseif self.WP_State == STATE_IGNITING then
-        -- Sparks: use ElectricSpark (valid builtin effect)
         if ct >= self.WP_SparkNext then
-            self.WP_SparkNext = ct + 0.12
+            self.WP_SparkNext = ct + 0.15
             local ed = EffectData()
             ed:SetOrigin(pos + Vector(math.Rand(-6,6), math.Rand(-6,6), math.Rand(2,14)))
             ed:SetScale(1)
             util.Effect("ElectricSpark", ed, true, true)
         end
-
         if ct >= self.WP_IgniteEnd then
             self.WP_State = STATE_BURNING
             BroadcastState(self, STATE_BURNING)
-            -- One ignition flash effect
             local fed = EffectData()
             fed:SetOrigin(pos)
             fed:SetScale(2)
@@ -140,7 +147,6 @@ function ENT:Think()
         end
 
     elseif self.WP_State == STATE_BURNING then
-        -- Re-trigger fire sound loop
         if ct >= self.WP_SoundTime then
             self.WP_SoundTime = ct + 4.5
             sound.Play("ambient/fire/fire_large_loop1.wav", pos, 80, 82, 0.85)
@@ -172,7 +178,7 @@ function ENT:WP_Die()
 end
 
 -- ============================================================
--- GROUND IMPACT: leave chute lying on the floor
+-- GROUND IMPACT
 -- ============================================================
 function ENT:PhysicsCollide(data, physObj)
     if self.WP_State == STATE_DEAD then return end
