@@ -2,29 +2,26 @@
 -- ent_bombin_gbu53_chute_owned  --  SERVER
 -- Palette / chute / 4x visual munition combo for C-17 GBU-53.
 --
--- Destruction model (INDEPENDENT HP pools):
---   HP_CHUTE  = 100  : player shoots the chute region (ChuteHitbox).
---                      Chute visual removed, drag disabled.
---                      Palette + GBUs free-fall under raw gravity.
---                      Each GBU detonates on ground contact.
+-- Root entity physics notes:
+--   PALETTE_MODEL must have a valid VPhysics mesh so that
+--   PhysicsInit(SOLID_VPHYSICS) actually produces a physobj.
+--   We use models/hunter/blocks/cube1x1x1.mdl (always present,
+--   guaranteed convex hull) and make it invisible.  The visual
+--   palette prop is attached as a parented child.
 --
---   HP_PALLET = 50   : player shoots the palette / GBU region
---                      (PalletHitbox or palette root).
---                      Mid-air explosion. Chute falls as debris.
---                      GBUs scatter. Completely independent of chute HP.
---
--- Spawn immunity: SPAWN_IMMUNITY seconds of damage immunity after
--- Initialize() so the cargo door can't kill the combo on ejection.
+--   EnableMotionController is deferred to timer.Simple(0) so it
+--   runs after Activate() has fully initialised the physobj.
+--   This is the only safe pattern in GMod -- calling it directly
+--   inside Initialize() races against engine setup.
 --
 -- Physics model:
 --   MOVETYPE_VPHYSICS + EnableGravity(true) on the palette root.
---   phys:EnableMotionController(true) is called so that the engine
---   actually invokes PhysicsUpdate(phys, deltatime) each physics tick.
---   Quadratic drag in PhysicsUpdate counters gravity to ~90 u/s
---   terminal velocity while chute is intact.
---   Children (chute visual, munitions, hitboxes) are SetParent --
---   zero per-tick position math on them.
---   Sway via AddAngleVelocity so Source interpolates on clients.
+--   PhysicsUpdate (~66 Hz) applies quadratic drag to ~90 u/s
+--   terminal velocity while chute is intact.  Source Engine uses
+--   the real velocity data for smooth client interpolation.
+--   Children (chute visual, munitions, hitboxes) are SetParent'd
+--   with SetLocalPos -- zero per-tick position math on them.
+--   Sway via AddAngleVelocity so clients interpolate it.
 -- ============================================================
 
 AddCSLuaFile("cl_init.lua")
@@ -33,16 +30,16 @@ include("shared.lua")
 
 util.AddNetworkString("bombin_gbu53chute_damage_tier")
 
-local PALETTE_MODEL  = "models/props_phx/construct/metal_wire1x1x2.mdl"
+-- Invisible box guaranteed to have a physics mesh in every GMod install.
+local PALETTE_MODEL  = "models/hunter/blocks/cube1x1x1.mdl"
 local MUNITION_MODEL = "models/sw/usa/bombs/guided/gbu53.mdl"
 local CHUTE_MODEL    = "models/v92/parachutez/flying.mdl"
 
-local PALETTE_SCALE  = 1.0
 local MUNITION_SCALE = 1.0
 local CHUTE_SCALE    = 2.2
 
-local PALETTE_ABOVE_MISSILE = Vector(0, 0, 110)
 local CHUTE_ABOVE_PALETTE   = Vector(0, 0, 90)
+local PALETTE_ABOVE_MISSILE = Vector(0, 0, 110)
 
 local MUNITION_OFFSETS = {
 	Vector( 30,  18, 8),
@@ -57,7 +54,7 @@ local HP_PALLET = 50
 
 local SPAWN_IMMUNITY = 1.8
 
--- Drag: k * vz^2 opposes gravity. Terminal ~90 u/s.
+-- Quadratic drag: k * vz^2 opposes gravity.  Terminal ~90 u/s.
 -- k = 600 / 90^2 ~= 0.074
 local CHUTE_DRAG_K       = 0.074
 local CHUTE_TERMINAL_VEL = -90
@@ -99,18 +96,23 @@ end
 -- INITIALIZE
 -- ============================================================
 function ENT:Initialize()
+	-- Use an invisible guaranteed-physics cube as the root body.
+	-- models/props_phx/construct/metal_wire1x1x2.mdl has no convex
+	-- hull in many installations, making GetPhysicsObject() return
+	-- an invalid object and crashing EnableMotionController.
 	self:SetModel(PALETTE_MODEL)
-	self:SetModelScale(PALETTE_SCALE, 0)
+	self:SetModelScale(0.01, 0)   -- effectively invisible
+	self:SetRenderMode(RENDERMODE_NONE)
+	self:DrawShadow(false)
 
 	self:PhysicsInit(SOLID_VPHYSICS)
 	self:SetMoveType(MOVETYPE_VPHYSICS)
 	self:SetSolid(SOLID_VPHYSICS)
 	self:SetCollisionGroup(COLLISION_GROUP_NONE)
-	self:DrawShadow(false)
 
-	-- Initialise all fields before any timer fires.
+	-- Initialise all state fields before any timer fires.
 	self.SwayClock    = math.Rand(0, math.pi * 2)
-	self.MunitionEnts = {}   -- always a table, never nil
+	self.MunitionEnts = {}
 	self.ChuteEnt     = nil
 	self.ChuteHitbox  = nil
 	self.PalletHitbox = nil
@@ -122,19 +124,29 @@ function ENT:Initialize()
 	self.HP_Pallet    = HP_PALLET
 	self.SpawnTime    = CurTime()
 
-	local phys = self:GetPhysicsObject()
-	if IsValid(phys) then
-		phys:Wake()
-		phys:EnableGravity(true)
-		phys:SetVelocity(Vector(0, 0, -10))
-		phys:SetDamping(0.05, 0.8)
-		-- CRITICAL: without this call the engine never invokes
-		-- ENT:PhysicsUpdate and deltatime arrives as nil.
-		phys:EnableMotionController(true)
-	end
-
+	-- Defer physobj setup to after Activate() has run.
+	-- Calling EnableMotionController inside Initialize() directly
+	-- races engine setup and returns a nil physobj.
 	timer.Simple(0, function()
 		if not IsValid(self) then return end
+
+		local phys = self:GetPhysicsObject()
+		if IsValid(phys) then
+			phys:Wake()
+			phys:EnableGravity(true)
+			phys:SetVelocity(Vector(0, 0, -10))
+			phys:SetDamping(0.05, 0.8)
+			-- This is what actually makes the engine call
+			-- ENT:PhysicsUpdate(phys, deltatime) each tick.
+			phys:EnableMotionController(true)
+		else
+			-- Absolute fallback: no valid physobj at all.
+			-- Switch to FLY so Think() can drive movement manually.
+			self:SetMoveType(MOVETYPE_FLY)
+			self:SetSolid(SOLID_NONE)
+			self.UseFlyFallback = true
+		end
+
 		self:SpawnChildren()
 	end)
 
@@ -294,7 +306,7 @@ function ENT:TakePalletHit(dmg)
 	end
 end
 
--- Fallback: direct hits on the palette root body = pallet hit.
+-- Fallback: direct hits on the root body.
 function ENT:OnTakeDamage(dmginfo)
 	self:TakePalletHit(dmginfo:GetDamage())
 end
@@ -440,10 +452,7 @@ end
 
 -- ============================================================
 -- PHYSICS UPDATE (~66 Hz via EnableMotionController)
--- Signature: ENT:PhysicsUpdate(phys, deltatime)
--- dt is valid ONLY because phys:EnableMotionController(true) was
--- called in Initialize. Without it the engine never invokes this
--- hook and deltatime would be nil.
+-- Only called when EnableMotionController(true) succeeded.
 -- ============================================================
 function ENT:PhysicsUpdate(phys, deltatime)
 	if self.Detached or self.PalletDead then return end
@@ -460,22 +469,19 @@ function ENT:PhysicsUpdate(phys, deltatime)
 
 	if phys:IsAsleep() then phys:Wake() end
 
-	local vel        = phys:GetVelocity()
-	local vz         = vel.z
-	local missilePos = missile:GetPos()
-	local targetXY   = missilePos + PALETTE_ABOVE_MISSILE
-	local curPos     = self:GetPos()
-	local vxCorrect  = (targetXY.x - curPos.x) * 12
-	local vyCorrect  = (targetXY.y - curPos.y) * 12
+	local vel       = phys:GetVelocity()
+	local vz        = vel.z
+	local targetXY  = missile:GetPos() + PALETTE_ABOVE_MISSILE
+	local curPos    = self:GetPos()
+	local vxCorrect = (targetXY.x - curPos.x) * 12
+	local vyCorrect = (targetXY.y - curPos.y) * 12
 
 	local newVz
 	if not self.ChuteDead then
-		-- Quadratic drag opposes downward velocity.
 		local dragDelta = CHUTE_DRAG_K * vz * vz * dt
 		if vz >= 0 then dragDelta = -dragDelta end
 		newVz = math.max(vz + dragDelta, CHUTE_TERMINAL_VEL)
 	else
-		-- Chute gone: gravity only, clamp to sane terminal.
 		newVz = math.max(vz, FREEFALL_TERMINAL_VEL)
 	end
 
@@ -494,12 +500,10 @@ end
 
 -- ============================================================
 -- THINK (1/20 s)
+-- Also drives movement for the MOVETYPE_FLY fallback path.
 -- ============================================================
 function ENT:Think()
 	if self.PalletDead then return end
-
-	-- MunitionEnts is always initialised in Initialize(), but guard
-	-- defensively in case of a hot-reload edge case.
 	if not self.MunitionEnts then self.MunitionEnts = {} end
 
 	local missile = self:GetOwner()
@@ -511,6 +515,43 @@ function ENT:Think()
 	if not util.IsInWorld(missile:GetPos()) then
 		self:FullRemove()
 		return
+	end
+
+	-- MOVETYPE_FLY fallback: drive position manually when no physobj.
+	if self.UseFlyFallback and not self.Detached then
+		local missile2 = self:GetOwner()
+		if IsValid(missile2) then
+			if missile2:GetNWBool("EngineOn", false) then
+				self:Detach()
+			else
+				local targetPos = missile2:GetPos() + PALETTE_ABOVE_MISSILE
+				local curPos    = self:GetPos()
+				local dt        = THINK_DT
+				if not self.FlyVz then self.FlyVz = -10 end
+
+				if not self.ChuteDead then
+					local dragDelta = CHUTE_DRAG_K * self.FlyVz * self.FlyVz * dt
+					if self.FlyVz >= 0 then dragDelta = -dragDelta end
+					self.FlyVz = math.max(self.FlyVz + dragDelta, CHUTE_TERMINAL_VEL)
+				else
+					self.FlyVz = math.max(self.FlyVz - 600 * dt, FREEFALL_TERMINAL_VEL)
+				end
+
+				local newPos = Vector(
+					targetPos.x,
+					targetPos.y,
+					curPos.z + self.FlyVz * dt
+				)
+				self:SetPos(newPos)
+
+				if not self.ChuteDead then
+					self.SwayClock = (self.SwayClock or 0) + SWAY_RATE * dt
+					local sway = math.sin(self.SwayClock) * SWAY_AMP
+					local ang  = missile2:GetAngles()
+					self:SetAngles(Angle(sway, ang.y, 0))
+				end
+			end
+		end
 	end
 
 	-- Ground-contact detonation while free-falling (chute dead).
@@ -577,7 +618,7 @@ function ENT:GroundDetonation()
 end
 
 -- ============================================================
--- DETACH (missile engine ignited -- normal release path)
+-- DETACH (missile engine ignited -- normal release)
 -- ============================================================
 function ENT:Detach()
 	if self.Detached then return end
