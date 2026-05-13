@@ -1,7 +1,7 @@
 include("shared.lua")
 
 -- ============================================================
--- Client: smoke trail + ignition sparks + WP burn light
+-- Client: smoke trail + ignition sparks + WP burn light + sway
 -- ============================================================
 
 local STATE_FALLING  = 0
@@ -9,7 +9,8 @@ local STATE_IGNITING = 1
 local STATE_BURNING  = 2
 local STATE_DEAD     = 3
 
-local wpState  = {}   -- [entIdx] = current state
+local wpState  = {}   -- [entIdx] = state
+local wpSway   = {}   -- [entIdx] = {pitch, roll}
 local activeDL = {}   -- [entIdx] = DynamicLight handle
 
 local function KillLight(idx)
@@ -20,21 +21,21 @@ local function KillLight(idx)
 end
 
 -- ============================================================
--- Net receive: state transitions from server
+-- Net: state transitions
 -- ============================================================
 net.Receive("bombin_wp_state", function()
     local idx   = net.ReadUInt(16)
     local state = net.ReadUInt(2)
-    local ent   = ents.GetByIndex(idx)
-
     wpState[idx] = state
 
     if state == STATE_DEAD then
         KillLight(idx)
         wpState[idx] = nil
+        wpSway[idx]  = nil
         return
     end
 
+    local ent = ents.GetByIndex(idx)
     if state == STATE_BURNING then
         if not IsValid(ent) then return end
         local dl = DynamicLight(ent:EntIndex())
@@ -54,7 +55,22 @@ net.Receive("bombin_wp_state", function()
 end)
 
 -- ============================================================
--- Global Think: keep light alive + flicker
+-- Net: sway angles from server (8 Hz)
+-- ============================================================
+net.Receive("bombin_wp_sway", function()
+    local idx   = net.ReadUInt(16)
+    local pitch = net.ReadInt(16) / 10
+    local roll  = net.ReadInt(16) / 10
+    wpSway[idx] = { pitch = pitch, roll = roll }
+    -- Apply immediately to the chute child if already cached
+    local ent = ents.GetByIndex(idx)
+    if IsValid(ent) and IsValid(ent.WP_ChuteEntCL) then
+        ent.WP_ChuteEntCL:SetLocalAngles(Angle(pitch, 0, roll))
+    end
+end)
+
+-- ============================================================
+-- Global Think: keep DynamicLight alive + flicker while burning
 -- ============================================================
 hook.Add("Think", "bombin_wp_light_think", function()
     local t = CurTime()
@@ -79,19 +95,17 @@ end)
 function ENT:Initialize()
     self:SetRenderMode(RENDERMODE_NORMAL)
     wpState[self:EntIndex()] = STATE_FALLING
-    -- Reset per-entity timers
-    self.WP_LastSmoke = 0
-    self.WP_LastFire  = 0
-    self.WP_LastSpark = 0
+    wpSway[self:EntIndex()]  = { pitch = 0, roll = 0 }
+    self.WP_LastSmoke  = 0
+    self.WP_LastFire   = 0
+    self.WP_LastSpark  = 0
+    self.WP_ChuteEntCL = nil
 end
 
 function ENT:Draw()
     self:DrawModel()
 end
 
--- Client Think: runs every frame for each visible entity.
--- Drives the constant white smoke trail and per-state fire/spark effects.
--- All util.Effect calls here omit the broadcast flags (no args = local only).
 function ENT:Think()
     local idx   = self:EntIndex()
     local state = wpState[idx] or STATE_FALLING
@@ -100,20 +114,35 @@ function ENT:Think()
     local pos = self:GetPos()
     local t   = CurTime()
 
-    -- ---- Constant white smoke trail (all states while alive) ----
-    -- Rate: ~12 puffs/sec. "cball_bounce" emits a reliable white smoke cloud.
-    if t - (self.WP_LastSmoke or 0) > 0.08 then
+    -- Cache reference to chute child entity
+    if not IsValid(self.WP_ChuteEntCL) then
+        for _, child in ipairs(self:GetChildren()) do
+            if IsValid(child) then
+                self.WP_ChuteEntCL = child
+                break
+            end
+        end
+    end
+
+    -- Apply latest sway to chute child
+    local sw = wpSway[idx]
+    if sw and IsValid(self.WP_ChuteEntCL) then
+        self.WP_ChuteEntCL:SetLocalAngles(Angle(sw.pitch, 0, sw.roll))
+    end
+
+    -- ---- Constant white smoke trail ----
+    if t - self.WP_LastSmoke > 0.08 then
         self.WP_LastSmoke = t
         local ed = EffectData()
         ed:SetOrigin(pos + Vector(math.Rand(-3,3), math.Rand(-3,3), math.Rand(2,10)))
-        ed:SetScale(0.7)
-        ed:SetMagnitude(0.5)
+        ed:SetScale(0.65)
+        ed:SetMagnitude(0.45)
         util.Effect("cball_bounce", ed)
     end
 
-    -- ---- Igniting: extra client-side spark flash ----
+    -- ---- Igniting: client-side spark flash ----
     if state == STATE_IGNITING then
-        if t - (self.WP_LastSpark or 0) > 0.1 then
+        if t - self.WP_LastSpark > 0.1 then
             self.WP_LastSpark = t
             local ed = EffectData()
             ed:SetOrigin(pos + Vector(math.Rand(-5,5), math.Rand(-5,5), math.Rand(2,12)))
@@ -122,14 +151,18 @@ function ENT:Think()
         end
     end
 
-    -- ---- Burning: fire puffs around the canister ----
+    -- ---- Burning: small proportionate fire puffs ----
+    -- MuzzleEffect at scale=0.4, magnitude=0.3 for a hand-canister-sized flame.
+    -- Replaces HelicopterMegaBomb which produced an oversized fireball.
     if state == STATE_BURNING then
-        if t - (self.WP_LastFire or 0) > 0.07 then
+        if t - self.WP_LastFire > 0.09 then
             self.WP_LastFire = t
             local ed = EffectData()
-            ed:SetOrigin(pos + Vector(math.Rand(-6,6), math.Rand(-6,6), math.Rand(4,16)))
-            ed:SetScale(1.0)
-            util.Effect("HelicopterMegaBomb", ed)
+            ed:SetOrigin(pos + Vector(math.Rand(-4,4), math.Rand(-4,4), math.Rand(3,14)))
+            ed:SetNormal(Vector(0,0,1))
+            ed:SetScale(0.4)
+            ed:SetMagnitude(0.3)
+            util.Effect("MuzzleEffect", ed)
         end
     end
 end
@@ -138,4 +171,5 @@ function ENT:OnRemove()
     local idx = self:EntIndex()
     KillLight(idx)
     wpState[idx] = nil
+    wpSway[idx]  = nil
 end
