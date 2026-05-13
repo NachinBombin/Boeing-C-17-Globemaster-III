@@ -31,6 +31,7 @@ local MODEL_SCALE = 1.8
 --   W2 "heavy"    -- heavy GP / penetrators
 --   W3 "gbu53"    -- GBU-53 parachute cluster drop
 --   W6 "retarded" -- parachute / retarder bombs
+--   W7 "wp"       -- WP illumination canister (parachute)
 -- ============================================================
 
 local DART_SPEED  = 4500
@@ -92,12 +93,12 @@ local CFG_W2_Pool    = {
 }
 
 -- ---------- W3 -- GBU-53 parachute cluster ----------
--- AltStagger staggers each successive pallet further below the drop
--- point so they separate cleanly during free-fall before chute deploy.
--- This is intentional, not a geometry error.
+-- All 3 pallets spawn from the same cargo door position.
+-- Separation happens naturally from the 1.2s inter-shot delay
+-- (CFG_W3_GBU53_Delay): by the time pallet 2 drops, pallet 1 is
+-- already 1.2 seconds into freefall and well clear of the door.
 local CFG_W3_GBU53_Count       = 3
 local CFG_W3_GBU53_Delay       = 1.2
-local CFG_W3_AltStagger        = 400
 local CFG_W3_DropOffset        = Vector(0, 50, -60)
 local CFG_W3_BodyClearance     = 80
 local CFG_W3_NoCollideHoldTime = 1.8
@@ -113,7 +114,16 @@ local CFG_W6_Pool    = {
     "sw_bomb_mk84_air_v3",
 }
 
-local WEAPON_ROSTER = { "jassm", "heavy", "gbu53", "retarded" }
+-- ---------- W7 -- WP Illumination parachute canister ----------
+-- 4 canisters per pass, 1.5s between each drop.
+-- All spawn from the same cargo door offset as W3.
+local CFG_W7_Count          = 4
+local CFG_W7_Delay          = 1.5
+local CFG_W7_DropOffset     = Vector(0, 50, -60)
+local CFG_W7_BodyClearance  = 80
+local CFG_W7_NoCollideHold  = 1.8
+
+local WEAPON_ROSTER = { "jassm", "heavy", "gbu53", "retarded", "wp" }
 
 -- ============================================================
 -- CARGO DOOR TIMING
@@ -541,6 +551,7 @@ function ENT:UpdateWeapons(ct)
             elseif w == "heavy"    then done = self:UpdateHeavy(ct)
             elseif w == "gbu53"    then done = self:UpdateGBU53(ct)
             elseif w == "retarded" then done = self:UpdateRetarded(ct)
+            elseif w == "wp"       then done = self:UpdateWP(ct)
             end
         end
 
@@ -822,7 +833,7 @@ function ENT:SpawnOneJASSM(dropIndex)
     missile.SpawnedFromPlane = true
     missile.CenterPos    = self.CenterPos
     missile.CallDir      = callDir
-    missile.Lifetime     = math.min(self.Lifetime or 120, 35)
+    missile.Lifetime     = math.min(self.Lifetime, 35)
     missile.Speed        = 250
     missile.OrbitRadius  = self.OrbitRadius * 0.75
     missile.SkyHeightAdd = sha
@@ -891,13 +902,13 @@ end
 -- ============================================================
 -- W3: GBU-53 PARACHUTE CLUSTER DROP
 -- ============================================================
-function ENT:SpawnOneGBU53Pallet(palletIndex)
-    palletIndex = palletIndex or 0
-
-    -- All 3 pallets spawn at the same cargo door position.
-    -- The 1.2s inter-shot delay (CFG_W3_GBU53_Delay) provides
-    -- the only separation needed; pallets drift apart naturally
-    -- during free-fall once released.
+function ENT:SpawnOneGBU53Pallet()
+    -- FIX: All pallets spawn from the same cargo door position.
+    -- The original code applied palletIndex * CFG_W3_AltStagger as a
+    -- vertical offset at spawn time, placing pallets 2 and 3 hundreds
+    -- of units below the fuselage before freefall even started.
+    -- The 1.2s inter-shot delay (CFG_W3_GBU53_Delay) already ensures
+    -- each pallet has physically separated before the next one drops.
     local tailWorld = self:LocalToWorld(CFG_W3_DropOffset)
     local dropPos = Vector(
         tailWorld.x,
@@ -921,7 +932,7 @@ function ENT:SpawnOneGBU53Pallet(palletIndex)
     pallet.SpawnedFromPlane = true
     pallet.CenterPos    = self.CenterPos
     pallet.CallDir      = callDir
-    pallet.Lifetime     = math.min(self.Lifetime or 120, 60)
+    pallet.Lifetime     = math.min(self.Lifetime, 60)
     pallet.Speed        = 420
     pallet.OrbitRadius  = self.OrbitRadius
     local groundZ = self:FindGround(dropPos)
@@ -942,7 +953,7 @@ function ENT:SpawnOneGBU53Pallet(palletIndex)
     end)
 
     SpawnWoodPallet(dropPos + Vector(0,0,-15), Vector(math.Rand(-50,50), math.Rand(-50,50), -70), nil)
-    self:Debug("W3 GBU53 pallet #" .. (palletIndex+1) .. " dropped at " .. tostring(dropPos))
+    self:Debug("W3 GBU53 pallet dropped at " .. tostring(dropPos))
 end
 
 function ENT:UpdateGBU53(ct)
@@ -950,7 +961,7 @@ function ENT:UpdateGBU53(ct)
     if ct < self.WPN_NextShot then return false end
     self.WPN_NextShot   = ct + CFG_W3_GBU53_Delay
     self.WPN_ShotsFired = self.WPN_ShotsFired + 1
-    self:SpawnOneGBU53Pallet(self.WPN_ShotsFired - 1)
+    self:SpawnOneGBU53Pallet()
     return (self.WPN_ShotsFired >= CFG_W3_GBU53_Count)
 end
 
@@ -971,6 +982,55 @@ function ENT:UpdateRetarded(ct)
         SpawnWoodPallet(dropPos + Vector(0,0,-10), Vector(math.Rand(-50,50), math.Rand(-50,50), -60), bomb)
     end
     return (self.WPN_ShotsFired >= CFG_W6_Count)
+end
+
+-- ============================================================
+-- W7: WP ILLUMINATION CANISTER (parachute)
+-- 4 canisters per pass, 1.5s inter-drop delay.
+-- Each canister deploys its own parachute and autonomously ignites
+-- after WP_IGNITE_DELAY seconds, producing omnidirectional white
+-- phosphorus illumination.
+-- ============================================================
+function ENT:SpawnOneWP()
+    local tailWorld = self:LocalToWorld(CFG_W7_DropOffset)
+    local dropPos = Vector(
+        tailWorld.x,
+        tailWorld.y,
+        tailWorld.z - CFG_W7_BodyClearance
+    )
+    if not util.IsInWorld(dropPos) then
+        dropPos = Vector(self.CenterPos.x, self.CenterPos.y, self:GetPos().z - CFG_W7_BodyClearance)
+    end
+
+    local can = ents.Create("ent_bombin_wp_canister")
+    if not IsValid(can) then
+        self:Debug("W7 WP: ent_bombin_wp_canister not found")
+        return
+    end
+
+    can:SetPos(dropPos)
+    can:SetAngles(Angle(0, self.flightYaw, 0))
+    can:SetOwner(self)
+    can.Launcher = self
+    can:Spawn()
+    can:Activate()
+
+    local ncHandle = constraint.NoCollide(can, self, 0, 0)
+    timer.Simple(CFG_W7_NoCollideHold, function()
+        if IsValid(ncHandle) then ncHandle:Remove() end
+    end)
+
+    SpawnWoodPallet(dropPos + Vector(0,0,-15), Vector(math.Rand(-50,50), math.Rand(-50,50), -70), nil)
+    self:Debug("W7 WP canister dropped at " .. tostring(dropPos))
+end
+
+function ENT:UpdateWP(ct)
+    if self.WPN_ShotsFired >= CFG_W7_Count then return true end
+    if ct < self.WPN_NextShot then return false end
+    self.WPN_NextShot   = ct + CFG_W7_Delay
+    self.WPN_ShotsFired = self.WPN_ShotsFired + 1
+    self:SpawnOneWP()
+    return (self.WPN_ShotsFired >= CFG_W7_Count)
 end
 
 function ENT:SetVar(key, value)

@@ -29,10 +29,10 @@ local CHUTE_ABOVE_PALETTE   = Vector(0, 0, 90)
 local PALETTE_ABOVE_MISSILE = Vector(0, 0, 110)
 
 local MUNITION_OFFSETS = {
-	Vector( 30,  18, 8),
-	Vector( 30, -18, 8),
-	Vector(-30,  18, 8),
-	Vector(-30, -18, 8),
+	Vector( 30,  18, 2),
+	Vector( 30, -18, 2),
+	Vector(-30,  18, 2),
+	Vector(-30, -18, 2),
 }
 local MUNITION_YAW_OFFSETS = { 0, 0, 180, 180 }
 

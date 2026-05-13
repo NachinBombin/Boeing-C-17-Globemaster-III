@@ -51,8 +51,8 @@ local SALVO_PALLET_OFFSETS = {
 -- ENT.WeaponWindow  = 8   -- was never read; weapon interval is math.Rand(4,9)
 -- ENT.FadeDuration  = 0.0 -- unused
 
-ENT.DIVE_Speed         = 1800
-ENT.DIVE_TrackInterval = 0.1
+ENT.DIVE_Speed         = 1000
+ENT.DIVE_TrackInterval = 2.1
 
 util.AddNetworkString( "bombin_gbu53owned_damage_tier" )
 

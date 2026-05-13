@@ -14,10 +14,10 @@ local SAMPLE_RATE    = 0.025
 -- X = wingspan offset, Y = rear of engine pod, Z = slight up
 -- All values multiplied by 1.8 to match the scaled model.
 local TRAIL_OFFSETS = {
-    Vector(  414, -108,  0 ),   -- outer-right engine pod pair  (230 * 1.8)
-    Vector(  216, -108,  0 ),   -- inner-right engine pod pair  (120 * 1.8)
-    Vector( -216, -108,  0 ),   -- inner-left  engine pod pair
-    Vector( -414, -108,  0 ),   -- outer-left  engine pod pair
+    Vector(  814, -108,  0 ),   -- outer-right engine pod pair  (230 * 1.8)
+    Vector(  316, -108,  0 ),   -- inner-right engine pod pair  (120 * 1.8)
+    Vector( -316, -108,  0 ),   -- inner-left  engine pod pair
+    Vector( -814, -108,  0 ),   -- outer-left  engine pod pair
     Vector(    0, -144,  0 ),   -- fuselage center              ( 80 * 1.8)
 }
 
