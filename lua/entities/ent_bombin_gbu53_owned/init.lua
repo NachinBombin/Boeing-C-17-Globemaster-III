@@ -244,10 +244,8 @@ function ENT:Initialize()
 	self.WanderRateY   = math.Rand( 0.003, 0.009 )
 
 	self.CurrentWeapon   = nil
-	-- WeaponWindowEnd: wall-clock time at which the current peaceful lapse ends.
-	-- While ct < WeaponWindowEnd the doors stay open (the window is "active").
 	self.WeaponWindowEnd = 0
-	self.WeaponWindowOpen = false   -- tracks whether we already signalled Open
+	self.WeaponWindowOpen = false
 
 	self.Diving        = false
 	self.DiveTarget    = nil
@@ -296,9 +294,6 @@ function ENT:Initialize()
 	self:Debug( "Spawned [salvo " .. self.SalvoIndex .. "] at " .. tostring(spawnPos) )
 end
 
--- ============================================================
--- CHUTE SPAWN
--- ============================================================
 function ENT:SpawnChute()
 	if IsValid( self.ChuteEnt ) then return end
 	local chute = ents.Create( "ent_bombin_gbu53_chute_owned" )
@@ -314,30 +309,18 @@ function ENT:SpawnChute()
 	self.ChuteEnt = chute
 end
 
--- ============================================================
--- SALVO SPAWN
--- Fix: each child reads the pallet's LIVE world position at the moment
--- its timer fires.  The pallet (ChuteEnt, an ent_bombin_gbu53_chute_owned)
--- is in freefall and moves continuously, so computing releasePos up-front
--- (or via planeEnt:LocalToWorld at callback time) gives the wrong origin
--- for munitions 2-4.  Reading self.ChuteEnt:GetPos() inside the callback
--- guarantees every munition starts from the pallet's current position.
--- ============================================================
 function ENT:SpawnSalvo( planeEnt )
 	for i = 2, SALVO_COUNT do
 		local delay     = (i - 1) * SALVO_DELAY_BASE + math.Rand( 0, SALVO_DELAY_JITTER )
 		local capturedI = i
 		timer.Simple( delay, function()
 			if not IsValid( self ) then return end
+			if self.Destroyed then return end
 
-			-- Read the pallet's live position at the moment this timer fires.
-			-- The pallet is still falling, so this is always the correct origin.
 			local releasePos
 			if IsValid( self.ChuteEnt ) then
 				releasePos = self.ChuteEnt:GetPos()
 			else
-				-- Fallback: pallet already gone (early ignition edge-case).
-				-- Use the missile's own current position.
 				releasePos = self:GetPos()
 			end
 
@@ -355,8 +338,6 @@ function ENT:SpawnSalvo( planeEnt )
 			child:SetVar( "Speed",                self.Speed )
 			child:SetVar( "DIVE_ExplosionDamage", self.DIVE_ExplosionDamage )
 			child:SetVar( "DIVE_ExplosionRadius", self.DIVE_ExplosionRadius )
-			-- Propagate parent plane reference so salvo children can also
-			-- control the cargo doors during their own dives.
 			child:SetVar( "ParentPlane",          self:GetVar("ParentPlane", nil) )
 
 			child:SetPos( releasePos )
@@ -368,9 +349,6 @@ function ENT:SpawnSalvo( planeEnt )
 	end
 end
 
--- ============================================================
--- FREEFALL PHYSICS
--- ============================================================
 function ENT:UpdateFreefall( dt )
 	local k = FREEFALL_GRAVITY / math.abs( TERMINAL_VEL )
 	self.FreefallVelZ = self.FreefallVelZ - FREEFALL_GRAVITY * dt
@@ -405,11 +383,9 @@ function ENT:UpdateFreefall( dt )
 	end
 end
 
--- ============================================================
--- ENGINE IGNITION
--- ============================================================
 function ENT:IgniteEngine()
 	if self.Phase == "orbit" then return end
+	if self.Destroyed then return end
 	self.Phase = "orbit"
 
 	self:Debug( "Engine ignited [salvo " .. self.SalvoIndex .. "] at Z=" .. math.Round(self:GetPos().z) )
@@ -421,10 +397,6 @@ function ENT:IgniteEngine()
 	self:PhysicsInit( SOLID_VPHYSICS )
 	self:SetMoveType( MOVETYPE_VPHYSICS )
 	self:SetSolid( SOLID_VPHYSICS )
-
-	-- Fix: COLLISION_GROUP_DEBRIS_TRIGGER collides with world/static props
-	-- but ignores players and other missiles — correct for loitering altitude.
-	-- Upgraded to COLLISION_GROUP_NONE on StartDive().
 	self:SetCollisionGroup( COLLISION_GROUP_DEBRIS_TRIGGER )
 
 	self.PhysObj = self:GetPhysicsObject()
@@ -463,9 +435,6 @@ function ENT:IgniteEngine()
 	end
 end
 
--- ============================================================
--- THINK
--- ============================================================
 function ENT:Think()
 	if not self.DieTime or not self.SpawnTime then
 		self:NextThink( CurTime() + 0.1 )
@@ -521,9 +490,6 @@ function ENT:Think()
 	return true
 end
 
--- ============================================================
--- ORBIT PHYSICS
--- ============================================================
 function ENT:UpdateOrbit( ct, dt, phys )
 	if not IsValid( phys ) then return end
 
@@ -577,55 +543,27 @@ function ENT:UpdateOrbit( ct, dt, phys )
 	self:SetAngles( self.ang )
 end
 
--- ============================================================
--- WEAPON LOGIC
--- ============================================================
--- A "weapon window" is the period between when UpdateWeaponLogic picks
--- a peaceful-lapse roll and when the next roll fires (or the missile
--- transitions to a dive).  The cargo doors are OPEN for the entire
--- window — including during the dive itself — and close only once
--- the missile is no longer in an active window (peaceful lapse expired
--- without a follow-up window or dive).
---
--- Timeline per cycle:
---   1. WeaponWindowEnd expires  →  roll dice
---   2a. Roll == 3  →  StartDive()  →  doors OPEN (stay open through dive)
---   2b. Roll != 3  →  set new WeaponWindowEnd (peaceful lapse) → doors CLOSE
---       When WeaponWindowEnd expires again → back to step 1
--- ============================================================
 function ENT:UpdateWeaponLogic( ct )
 	if ct < self.WeaponWindowEnd then
-		-- Still inside the current peaceful lapse window — doors are already
-		-- open (set when the window was created); nothing to do.
 		return
 	end
 
-	-- Window has expired.  Roll the dice.
 	local roll = math.random( 1, 3 )
 	if roll == 3 then
-		-- ── DIVE: open doors and begin attack. ──────────────────
-		-- Fix (BUG 3): set WeaponWindowEnd so that if Diving is ever
-		-- reset externally the logic won't immediately re-enter StartDive.
-		self.WeaponWindowEnd = ct + 30   -- generous hold; dive removes entity anyway
+		self.WeaponWindowEnd = ct + 30
 		C17_SetCargoDoor( self, true )
 		self:StartDive( ct )
 	else
-		-- ── PEACEFUL LAPSE: doors open while we wait for next roll. ──
 		self.WeaponWindowEnd = ct + math.Rand( 4, 9 )
 		C17_SetCargoDoor( self, true )
 	end
 end
 
--- ============================================================
--- DIVE ATTACK
--- ============================================================
 function ENT:StartDive( ct )
 	self.Diving = true
 	self.DiveAimOffset    = Vector( math.Rand(-400,400), math.Rand(-400,400), 0 )
 	self.DiveSpeedCurrent = self.DiveSpeedMin
 	self.DiveWobblePhase  = 0
-
-	-- Full collision on dive so the missile can't pass through the ground.
 	self:SetCollisionGroup( COLLISION_GROUP_NONE )
 
 	local closest, closestDist = nil, math.huge
@@ -683,14 +621,10 @@ function ENT:UpdateDive( ct )
 	end
 end
 
--- ============================================================
--- EXPLODE
--- ============================================================
 function ENT:DiveExplode( pos )
 	if self.DiveExploded then return end
 	self.DiveExploded = true
 
-	-- Fix: SafeAttacker() ensures util.BlastDamage never receives NULL.
 	util.BlastDamage( self, SafeAttacker(self), pos, self.DIVE_ExplosionRadius, self.DIVE_ExplosionDamage )
 
 	local ed = EffectData()
@@ -700,7 +634,6 @@ function ENT:DiveExplode( pos )
 
 	sound.Play( "ambient/explosions/explode_" .. math.random(1,5) .. ".wav", pos, 145, math.random(85,100), 1.0 )
 
-	-- Close doors: this missile is gone, no further window events from it.
 	C17_SetCargoDoor( self, false )
 
 	if IsValid( self.ChuteEnt ) then self.ChuteEnt:Remove() end
@@ -720,16 +653,12 @@ function ENT:CrashExplode( pos )
 
 	sound.Play( "ambient/explosions/explode_" .. math.random(1,5) .. ".wav", pos, 120, math.random(90,110), 0.7 )
 
-	-- Close doors on crash too.
 	C17_SetCargoDoor( self, false )
 
 	if IsValid( self.ChuteEnt ) then self.ChuteEnt:Remove() end
 	self:Remove()
 end
 
--- ============================================================
--- DAMAGE / DESTRUCTION
--- ============================================================
 function ENT:OnTakeDamage( dmginfo )
 	if self.Destroyed then return end
 
@@ -765,20 +694,15 @@ function ENT:Destroy()
 		self.PhysObj:EnableGravity( true )
 	end
 
-	-- Close doors: missile is destroyed and will no longer fight.
 	C17_SetCargoDoor( self, false )
 
 	if IsValid( self.ChuteEnt ) then self.ChuteEnt:Remove() end
 end
 
 function ENT:OnRemove()
-	-- Catch any removal path not covered by Destroy/DiveExplode/CrashExplode.
 	C17_SetCargoDoor( self, false )
 end
 
--- ============================================================
--- GROUND FINDER
--- ============================================================
 function ENT:FindGround( pos )
 	local tr = util.TraceLine({
 		start  = Vector( pos.x, pos.y, pos.z + 100 ),
@@ -789,9 +713,6 @@ function ENT:FindGround( pos )
 	return tr.Hit and tr.HitPos.z or -1
 end
 
--- ============================================================
--- GENERIC VAR HELPERS
--- ============================================================
 function ENT:SetVar( key, val ) self["_var_" .. key] = val end
 function ENT:GetVar( key, default )
 	local v = self["_var_" .. key]
