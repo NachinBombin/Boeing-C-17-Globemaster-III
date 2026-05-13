@@ -16,8 +16,7 @@ local MODEL_SCALE = 1.8
 local DART_SPEED  = 4500
 local GRAVITY_EST = 580
 
--- Tumble gravity (units/s^2, positive = downward in GMod Z)
--- Cached at file load time on the game thread -- safe to use anywhere.
+-- Tumble gravity (units/s^2). Plain constant -- safe on any thread.
 local TUMBLE_GRAVITY = 600
 
 local CFG_MaxHP        = 3500
@@ -387,7 +386,7 @@ function ENT:UpdateOrbit(ct,dt)
     self:SetAngles(self.ang)
 end
 
--- PhysicsUpdate: only handles normal flight velocity. Tumble is entirely in Think.
+-- PhysicsUpdate: flight velocity only. Tumble/destroy handled in Think.
 function ENT:PhysicsUpdate(phys,dt)
     if self.IsTumbling or self.Destroyed then return end
     if not self.DesiredVelocity then return end
@@ -407,8 +406,7 @@ end
 
 -- ============================================================
 -- TUMBLE / CRASH
--- All motion is computed in Think (game thread). No engine/physenv
--- calls happen inside PhysicsUpdate to avoid crashes.
+-- All motion is computed in Think (game thread).
 -- ============================================================
 function ENT:StartTumble()
     self.IsTumbling     = true
@@ -416,16 +414,14 @@ function ENT:StartTumble()
     self.TumbleCrashed  = false
     local gnd = self:FindGround(self:GetPos())
     if gnd~=-1 then self.TumbleGroundZ=gnd end
-    -- Forward velocity carried from flight, gentle downward start
     local fwd = Angle(0,self.flightYaw,0):Forward()
     local spd = self.Speed or 260
     self.TumbleVelocity = Vector(fwd.x*spd, fwd.y*spd, -80)
-    -- Slow, cinematic tumble: gentle roll, very light yaw/pitch
     local function sign() return (math.random(2)==1) and 1 or -1 end
     self.TumbleAngVelocity = Vector(
-        math.Rand(8,18)*sign(),   -- pitch  (slow nod)
-        math.Rand(3,8)*sign(),    -- yaw    (barely drifts)
-        math.Rand(20,40)*sign()   -- roll   (lazy spin)
+        math.Rand(8,18)*sign(),
+        math.Rand(3,8)*sign(),
+        math.Rand(20,40)*sign()
     )
     local pos = self:GetPos()
     local ed  = EffectData()
@@ -439,16 +435,13 @@ function ENT:UpdateTumble(ct)
 
     local dt = ct - self.TumbleLastTime
     self.TumbleLastTime = ct
-    if dt<=0 or dt>0.2 then return end  -- sanity clamp
+    if dt<=0 or dt>0.2 then return end
 
-    -- Apply gravity to Z velocity
     self.TumbleVelocity.z = self.TumbleVelocity.z - TUMBLE_GRAVITY*dt
 
-    -- Advance position
     local pos    = self:GetPos()
     local newPos = pos + self.TumbleVelocity*dt
 
-    -- Advance angles
     local av = self.TumbleAngVelocity
     self.ang = Angle(
         self.ang.p + av.x*dt,
@@ -459,7 +452,6 @@ function ENT:UpdateTumble(ct)
     self:SetPos(newPos)
     self:SetAngles(self.ang)
 
-    -- Ground / world check
     if newPos.z <= (self.TumbleGroundZ or -16384)+200 then
         self:CrashExplode() return
     end
@@ -470,14 +462,24 @@ end
 function ENT:CrashExplode()
     if self.TumbleCrashed then return end
     self.TumbleCrashed = true
-    local pos = self:GetPos()
+
+    -- Capture position before any removal happens
+    local pos = Vector(self:GetPos())
+
     local e1=EffectData() e1:SetOrigin(pos) e1:SetScale(6) e1:SetMagnitude(6) e1:SetRadius(600) util.Effect("HelicopterMegaBomb",e1,true,true)
     local e2=EffectData() e2:SetOrigin(pos) e2:SetScale(5) e2:SetMagnitude(5) e2:SetRadius(500) util.Effect("500lb_air",e2,true,true)
     local e3=EffectData() e3:SetOrigin(pos+Vector(0,0,80)) e3:SetScale(4) e3:SetMagnitude(4) e3:SetRadius(400) util.Effect("500lb_air",e3,true,true)
     sound.Play("ambient/explosions/explode_8.wav",pos,140,90,1.0)
     sound.Play("weapon_AWP.Single",pos,145,60,1.0)
-    util.BlastDamage(self,self,pos,400,200)
-    self:Remove()
+
+    -- Use game.GetWorld() as inflictor so the engine never touches self during damage dispatch
+    util.BlastDamage(game.GetWorld(), game.GetWorld(), pos, 400, 200)
+
+    -- Defer removal to the next frame so all callbacks finish cleanly
+    local ref = self
+    timer.Simple(0, function()
+        if IsValid(ref) then ref:Remove() end
+    end)
 end
 
 -- ============================================================
@@ -487,7 +489,6 @@ function ENT:Think()
     if not self.DieTime then self:NextThink(CurTime()+0.1) return true end
     local ct = CurTime()
 
-    -- Tumble is handled here, on the safe game thread
     if self.IsTumbling then
         if not self.TumbleCrashed then
             self:UpdateTumble(ct)
@@ -534,7 +535,6 @@ function ENT:DestroyPlane()
     self.WPN_PeaceUntil = math.huge
     BroadcastTier(self,3)
     self:StartTumble()
-    -- Safety removal in case CrashExplode never fires (e.g. plane is already out of world)
     timer.Simple(20, function()
         if IsValid(self) then self:CrashExplode() end
     end)
