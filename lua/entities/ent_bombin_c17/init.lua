@@ -3,14 +3,6 @@ AddCSLuaFile("cl_trailsystem.lua")
 AddCSLuaFile("shared.lua")
 include("shared.lua")
 
--- ============================================================
--- MODEL / FLIGHT ORIENTATION NOTES
--- The C-17 model nose points along LOCAL +X.
--- MODEL_YAW_OFFSET = -90 aligns the visual nose with flightYaw.
--- bank  (wing tilt)   = GMod Angle.p   (negative sign: right turn -> right wing down)
--- pitch (nose up/dn)  = GMod Angle.r
--- Final angle: Angle( -SmoothedRoll, flightYaw+OFFSET, -SmoothedPitch )
--- ============================================================
 local MODEL_YAW_OFFSET = -90
 
 local ROLL_SUSTAINED_GAIN = 2.2
@@ -23,6 +15,10 @@ local MODEL_SCALE = 1.8
 
 local DART_SPEED  = 4500
 local GRAVITY_EST = 580
+
+-- Tumble gravity (units/s^2, positive = downward in GMod Z)
+-- Cached at file load time on the game thread -- safe to use anywhere.
+local TUMBLE_GRAVITY = 600
 
 local CFG_MaxHP        = 3500
 local CFG_FadeDuration = 3.0
@@ -230,9 +226,9 @@ function ENT:Initialize()
     self.DestroyStart = nil
     self.Destroyed    = false
 
-    -- Tumble state
+    -- Tumble state -- all motion driven from Think, never PhysicsUpdate
     self.IsTumbling        = false
-    self.TumbleStartTime   = 0
+    self.TumbleLastTime    = 0
     self.TumbleGroundZ     = ground
     self.TumbleCrashed     = false
     self.TumbleVelocity    = Vector(0,0,0)
@@ -391,20 +387,9 @@ function ENT:UpdateOrbit(ct,dt)
     self:SetAngles(self.ang)
 end
 
+-- PhysicsUpdate: only handles normal flight velocity. Tumble is entirely in Think.
 function ENT:PhysicsUpdate(phys,dt)
-    if self.IsTumbling then
-        if self.TumbleCrashed then return end
-        local dtt = engine.TickInterval()
-        self.TumbleVelocity.z = self.TumbleVelocity.z+physenv.GetGravity().z*dtt
-        local pos    = self:GetPos()
-        local newPos = pos+self.TumbleVelocity*dtt
-        local av     = self.TumbleAngVelocity
-        self.ang = Angle(self.ang.p+av.x*dtt,self.ang.y+av.y*dtt,self.ang.r+av.z*dtt)
-        self:SetPos(newPos) self:SetAngles(self.ang)
-        if IsValid(phys) then phys:SetPos(newPos) phys:SetAngles(self.ang) end
-        return
-    end
-    if self.Destroyed then return end
+    if self.IsTumbling or self.Destroyed then return end
     if not self.DesiredVelocity then return end
     if phys:IsAsleep() then phys:Wake() end
     phys:SetVelocity(self.DesiredVelocity)
@@ -422,25 +407,64 @@ end
 
 -- ============================================================
 -- TUMBLE / CRASH
+-- All motion is computed in Think (game thread). No engine/physenv
+-- calls happen inside PhysicsUpdate to avoid crashes.
 -- ============================================================
 function ENT:StartTumble()
-    self.IsTumbling      = true
-    self.TumbleStartTime = CurTime()
-    self.TumbleCrashed   = false
+    self.IsTumbling     = true
+    self.TumbleLastTime = CurTime()
+    self.TumbleCrashed  = false
     local gnd = self:FindGround(self:GetPos())
     if gnd~=-1 then self.TumbleGroundZ=gnd end
+    -- Forward velocity carried from flight, gentle downward start
     local fwd = Angle(0,self.flightYaw,0):Forward()
-    self.TumbleVelocity = Vector(fwd.x*(self.Speed or 260),fwd.y*(self.Speed or 260),-200)
+    local spd = self.Speed or 260
+    self.TumbleVelocity = Vector(fwd.x*spd, fwd.y*spd, -80)
+    -- Slow, cinematic tumble: gentle roll, very light yaw/pitch
     local function sign() return (math.random(2)==1) and 1 or -1 end
     self.TumbleAngVelocity = Vector(
-        math.Rand(80,200)*sign(),
-        math.Rand(20,80)*sign(),
-        math.Rand(150,400)*sign()
+        math.Rand(8,18)*sign(),   -- pitch  (slow nod)
+        math.Rand(3,8)*sign(),    -- yaw    (barely drifts)
+        math.Rand(20,40)*sign()   -- roll   (lazy spin)
     )
     local pos = self:GetPos()
-    local ed  = EffectData() ed:SetOrigin(pos) ed:SetScale(4) ed:SetMagnitude(4) ed:SetRadius(400)
+    local ed  = EffectData()
+    ed:SetOrigin(pos) ed:SetScale(4) ed:SetMagnitude(4) ed:SetRadius(400)
     util.Effect("500lb_air",ed,true,true)
     sound.Play("ambient/explosions/explode_4.wav",pos,135,95,1.0)
+end
+
+function ENT:UpdateTumble(ct)
+    if not self.IsTumbling or self.TumbleCrashed then return end
+
+    local dt = ct - self.TumbleLastTime
+    self.TumbleLastTime = ct
+    if dt<=0 or dt>0.2 then return end  -- sanity clamp
+
+    -- Apply gravity to Z velocity
+    self.TumbleVelocity.z = self.TumbleVelocity.z - TUMBLE_GRAVITY*dt
+
+    -- Advance position
+    local pos    = self:GetPos()
+    local newPos = pos + self.TumbleVelocity*dt
+
+    -- Advance angles
+    local av = self.TumbleAngVelocity
+    self.ang = Angle(
+        self.ang.p + av.x*dt,
+        self.ang.y + av.y*dt,
+        self.ang.r + av.z*dt
+    )
+
+    self:SetPos(newPos)
+    self:SetAngles(self.ang)
+
+    -- Ground / world check
+    if newPos.z <= (self.TumbleGroundZ or -16384)+200 then
+        self:CrashExplode() return
+    end
+    local tr = util.TraceLine({start=pos, endpos=newPos, filter=self, mask=MASK_SOLID_BRUSHONLY})
+    if tr.HitWorld then self:CrashExplode() end
 end
 
 function ENT:CrashExplode()
@@ -463,12 +487,12 @@ function ENT:Think()
     if not self.DieTime then self:NextThink(CurTime()+0.1) return true end
     local ct = CurTime()
 
-    if self.IsTumbling and not self.TumbleCrashed then
-        local pos = self:GetPos()
-        if pos.z<=(self.TumbleGroundZ or -16384)+150 then self:CrashExplode() return end
-        local tr = util.TraceLine({start=pos,endpos=pos+Vector(0,0,-200),filter=self})
-        if tr.HitWorld then self:CrashExplode() return end
-        self:NextThink(ct+0.05)
+    -- Tumble is handled here, on the safe game thread
+    if self.IsTumbling then
+        if not self.TumbleCrashed then
+            self:UpdateTumble(ct)
+        end
+        self:NextThink(ct+0.015)
         return true
     end
 
@@ -510,7 +534,8 @@ function ENT:DestroyPlane()
     self.WPN_PeaceUntil = math.huge
     BroadcastTier(self,3)
     self:StartTumble()
-    timer.Simple(12, function()
+    -- Safety removal in case CrashExplode never fires (e.g. plane is already out of world)
+    timer.Simple(20, function()
         if IsValid(self) then self:CrashExplode() end
     end)
 end
