@@ -16,7 +16,6 @@ local MODEL_SCALE = 1.8
 local DART_SPEED  = 4500
 local GRAVITY_EST = 580
 
--- Tumble gravity (units/s^2). Plain constant -- safe on any thread.
 local TUMBLE_GRAVITY = 600
 
 local CFG_MaxHP        = 3500
@@ -225,7 +224,6 @@ function ENT:Initialize()
     self.DestroyStart = nil
     self.Destroyed    = false
 
-    -- Tumble state -- all motion driven from Think, never PhysicsUpdate
     self.IsTumbling        = false
     self.TumbleLastTime    = 0
     self.TumbleGroundZ     = ground
@@ -386,7 +384,6 @@ function ENT:UpdateOrbit(ct,dt)
     self:SetAngles(self.ang)
 end
 
--- PhysicsUpdate: flight velocity only. Tumble/destroy handled in Think.
 function ENT:PhysicsUpdate(phys,dt)
     if self.IsTumbling or self.Destroyed then return end
     if not self.DesiredVelocity then return end
@@ -406,7 +403,6 @@ end
 
 -- ============================================================
 -- TUMBLE / CRASH
--- All motion is computed in Think (game thread).
 -- ============================================================
 function ENT:StartTumble()
     self.IsTumbling     = true
@@ -423,6 +419,18 @@ function ENT:StartTumble()
         math.Rand(3,8)*sign(),
         math.Rand(20,40)*sign()
     )
+
+    -- Freeze the physics object so the engine stops simulating it.
+    -- Without this, Havok continues integrating the body while Think
+    -- is also calling SetPos, causing a race that crashes on ground impact.
+    local phys = self:GetPhysicsObject()
+    if IsValid(phys) then
+        phys:EnableGravity(false)
+        phys:SetVelocity(Vector(0,0,0))
+        phys:SetAngularVelocity(Vector(0,0,0))
+        phys:Sleep()
+    end
+
     local pos = self:GetPos()
     local ed  = EffectData()
     ed:SetOrigin(pos) ed:SetScale(4) ed:SetMagnitude(4) ed:SetRadius(400)
@@ -449,21 +457,31 @@ function ENT:UpdateTumble(ct)
         self.ang.r + av.z*dt
     )
 
+    -- Check ground/wall BEFORE moving — so CrashExplode is called
+    -- while self is still at a valid position, not inside the ground.
+    local hitGround = newPos.z <= (self.TumbleGroundZ or -16384)+200
+    local hitWall   = false
+    if not hitGround then
+        local tr = util.TraceLine({start=pos, endpos=newPos, filter=self, mask=MASK_SOLID_BRUSHONLY})
+        hitWall = tr.HitWorld
+    end
+
+    if hitGround or hitWall then
+        self:CrashExplode()
+        return  -- do NOT call SetPos/SetAngles after crash
+    end
+
     self:SetPos(newPos)
     self:SetAngles(self.ang)
-
-    if newPos.z <= (self.TumbleGroundZ or -16384)+200 then
-        self:CrashExplode() return
-    end
-    local tr = util.TraceLine({start=pos, endpos=newPos, filter=self, mask=MASK_SOLID_BRUSHONLY})
-    if tr.HitWorld then self:CrashExplode() end
 end
 
 function ENT:CrashExplode()
+    -- Hard gate: TumbleCrashed is the single source of truth.
+    -- Both UpdateTumble and the DestroyPlane safety timer call this;
+    -- only the first call does anything.
     if self.TumbleCrashed then return end
     self.TumbleCrashed = true
 
-    -- Capture position before any removal happens
     local pos = Vector(self:GetPos())
 
     local e1=EffectData() e1:SetOrigin(pos) e1:SetScale(6) e1:SetMagnitude(6) e1:SetRadius(600) util.Effect("HelicopterMegaBomb",e1,true,true)
@@ -472,10 +490,8 @@ function ENT:CrashExplode()
     sound.Play("ambient/explosions/explode_8.wav",pos,140,90,1.0)
     sound.Play("weapon_AWP.Single",pos,145,60,1.0)
 
-    -- Use game.GetWorld() as inflictor so the engine never touches self during damage dispatch
     util.BlastDamage(game.GetWorld(), game.GetWorld(), pos, 400, 200)
 
-    -- Defer removal to the next frame so all callbacks finish cleanly
     local ref = self
     timer.Simple(0, function()
         if IsValid(ref) then ref:Remove() end
@@ -490,6 +506,8 @@ function ENT:Think()
     local ct = CurTime()
 
     if self.IsTumbling then
+        -- TumbleCrashed means CrashExplode already fired and removal
+        -- is deferred to next frame — stop doing anything at all.
         if not self.TumbleCrashed then
             self:UpdateTumble(ct)
         end
@@ -535,13 +553,14 @@ function ENT:DestroyPlane()
     self.WPN_PeaceUntil = math.huge
     BroadcastTier(self,3)
     self:StartTumble()
+    -- Safety net: if the plane never hits ground (e.g. spawned over void),
+    -- force a crash after 20 s. TumbleCrashed gate prevents double-fire.
     timer.Simple(20, function()
         if IsValid(self) then self:CrashExplode() end
     end)
 end
 
 function ENT:OnRemove()
-    -- engine sound lifecycle owned by cl_init.lua
 end
 
 -- ============================================================
