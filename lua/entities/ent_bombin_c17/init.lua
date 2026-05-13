@@ -19,8 +19,6 @@ local ROLL_MAX            = 19.0
 local ROLL_LERP_IN        = 0.08
 local ROLL_LERP_OUT       = 0.012
 
-local ENGINE_LOOP_SOUND = "sound/b52/b52.wav"
-
 local MODEL_SCALE = 1.8
 
 -- ============================================================
@@ -263,10 +261,7 @@ function ENT:Initialize()
 
     self.JASSM_Stock  = 6
 
-    self.EngineSound = CreateSound(self, ENGINE_LOOP_SOUND)
-    if self.EngineSound then
-        self.EngineSound:PlayEx(0.9, 95)
-    end
+    -- Engine sound is managed client-side in cl_init.lua
 
     self:SetNWBool("Destroyed", false)
 
@@ -561,11 +556,6 @@ function ENT:DestroyPlane()
     self.WPN_PeaceUntil = math.huge
     BroadcastTier(self, 3)
 
-    if self.EngineSound then
-        self.EngineSound:Stop()
-        self.EngineSound = nil
-    end
-
     local pos = self:GetPos()
     local expEd = EffectData()
     expEd:SetOrigin(pos)
@@ -599,10 +589,7 @@ function ENT:DestroyPlane()
 end
 
 function ENT:OnRemove()
-    if self.EngineSound then
-        self.EngineSound:Stop()
-        self.EngineSound = nil
-    end
+    -- No-op: engine sound lifecycle is owned entirely by cl_init.lua.
 end
 
 -- ============================================================
