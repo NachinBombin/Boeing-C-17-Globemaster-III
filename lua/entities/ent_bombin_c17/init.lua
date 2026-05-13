@@ -485,26 +485,33 @@ function ENT:UpdateTumble(ct)
     self:SetAngles(self.ang)
 end
 
--- Spawns a single crash bomb at pos, aimed straight down so it detonates on impact.
+-- Spawns a single crash bomb at pos, nose-down so it detonates on impact.
+-- Order: Spawn -> Activate -> velocity -> arm  (matches SpawnDartBomb).
 local function SpawnCrashBomb(crashPos)
     if #CFG_CRASH_BOMB_POOL == 0 then return end
     local entClass = CFG_CRASH_BOMB_POOL[math.random(#CFG_CRASH_BOMB_POOL)]
     local bomb = ents.Create(entClass)
     if not IsValid(bomb) then return end
-    -- Place slightly above crash site so it can fall onto it.
-    local spawnPos = crashPos + Vector(0, 0, 60)
-    bomb:SetPos(spawnPos)
+
+    bomb:SetPos(crashPos + Vector(0, 0, 60))
     bomb:SetAngles(Angle(90, 0, 0))  -- nose-down
     bomb:Spawn()
     bomb:Activate()
-    -- Give it a tiny downward nudge so it reaches the ground quickly.
+
+    -- Validity check post-activate before touching physics or armed state.
+    if not IsValid(bomb) then return end
+
     local bPhys = bomb:GetPhysicsObject()
     if IsValid(bPhys) then
         bPhys:SetVelocity(Vector(0, 0, -120))
     end
-    -- Arm immediately (already on the ground, no safety needed).
-    if bomb.Arm then bomb:Arm()
-    elseif bomb.Armed ~= nil then bomb.Armed = true end
+
+    -- Arm after Spawn + Activate + velocity, matching SpawnDartBomb order.
+    if bomb.Arm then
+        bomb:Arm()
+    elseif bomb.Armed ~= nil then
+        bomb.Armed = true
+    end
 end
 
 function ENT:CrashExplode()
@@ -716,6 +723,7 @@ function ENT:SpawnDartBomb(entClass,dropPos,targetPos,isRetarded)
     else dropAng=Angle(90,0,0) end
     bomb:SetPos(dropPos) bomb:SetAngles(dropAng)
     bomb:Spawn() bomb:Activate()
+    if not IsValid(bomb) then return nil end
     if isRetarded then bomb:SetBodygroup(1,1) end
     local handle = constraint.NoCollide(bomb,self,0,0)
     timer.Simple(0.6,function() if IsValid(handle) then handle:Remove() end end)
@@ -731,6 +739,7 @@ function ENT:SpawnCarpetBomb(entClass,dropPos,aimPos)
     bomb.IsOnPlane=true bomb.Launcher=self bomb:SetOwner(self)
     bomb:SetPos(dropPos) bomb:SetAngles(Angle(90,self.flightYaw,0))
     bomb:Spawn() bomb:Activate()
+    if not IsValid(bomb) then return nil end
     local handle = constraint.NoCollide(bomb,self,0,0)
     timer.Simple(0.6,function() if IsValid(handle) then handle:Remove() end end)
     local bPhys = bomb:GetPhysicsObject()
