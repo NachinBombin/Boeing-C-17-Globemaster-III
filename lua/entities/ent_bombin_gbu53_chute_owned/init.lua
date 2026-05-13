@@ -11,9 +11,9 @@ AddCSLuaFile("cl_init.lua")
 AddCSLuaFile("shared.lua")
 include("shared.lua")
 
-util.AddNetworkString("bombin_gbu53chute_damage_tier")   -- legacy, kept for safety
-util.AddNetworkString("bombin_gbu53chute_pallet_tier")   -- pallet fire tiers 0-3
-util.AddNetworkString("bombin_gbu53chute_chute_tier")    -- chute  smoke/fire tiers 0-2
+util.AddNetworkString("bombin_gbu53chute_damage_tier")
+util.AddNetworkString("bombin_gbu53chute_pallet_tier")
+util.AddNetworkString("bombin_gbu53chute_chute_tier")
 
 local ROOT_MODEL     = "models/hunter/blocks/cube1x1x1.mdl"
 local PALLET_MODEL   = "models/props_phx/construct/metal_wire1x1x2.mdl"
@@ -61,9 +61,6 @@ local CHILD_NOCLIP_HOLD  = 1.8
 local DEBRIS_LIFETIME    = 14
 local RELEASE_STEP_DELAY = 0.5
 
--- ============================================================
--- TIER HELPERS  (identical pattern to ent_bombin_gbu53_owned)
--- ============================================================
 local function CalcPalletTier(hp, maxHP)
 	local frac = hp / maxHP
 	if frac > 0.66 then return 0 end
@@ -93,9 +90,6 @@ local function BroadcastChuteTier(ent, tier)
 	net.Broadcast()
 end
 
--- ============================================================
--- HELPERS
--- ============================================================
 local function SafeAttacker(ent)
 	local owner = ent:GetOwner()
 	return IsValid(owner) and owner or ent
@@ -108,9 +102,6 @@ local function FireExplosionEffect(pos, scale)
 	util.Effect("Explosion", ed, true, true)
 end
 
--- ============================================================
--- INITIALIZE
--- ============================================================
 function ENT:Initialize()
 	self:SetModel(ROOT_MODEL)
 	self:SetModelScale(ROOT_PHYS_SCALE, 0)
@@ -160,9 +151,6 @@ function ENT:Initialize()
 	self:NextThink(CurTime() + THINK_DT)
 end
 
--- ============================================================
--- DAMAGE HOOK
--- ============================================================
 function ENT:RegisterDamageHook()
 	local comboRef = self
 	local hookName = "GBU53Chute_Damage_" .. self:EntIndex()
@@ -184,9 +172,6 @@ function ENT:RegisterDamageHook()
 	self.DamageHookName = hookName
 end
 
--- ============================================================
--- CHILDREN
--- ============================================================
 function ENT:SpawnChildren()
 	local missile  = self:GetOwner()
 	local launcher = IsValid(missile) and missile.Launcher or nil
@@ -229,14 +214,12 @@ function ENT:SpawnChildren()
 		self.ChuteEnt = chute
 	end
 
-	-- ChuteHitbox: PhysicsInit MUST be called before Spawn() so the
-	-- collision mesh is built and weapon traces can register hits.
 	local cHitbox = ents.Create("prop_physics")
 	if IsValid(cHitbox) then
 		cHitbox:SetModel("models/hunter/misc/sphere075x075.mdl")
 		cHitbox:SetPos(basePos + CHUTE_ABOVE_PALETTE)
 		cHitbox:SetAngles(Angle(0, 0, 0))
-		cHitbox:PhysicsInit(SOLID_VPHYSICS)   -- FIX: build collision mesh before Spawn
+		cHitbox:PhysicsInit(SOLID_VPHYSICS)
 		cHitbox:Spawn()
 		cHitbox:Activate()
 		cHitbox:SetModelScale(3.5, 0)
@@ -259,13 +242,12 @@ function ENT:SpawnChildren()
 		end
 	end
 
-	-- PalletHitbox: same fix -- PhysicsInit before Spawn.
 	local pHitbox = ents.Create("prop_physics")
 	if IsValid(pHitbox) then
 		pHitbox:SetModel("models/hunter/blocks/cube075x075x075.mdl")
 		pHitbox:SetPos(basePos + Vector(0, 0, 8))
 		pHitbox:SetAngles(Angle(0, 0, 0))
-		pHitbox:PhysicsInit(SOLID_VPHYSICS)   -- FIX: build collision mesh before Spawn
+		pHitbox:PhysicsInit(SOLID_VPHYSICS)
 		pHitbox:Spawn()
 		pHitbox:Activate()
 		pHitbox:SetModelScale(2.2, 0)
@@ -318,9 +300,6 @@ function ENT:SpawnChildren()
 	end
 end
 
--- ============================================================
--- DAMAGE ROUTING
--- ============================================================
 local function IsImmune(ent)
 	return (CurTime() - (ent.SpawnTime or 0)) < SPAWN_IMMUNITY
 end
@@ -353,14 +332,10 @@ function ENT:TakePalletHit(dmg)
 	if self.HP_Pallet <= 0 then self:DestroyPallet() end
 end
 
--- ============================================================
--- DESTROY CHUTE
--- ============================================================
 function ENT:DestroyChute()
 	if self.ChuteDead then return end
 	self.ChuteDead = true
 
-	-- Stop chute particles on all clients
 	BroadcastChuteTier(self, 0)
 
 	if IsValid(self.ChuteHitbox) then
@@ -376,20 +351,15 @@ function ENT:DestroyChute()
 	end
 
 	local pos = self:GetPos()
-	sound.Play("physics/metal/metal_canister_impact_hard" .. math.random(1,3) .. ".wav",
-		pos, 85, math.random(80, 100), 1.0)
+	sound.Play("physics/metal/metal_canister_impact_hard" .. math.random(1,3) .. ".wav", pos, 85, math.random(80, 100), 1.0)
 end
 
--- ============================================================
--- DESTROY PALLET (mid-air hit)
--- ============================================================
 function ENT:DestroyPallet()
 	if self.PalletDead then return end
 	self.PalletDead  = true
 	self.Detached    = true
-	self.MunitionEnts = self.MunitionEnts or {}  -- guard: may be nil if damaged before SpawnChildren
+	self.MunitionEnts = self.MunitionEnts or {}
 
-	-- Clear all fire particles on all clients
 	BroadcastPalletTier(self, 0)
 	BroadcastChuteTier(self, 0)
 
@@ -398,8 +368,7 @@ function ENT:DestroyPallet()
 
 	util.BlastDamage(self, SafeAttacker(self), pos, PALLET_EXPLODE_RADIUS, PALLET_EXPLODE_DAMAGE)
 	FireExplosionEffect(pos, 2.2)
-	sound.Play("ambient/explosions/explode_" .. math.random(1, 5) .. ".wav",
-		pos, 140, math.random(88, 102), 1.0)
+	sound.Play("ambient/explosions/explode_" .. math.random(1, 5) .. ".wav", pos, 140, math.random(88, 102), 1.0)
 
 	for _, field in ipairs({"ChuteHitbox", "PalletHitbox", "PalletVisual"}) do
 		if IsValid(self[field]) then
@@ -480,9 +449,6 @@ function ENT:DestroyPallet()
 	end)
 end
 
--- ============================================================
--- THINK (1/20 s)
--- ============================================================
 function ENT:Think()
 	if self.PalletDead then return end
 
@@ -499,7 +465,9 @@ function ENT:Think()
 
 	if not self.Detached then
 		if missile:GetNWBool("EngineOn", false) then
-			self:Detach()
+			if not self.PalletDead then
+				self:Detach()
+			end
 			self:NextThink(CurTime() + THINK_DT)
 			return true
 		end
@@ -561,9 +529,6 @@ function ENT:Think()
 	return true
 end
 
--- ============================================================
--- GROUND DETONATION
--- ============================================================
 function ENT:GroundDetonation()
 	if self.PalletDead then return end
 	self.PalletDead = true
@@ -581,11 +546,9 @@ function ENT:GroundDetonation()
 		local mun         = self.MunitionEnts[i]
 		local capturedPos = IsValid(mun) and mun:GetPos() or (basePos + MUNITION_OFFSETS[i])
 		timer.Simple((i - 1) * GBU_EXPLODE_STEP_DELAY, function()
-			util.BlastDamage(self, SafeAttacker(self), capturedPos,
-				GBU_EXPLODE_RADIUS, GBU_EXPLODE_DAMAGE)
+			util.BlastDamage(self, SafeAttacker(self), capturedPos, GBU_EXPLODE_RADIUS, GBU_EXPLODE_DAMAGE)
 			FireExplosionEffect(capturedPos, 2.0)
-			sound.Play("ambient/explosions/explode_" .. math.random(1, 5) .. ".wav",
-				capturedPos, 140, math.random(88, 104), 1.0)
+			sound.Play("ambient/explosions/explode_" .. math.random(1, 5) .. ".wav", capturedPos, 140, math.random(88, 104), 1.0)
 			if IsValid(mun) then
 				mun:SetParent(nil)
 				mun:Remove()
@@ -598,13 +561,10 @@ function ENT:GroundDetonation()
 	end)
 end
 
--- ============================================================
--- DETACH (missile engine ignited)
--- ============================================================
 function ENT:Detach()
 	if self.Detached then return end
 	self.Detached     = true
-	self.MunitionEnts = self.MunitionEnts or {}  -- guard
+	self.MunitionEnts = self.MunitionEnts or {}
 
 	for _, field in ipairs({"ChuteHitbox", "PalletHitbox"}) do
 		if IsValid(self[field]) then
@@ -687,13 +647,25 @@ function ENT:Detach()
 	end)
 end
 
--- ============================================================
--- CLEANUP
--- ============================================================
+function ENT:OnTakeDamage( dmginfo )
+	if IsImmune( self ) or self.PalletDead then return end
+	local dmg = dmginfo:GetDamage()
+	if dmg <= 0 then return end
+
+	if not self.ChuteDead then
+		self:TakePalletHit( dmg * 0.5 )
+		if not self.PalletDead then
+			self:TakeChuteHit( dmg * 0.5 )
+		end
+	else
+		self:TakePalletHit( dmg )
+	end
+end
+
 function ENT:FullRemove()
 	self.Detached     = true
 	self.PalletDead   = true
-	self.MunitionEnts = self.MunitionEnts or {}  -- guard
+	self.MunitionEnts = self.MunitionEnts or {}
 
 	for _, field in ipairs({"PalletVisual", "ChuteEnt", "ChuteHitbox", "PalletHitbox", "ChuteClone"}) do
 		if IsValid(self[field]) then
