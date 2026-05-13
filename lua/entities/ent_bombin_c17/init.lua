@@ -56,6 +56,17 @@ local CFG_W2_Pool = {
     { class="sw_bomb_anmk1_v3",    retarded=false },
 }
 
+-- Crash bombs: 2 heavy bombs spawned at impact point, 0.7s apart.
+-- Picked from CFG_W2_Pool (non-retarded entries only).
+local CFG_CRASH_BOMB_COUNT = 2
+local CFG_CRASH_BOMB_GAP   = 0.7
+local CFG_CRASH_BOMB_POOL  = {}
+for _, entry in ipairs(CFG_W2_Pool) do
+    if not entry.retarded then
+        table.insert(CFG_CRASH_BOMB_POOL, entry.class)
+    end
+end
+
 local CFG_W3_GBU53_Count       = 3
 local CFG_W3_GBU53_Delay       = 1.2
 local CFG_W3_DropOffset        = Vector(0,50,-60)
@@ -423,11 +434,6 @@ function ENT:StartTumble()
         math.Rand(20,40)*sign()
     )
 
-    -- Disable the physics simulation entirely during tumble.
-    -- We drive position/angles manually via SetPos/SetAngles in UpdateTumble.
-    -- NOTE: GMod's PhysObj does NOT have SetAngularVelocity — the correct
-    -- method is SetAngleVelocity. Guard IsValid before every call because
-    -- this can be triggered mid-FireBullets before the physics body is ready.
     self:SetMoveType(MOVETYPE_NONE)
     local phys = self:GetPhysicsObject()
     if IsValid(phys) then
@@ -463,8 +469,6 @@ function ENT:UpdateTumble(ct)
         self.ang.r + av.z*dt
     )
 
-    -- Check ground/wall BEFORE moving so CrashExplode fires while
-    -- self is still at a valid above-ground position.
     local hitGround = newPos.z <= (self.TumbleGroundZ or -16384)+200
     local hitWall   = false
     if not hitGround then
@@ -481,6 +485,28 @@ function ENT:UpdateTumble(ct)
     self:SetAngles(self.ang)
 end
 
+-- Spawns a single crash bomb at pos, aimed straight down so it detonates on impact.
+local function SpawnCrashBomb(crashPos)
+    if #CFG_CRASH_BOMB_POOL == 0 then return end
+    local entClass = CFG_CRASH_BOMB_POOL[math.random(#CFG_CRASH_BOMB_POOL)]
+    local bomb = ents.Create(entClass)
+    if not IsValid(bomb) then return end
+    -- Place slightly above crash site so it can fall onto it.
+    local spawnPos = crashPos + Vector(0, 0, 60)
+    bomb:SetPos(spawnPos)
+    bomb:SetAngles(Angle(90, 0, 0))  -- nose-down
+    bomb:Spawn()
+    bomb:Activate()
+    -- Give it a tiny downward nudge so it reaches the ground quickly.
+    local bPhys = bomb:GetPhysicsObject()
+    if IsValid(bPhys) then
+        bPhys:SetVelocity(Vector(0, 0, -120))
+    end
+    -- Arm immediately (already on the ground, no safety needed).
+    if bomb.Arm then bomb:Arm()
+    elseif bomb.Armed ~= nil then bomb.Armed = true end
+end
+
 function ENT:CrashExplode()
     if self.TumbleCrashed then return end
     self.TumbleCrashed = true
@@ -494,6 +520,15 @@ function ENT:CrashExplode()
     sound.Play("weapon_AWP.Single",pos,145,60,1.0)
 
     util.BlastDamage(game.GetWorld(), game.GetWorld(), pos, 400, 200)
+
+    -- Spawn 2 heavy bombs at the crash site, 0.7s apart, to simulate
+    -- the final fuel/munitions cook-off explosion.
+    for i = 0, CFG_CRASH_BOMB_COUNT - 1 do
+        local delay = i * CFG_CRASH_BOMB_GAP
+        timer.Simple(delay, function()
+            SpawnCrashBomb(pos)
+        end)
+    end
 
     local ref = self
     timer.Simple(0, function()
