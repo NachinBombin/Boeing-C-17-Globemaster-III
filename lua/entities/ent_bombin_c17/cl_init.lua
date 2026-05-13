@@ -1,20 +1,13 @@
 include( "shared.lua" )
 include( "cl_trailsystem.lua" )
 
--- Engine sound managed client-side. "sound/" prefix must NOT be used with CreateSound.
 local ENGINE_LOOP_SOUND = "b52/b52.wav"
 
--- ============================================================
--- CONSTANTS
--- ============================================================
 local ROLL_MAX        = 22.0
 local FLAP_RETRACTED  = -28
 local FLAP_EXTENDED   =  38
 local FAN_RPM         = 900
 
--- ============================================================
--- CARGO DOOR CONSTANTS
--- ============================================================
 local DOOR_SPEED        = 28
 local DOOR_THRESHOLD    = 1.0
 local DOOR_TARGETS_OPEN = { 28, 28, 100 }
@@ -24,9 +17,6 @@ local DOOR_BONES = {
 	"c17.ramp_1b_move",
 }
 
--- ============================================================
--- CARGO LIGHT CONSTANTS
--- ============================================================
 local CARGO_LIGHT_LOCAL    = Vector( -200, 0, -80 )
 local CARGO_LIGHT_RADIUS   = 1400
 local CARGO_LIGHT_DECAY    = 1200
@@ -34,9 +24,6 @@ local CARGO_LIGHT_MIN_BRIG = 0.35
 local CARGO_LIGHT_MAX_BRIG = 1.0
 local CARGO_LIGHT_PULSE_HZ = 0.6
 
--- ============================================================
--- NAV / STROBE LIGHT CONSTANTS
--- ============================================================
 local NAV_BLINK_ON   = 0.12
 local NAV_BLINK_OFF  = 0.85
 local NAV_RADIUS     = 80
@@ -50,9 +37,6 @@ local NAV_LIGHTS = {
 	{ Vector(-350,    0, -55 ), 255,   0,   0, 3, 0.16 },
 }
 
--- ============================================================
--- CONDENSATION VAPOR CONSTANTS
--- ============================================================
 local VAPOR_DURATION   = 1.5
 local VAPOR_LOCAL      = Vector( -200, 0, -90 )
 local VAPOR_PER_FRAME  = 6
@@ -62,9 +46,6 @@ local VAPOR_SIZE_END   = 55
 local VAPOR_SPEED      = 90
 local VAPOR_SPRITE     = "particle/particle_smokegrenade"
 
--- ============================================================
--- DAMAGE VISUAL SYSTEM  (ported from B-52)
--- ============================================================
 game.AddParticles( "particles/fire_01.pcf" )
 PrecacheParticleSystem( "fire_medium_02" )
 
@@ -160,14 +141,20 @@ function ENT:Initialize()
 	self._VaporEmitter = nil
 	self._VaporUntil   = 0
 
-	-- Client-side engine sound state
 	self._EngineSound   = nil
 	self._EnginePlaying = false
+	self._EngineKilled  = false
 end
 
--- ============================================================
--- CARGO DOOR ANIMATOR
--- ============================================================
+function ENT:_KillSound()
+	if self._EngineSound then
+		self._EngineSound:FadeOut( 1.5 )
+		self._EngineSound   = nil
+		self._EnginePlaying = false
+	end
+	self._EngineKilled = true
+end
+
 function ENT:UpdateCargoDoors( dt )
 	local wantOpen = self:GetNWBool( "CargoDoorOpen", false )
 
@@ -221,19 +208,13 @@ function ENT:UpdateCargoDoors( dt )
 	end
 end
 
--- ============================================================
--- RED CARGO BAY LIGHT
--- ============================================================
 function ENT:UpdateCargoLight()
 	if not self:GetNWBool( "CargoDoorOpen", false ) then return end
-
 	local dl = DynamicLight( self:EntIndex() + 4096 )
 	if not dl then return end
-
 	local t      = CurTime() * CARGO_LIGHT_PULSE_HZ * math.pi * 2
 	local frac   = ( math.sin( t ) + 1 ) * 0.5
 	local bright = CARGO_LIGHT_MIN_BRIG + frac * ( CARGO_LIGHT_MAX_BRIG - CARGO_LIGHT_MIN_BRIG )
-
 	local worldPos = self:LocalToWorld( CARGO_LIGHT_LOCAL )
 	dl.pos        = worldPos
 	dl.r          = 255
@@ -245,22 +226,15 @@ function ENT:UpdateCargoLight()
 	dl.dietime    = CurTime() + 0.1
 end
 
--- ============================================================
--- NAV / STROBE LIGHTS
--- ============================================================
 function ENT:UpdateNavLights()
 	if not self:GetNWBool( "CargoDoorOpen", false ) then return end
-
 	local ct      = CurTime()
 	local period  = NAV_BLINK_ON + NAV_BLINK_OFF
 	local base    = self:EntIndex() * 10
-
 	for _, light in ipairs( NAV_LIGHTS ) do
 		local lpos, r, g, b, slot, phase = light[1], light[2], light[3], light[4], light[5], light[6]
-
 		local t    = ( ct + phase * period ) % period
 		local isOn = ( t < NAV_BLINK_ON )
-
 		if isOn then
 			local dl = DynamicLight( base + slot )
 			if dl then
@@ -277,15 +251,11 @@ function ENT:UpdateNavLights()
 	end
 end
 
--- ============================================================
--- CONDENSATION VAPOR
--- ============================================================
 function ENT:StartVapor()
 	if self._VaporEmitter then
 		self._VaporEmitter:Finish()
 		self._VaporEmitter = nil
 	end
-
 	local worldPos     = self:LocalToWorld( VAPOR_LOCAL )
 	self._VaporEmitter = ParticleEmitter( worldPos, true )
 	self._VaporUntil   = CurTime() + VAPOR_DURATION
@@ -293,17 +263,14 @@ end
 
 function ENT:UpdateVapor()
 	if not self._VaporEmitter then return end
-
 	local ct = CurTime()
 	if ct >= self._VaporUntil then
 		self._VaporEmitter:Finish()
 		self._VaporEmitter = nil
 		return
 	end
-
 	local worldPos = self:LocalToWorld( VAPOR_LOCAL )
 	local rearDir  = self:LocalToWorldAngles( Angle( 5, 180, 0 ) ):Forward()
-
 	for _ = 1, VAPOR_PER_FRAME do
 		local p = self._VaporEmitter:Add( VAPOR_SPRITE, worldPos )
 		if p then
@@ -330,47 +297,53 @@ function ENT:UpdateVapor()
 end
 
 -- ============================================================
--- ENGINE SOUND (CLIENT)
+-- ENGINE SOUND + THINK
 -- ============================================================
 function ENT:Think()
+	-- Once destroyed, kill sound once then stop all per-frame work.
+	-- Accessing IsPlaying() or any self method while the entity is
+	-- being tumbled / removed crashes the client.
 	local destroyed = self:GetNWBool( "Destroyed", false )
+	if destroyed then
+		if not self._EngineKilled then
+			self:_KillSound()
+		end
+		return
+	end
 
-	if not destroyed then
-		if not self._EnginePlaying then
-			local snd = CreateSound( self, ENGINE_LOOP_SOUND )
-			if snd then
-				snd:SetSoundLevel( 85 )
-				snd:ChangePitch( 95, 0 )
-				snd:ChangeVolume( 0.9, 0 )
-				snd:Play()
-				self._EngineSound   = snd
-				self._EnginePlaying = true
-			end
-		end
-		if self._EngineSound and not self._EngineSound:IsPlaying() then
-			self._EngineSound:Play()
-		end
-	else
-		if self._EngineSound then
-			self._EngineSound:FadeOut( 1.5 )
-			self._EngineSound   = nil
-			self._EnginePlaying = false
+	if not self._EnginePlaying then
+		local snd = CreateSound( self, ENGINE_LOOP_SOUND )
+		if snd then
+			snd:SetSoundLevel( 85 )
+			snd:ChangePitch( 95, 0 )
+			snd:ChangeVolume( 0.9, 0 )
+			snd:Play()
+			self._EngineSound   = snd
+			self._EnginePlaying = true
 		end
 	end
 end
 
 function ENT:OnRemove()
-	if self._EngineSound then
-		self._EngineSound:FadeOut( 0.5 )
-		self._EngineSound   = nil
-		self._EnginePlaying = false
+	self:_KillSound()
+	if self._VaporEmitter then
+		self._VaporEmitter:Finish()
+		self._VaporEmitter = nil
 	end
 end
 
 -- ============================================================
--- DRAW
+-- DRAW  -- fully gated on Destroyed flag
 -- ============================================================
 function ENT:Draw()
+	-- When destroyed, skip ALL bone/door/light work.
+	-- LookupBone + ManipulateBoneAngles on an entity the server is
+	-- rapidly repositioning (tumble → ground impact) crashes the renderer.
+	if self:GetNWBool( "Destroyed", false ) then
+		self:DrawModel()
+		return
+	end
+
 	local roll = self:GetAngles().p
 
 	self._FanAngle = ( self._FanAngle or 0 ) + FAN_RPM * FrameTime()
@@ -390,7 +363,6 @@ function ENT:Draw()
 
 	self:DrawModel()
 
-	-- Fans
 	local bLF1 = self:LookupBone( "c17.engine_fan_lf1" )
 	local bLF2 = self:LookupBone( "c17.engine_fan_lf2" )
 	local bRT1 = self:LookupBone( "c17.engine_fan_rt1" )
@@ -401,14 +373,12 @@ function ENT:Draw()
 	if bRT1 then self:ManipulateBoneAngles( bRT1, Angle( 0, 0, fanZ ) ) end
 	if bRT2 then self:ManipulateBoneAngles( bRT2, Angle( 0, 0, fanZ ) ) end
 
-	-- Flaps
 	local bFlapL = self:LookupBone( "c17.flap_lf_1c_move" )
 	local bFlapR = self:LookupBone( "c17.flap_rt_1c_move" )
 
 	if bFlapL then self:ManipulateBoneAngles( bFlapL, Angle( 0, flapLeft,  0 ) ) end
 	if bFlapR then self:ManipulateBoneAngles( bFlapR, Angle( 0, flapRight, 0 ) ) end
 
-	-- Cargo doors
 	local bRamp2  = self:LookupBone( "c17.ramp_2_move"  )
 	local bRamp1  = self:LookupBone( "c17.ramp_1_move"  )
 	local bRamp1b = self:LookupBone( "c17.ramp_1b_move" )
