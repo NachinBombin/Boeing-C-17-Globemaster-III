@@ -13,10 +13,14 @@ local WP_IGNITE_DELAY = 4.5
 local WP_IGNITE_DUR   = 2.5
 local WP_BURN_LIFE    = 45
 
--- Drag: we target terminal velocity ~70 u/s downward.
--- PhysicsUpdate applies an upward impulse each tick to clamp velocity.
--- Using impulse approach (not raw force * mass) avoids the overshoot CTD.
-local WP_TERM_VEL     = -70   -- negative = downward
+-- Target terminal velocity (downward u/s). PhysicsUpdate damps toward this.
+local WP_TERM_VEL     = -70
+
+-- Sway: pendulum-like tilt driven by horizontal velocity
+local WP_SWAY_MAX     = 14     -- max tilt degrees
+local WP_SWAY_LERP    = 0.04   -- lerp rate toward target angle per tick
+local WP_SWAY_OSC_AMP = 6      -- oscillation amplitude when nearly vertical
+local WP_SWAY_OSC_HZ  = 0.35   -- oscillation frequency (Hz)
 
 local WP_CHUTE_OFFSET = Vector(0, 0, 90)
 local THINK_DT        = 0.1
@@ -27,6 +31,7 @@ local STATE_BURNING  = 2
 local STATE_DEAD     = 3
 
 util.AddNetworkString("bombin_wp_state")
+util.AddNetworkString("bombin_wp_sway")
 
 local function BroadcastState(ent, state)
     net.Start("bombin_wp_state")
@@ -35,9 +40,18 @@ local function BroadcastState(ent, state)
     net.Broadcast()
 end
 
+local function BroadcastSway(ent, pitch, roll)
+    net.Start("bombin_wp_sway")
+        net.WriteUInt(ent:EntIndex(), 16)
+        net.WriteInt(math.Round(pitch * 10), 16)
+        net.WriteInt(math.Round(roll  * 10), 16)
+    net.Broadcast()
+end
+
 -- ============================================================
 -- INITIALIZE
--- NOTE: never call self:Spawn()/self:Activate() inside Initialize().
+-- DropVel is set by c17/init.lua before Spawn() is called.
+-- It carries the plane's forward momentum + lateral spread vector.
 -- ============================================================
 function ENT:Initialize()
     self:SetModel(WP_MODEL)
@@ -51,8 +65,10 @@ function ENT:Initialize()
         phys:Wake()
         phys:EnableGravity(true)
         phys:SetMass(40)
-        phys:SetDamping(0.1, 0.4)
-        phys:SetVelocity(Vector(math.Rand(-20,20), math.Rand(-20,20), -60))
+        phys:SetDamping(0.05, 0.3)
+        -- Use DropVel set by spawner; fall back to straight down if not set
+        local initVel = self.DropVel or Vector(0, 0, -60)
+        phys:SetVelocity(initVel)
     end
 
     self.WP_State     = STATE_FALLING
@@ -62,6 +78,10 @@ function ENT:Initialize()
     self.WP_SoundTime = 0
     self.WP_SparkNext = 0
     self.WP_ChuteEnt  = nil
+    self.WP_SwayPitch = 0
+    self.WP_SwayRoll  = 0
+    self.WP_SwayNext  = 0
+    self.WP_SwayT0    = CurTime()
 
     timer.Simple(0, function()
         if not IsValid(self) then return end
@@ -88,36 +108,65 @@ function ENT:Initialize()
 end
 
 -- ============================================================
--- PHYSICS: parachute drag via velocity clamping impulse
--- PhysicsUpdate fires ~66 Hz. We apply a corrective upward
--- impulse only when falling faster than terminal velocity.
--- Impulse = mass * delta_v, so it's frame-rate independent.
+-- PHYSICS: parachute drag
+-- Vertical: impulse clamps descent to WP_TERM_VEL.
+-- Horizontal: gentle air resistance decays forward speed over ~8s,
+--   producing realistic lateral drift before the chute settles vertical.
 -- ============================================================
 function ENT:PhysicsUpdate(phys)
     if self.WP_State == STATE_DEAD then return end
     local vel = phys:GetVelocity()
 
+    -- Vertical drag: only kick upward when faster than terminal
     if vel.z < WP_TERM_VEL then
-        -- Apply impulse to bring vz back toward terminal this tick
-        local dv   = WP_TERM_VEL - vel.z   -- positive upward correction needed
-        local mass = phys:GetMass()
-        -- Scale impulse: only apply a fraction per tick so deceleration is gradual
-        local impulse = mass * dv * 0.08
+        local dv      = WP_TERM_VEL - vel.z
+        local impulse = phys:GetMass() * dv * 0.08
         phys:ApplyForceCenter(Vector(0, 0, impulse))
     end
 
-    -- Gentle horizontal damping (pendulum sway settling)
-    phys:ApplyForceCenter(Vector(-vel.x * 0.5, -vel.y * 0.5, 0))
+    -- Horizontal drag: ~0.35 per tick decays ~220 u/s to <30 u/s in ~8s
+    local hDamp = 0.35
+    phys:ApplyForceCenter(Vector(-vel.x * hDamp, -vel.y * hDamp, 0))
 end
 
 -- ============================================================
--- THINK: state machine (10 Hz)
+-- THINK: state machine + sway (10 Hz)
 -- ============================================================
 function ENT:Think()
     if self.WP_State == STATE_DEAD then return end
     local ct  = CurTime()
     local pos = self:GetPos()
 
+    -- ---- Sway at 8 Hz ----
+    if ct >= self.WP_SwayNext then
+        self.WP_SwayNext = ct + 0.12
+        local phys = self:GetPhysicsObject()
+        if IsValid(phys) then
+            local vel    = phys:GetVelocity()
+            local hspeed = math.sqrt(vel.x*vel.x + vel.y*vel.y)
+
+            -- Lean into horizontal motion
+            local tiltMag = math.min(hspeed / 80, 1) * WP_SWAY_MAX
+            local hdir    = (hspeed > 5) and math.atan2(vel.y, vel.x) or 0
+            local targetPitch = -tiltMag * math.cos(hdir)
+            local targetRoll  = -tiltMag * math.sin(hdir)
+
+            -- Pendulum oscillation: grows as horizontal speed decays
+            local osc      = WP_SWAY_OSC_AMP * math.sin((ct - self.WP_SwayT0) * 2 * math.pi * WP_SWAY_OSC_HZ)
+            local oscDecay = math.max(0, 1 - hspeed / 120)
+            targetPitch    = targetPitch + osc * oscDecay
+
+            self.WP_SwayPitch = Lerp(WP_SWAY_LERP, self.WP_SwayPitch, targetPitch)
+            self.WP_SwayRoll  = Lerp(WP_SWAY_LERP, self.WP_SwayRoll,  targetRoll)
+
+            if IsValid(self.WP_ChuteEnt) then
+                self.WP_ChuteEnt:SetLocalAngles(Angle(self.WP_SwayPitch, 0, self.WP_SwayRoll))
+            end
+            BroadcastSway(self, self.WP_SwayPitch, self.WP_SwayRoll)
+        end
+    end
+
+    -- ---- State transitions ----
     if self.WP_State == STATE_FALLING then
         if ct >= self.WP_IgniteAt then
             self.WP_State     = STATE_IGNITING
@@ -140,7 +189,7 @@ function ENT:Think()
             BroadcastState(self, STATE_BURNING)
             local fed = EffectData()
             fed:SetOrigin(pos)
-            fed:SetScale(2)
+            fed:SetScale(1)
             util.Effect("Explosion", fed, true, true)
             sound.Play("ambient/fire/fire_large_loop1.wav", pos, 95, 80, 1.0)
             self.WP_SoundTime = ct + 4.5
@@ -178,7 +227,7 @@ function ENT:WP_Die()
 end
 
 -- ============================================================
--- GROUND IMPACT
+-- GROUND IMPACT: detach chute
 -- ============================================================
 function ENT:PhysicsCollide(data, physObj)
     if self.WP_State == STATE_DEAD then return end
