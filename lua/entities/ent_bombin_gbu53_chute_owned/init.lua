@@ -229,11 +229,14 @@ function ENT:SpawnChildren()
 		self.ChuteEnt = chute
 	end
 
+	-- ChuteHitbox: PhysicsInit MUST be called before Spawn() so the
+	-- collision mesh is built and weapon traces can register hits.
 	local cHitbox = ents.Create("prop_physics")
 	if IsValid(cHitbox) then
 		cHitbox:SetModel("models/hunter/misc/sphere075x075.mdl")
 		cHitbox:SetPos(basePos + CHUTE_ABOVE_PALETTE)
 		cHitbox:SetAngles(Angle(0, 0, 0))
+		cHitbox:PhysicsInit(SOLID_VPHYSICS)   -- FIX: build collision mesh before Spawn
 		cHitbox:Spawn()
 		cHitbox:Activate()
 		cHitbox:SetModelScale(3.5, 0)
@@ -256,11 +259,13 @@ function ENT:SpawnChildren()
 		end
 	end
 
+	-- PalletHitbox: same fix -- PhysicsInit before Spawn.
 	local pHitbox = ents.Create("prop_physics")
 	if IsValid(pHitbox) then
 		pHitbox:SetModel("models/hunter/blocks/cube075x075x075.mdl")
 		pHitbox:SetPos(basePos + Vector(0, 0, 8))
 		pHitbox:SetAngles(Angle(0, 0, 0))
+		pHitbox:PhysicsInit(SOLID_VPHYSICS)   -- FIX: build collision mesh before Spawn
 		pHitbox:Spawn()
 		pHitbox:Activate()
 		pHitbox:SetModelScale(2.2, 0)
