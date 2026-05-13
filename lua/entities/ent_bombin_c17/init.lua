@@ -64,20 +64,11 @@ local CFG_W1_JASSM_Delay      = 0
 local CFG_W1_JASSM_TailOffset = Vector(0,100, -70)
 local CFG_W1_JASSM_AltOffset  = 500
 
--- ent_bombin_jassm_owned computes:
---   IgnitionAlt = groundZ + SHA + rand(-SHA*0.25, +SHA*0.25)
--- Worst-case (highest possible ignition): groundZ + SHA * 1.25
---
--- We need: dropPos.z > IgnitionAlt_max
---   dropPos.z > groundZ + SHA * 1.25
---   SHA < (dropPos.z - groundZ) / 1.25
---   SHA_max = (dropHeight - MIN_FREEFALL_CLEARANCE) / 1.25
 local CFG_W1_JASSM_MIN_FREEFALL_CLEARANCE = 800
 local CFG_W1_JASSM_SHA_FLOOR              = 400
 local CFG_W1_JASSM_MIN_DROP_HEIGHT = CFG_W1_JASSM_SHA_FLOOR * 1.25 + CFG_W1_JASSM_MIN_FREEFALL_CLEARANCE
 
 -- ---------- W2 -- Heavy ordnance ----------
--- Entries are structs {class, retarded} to avoid fragile _air_v3 substring heuristic.
 local CFG_W2_Count   = 2
 local CFG_W2_Delay   = 4.0
 local CFG_W2_Scatter = 0
@@ -93,10 +84,6 @@ local CFG_W2_Pool    = {
 }
 
 -- ---------- W3 -- GBU-53 parachute cluster ----------
--- All 3 pallets spawn from the same cargo door position.
--- Separation happens naturally from the 1.2s inter-shot delay
--- (CFG_W3_GBU53_Delay): by the time pallet 2 drops, pallet 1 is
--- already 1.2 seconds into freefall and well clear of the door.
 local CFG_W3_GBU53_Count       = 3
 local CFG_W3_GBU53_Delay       = 1.2
 local CFG_W3_DropOffset        = Vector(0, 50, -60)
@@ -115,24 +102,16 @@ local CFG_W6_Pool    = {
 }
 
 -- ---------- W7 -- WP Illumination parachute canister ----------
--- 4 canisters per pass, 1.5s between each drop.
--- All spawn from the same cargo door offset as W3.
-local CFG_W7_Count          = 4
-local CFG_W7_Delay          = 1.5
-local CFG_W7_DropOffset     = Vector(0, 50, -60)
-local CFG_W7_BodyClearance  = 80
-local CFG_W7_NoCollideHold  = 1.8
+local CFG_W7_Count         = 4
+local CFG_W7_Delay         = 1.5
+local CFG_W7_DropOffset    = Vector(0, 50, -60)
+local CFG_W7_BodyClearance = 80
+local CFG_W7_NoCollideHold = 1.8
 
 local WEAPON_ROSTER = { "jassm", "heavy", "gbu53", "retarded", "wp" }
 
 -- ============================================================
 -- CARGO DOOR TIMING
--- Derived from cl_init.lua constants:
---   DOOR_SPEED = 28 deg/s
---   DOOR_TARGETS_OPEN = { 28, 28, 100 }  (three sequential bone targets)
---   Total travel = 28+28+100 = 156 deg  =>  156/28 = 5.571 s
--- We use 5.58 s (a small safety margin) so the door is fully open
--- before the first shot is permitted.  Close time is symmetric.
 -- ============================================================
 local DOOR_OPEN_TIME  = 5.58
 local DOOR_CLOSE_TIME = 5.58
@@ -142,14 +121,8 @@ local DOOR_CLOSE_TIME = 5.58
 -- ============================================================
 local PALLET_MODEL    = "models/props/de_prodigy/wood_pallet_01.mdl"
 local PALLET_LIFETIME = 20
--- NoCollide hold time between a pallet and the bomb that just dropped.
--- Keeps the pallet from blowing up the bomb after it goes physics.
 local PALLET_NOCLIDE_HOLD = 2.0
 
--- Spawns a wood pallet as physics debris.
--- bombRef: the bomb entity to NoCollide against (may be nil for pure decoration).
--- Spawned via timer.Simple(0) so it lands in the NEXT physics tick,
--- preventing interpenetration with the bomb that was spawned this tick.
 local function SpawnWoodPallet(pos, vel, bombRef)
     timer.Simple(0, function()
         local p = ents.Create("prop_physics")
@@ -164,8 +137,6 @@ local function SpawnWoodPallet(pos, vel, bombRef)
         if IsValid(ph) then
             ph:SetVelocity(vel or Vector(0,0,0))
         end
-        -- NoCollide between pallet and the bomb so the pallet scatter
-        -- impulse never reaches an armed munition.
         if IsValid(bombRef) then
             local ncHandle = constraint.NoCollide(p, bombRef, 0, 0)
             timer.Simple(PALLET_NOCLIDE_HOLD, function()
@@ -192,9 +163,6 @@ local function BroadcastTier(ent, tier)
     net.Broadcast()
 end
 
--- ============================================================
--- CARGO DOOR
--- ============================================================
 function C17_SetCargoDoor(planeEnt, open)
     if not IsValid(planeEnt) then return end
     planeEnt:SetNWBool("CargoDoorOpen", open)
@@ -277,18 +245,12 @@ function ENT:Initialize()
     self.JitterPhase      = math.Rand(0, math.pi * 2)
     self.JitterAmplitude  = 8
 
-    -- Weapon state.
-    -- WPN_Phase values:
-    --   nil / false = idle (no active weapon)
-    --   "opening"   = door commanded open, waiting for animation to finish
-    --   "firing"    = door fully open, actively shooting
-    --   "closing"   = all shots done, door commanded closed, waiting for animation
     self.WPN_Active     = nil
     self.WPN_Phase      = nil
     self.WPN_ShotsFired = 0
     self.WPN_NextShot   = 0
     self.WPN_WindowEnd  = 0
-    self.WPN_PhaseUntil = 0   -- time when current phase (opening/closing) finishes
+    self.WPN_PhaseUntil = 0
     self.WPN_PeaceUntil = CurTime() + math.Rand(CFG_PeacefulMin, CFG_PeacefulMax)
 
     self.HP           = self.MaxHP
@@ -490,60 +452,33 @@ function ENT:PickNewWeapon(ct)
     self.WPN_Phase      = "opening"
     self.WPN_PhaseUntil = ct + DOOR_OPEN_TIME
     self.WPN_ShotsFired = 0
-    -- WPN_NextShot and WPN_WindowEnd are set when we transition to "firing"
     self.WPN_NextShot   = 0
     self.WPN_WindowEnd  = 0
-    -- Open the door now so the animation starts immediately.
     self:SetNWBool("CargoDoorOpen", true)
     self:Debug("Weapon window: " .. w .. " | door opening for " .. DOOR_OPEN_TIME .. "s")
 end
 
--- ============================================================
--- UpdateWeapons  -  3-phase state machine
---
---  Phase "opening":
---    Door open command sent, waiting DOOR_OPEN_TIME for the client
---    animation to fully open before the first shot is allowed.
---
---  Phase "firing":
---    Door is fully open.  Each weapon's Update* function fires its
---    shots.  The weapon window timer only counts during this phase.
---    When all shots are done (or the window expires), we move to
---    "closing".
---
---  Phase "closing":
---    All shots fired.  Door close command sent, waiting DOOR_CLOSE_TIME
---    for the animation to fully close before starting the peace timer.
---    Only after this phase ends does WPN_PeaceUntil get set.
--- ============================================================
 function ENT:UpdateWeapons(ct)
-    -- Peace timer: nothing happens until it expires.
     if ct < self.WPN_PeaceUntil then return end
 
-    -- No active weapon: pick one if a target exists.
     if not self.WPN_Active then
         if not IsValid(self:RefreshTarget(ct)) then return end
         self:PickNewWeapon(ct)
         return
     end
 
-    -- ---- Phase: opening ----
     if self.WPN_Phase == "opening" then
-        if ct < self.WPN_PhaseUntil then return end  -- still animating
-        -- Door fully open - enter firing phase.
+        if ct < self.WPN_PhaseUntil then return end
         self.WPN_Phase     = "firing"
-        self.WPN_NextShot  = ct                        -- first shot may fire this tick
+        self.WPN_NextShot  = ct
         self.WPN_WindowEnd = ct + 12
         self:Debug("Weapon window: " .. self.WPN_Active .. " | door open, firing begins")
-        -- Fall through into the firing block below.
     end
 
-    -- ---- Phase: firing ----
     if self.WPN_Phase == "firing" then
         local w    = self.WPN_Active
         local done = false
 
-        -- Weapon window hard timeout (safety net).
         if ct > self.WPN_WindowEnd then
             done = true
         else
@@ -556,7 +491,6 @@ function ENT:UpdateWeapons(ct)
         end
 
         if done then
-            -- All shots fired.  Close door and wait for animation.
             self.WPN_Phase      = "closing"
             self.WPN_PhaseUntil = ct + DOOR_CLOSE_TIME
             self:SetNWBool("CargoDoorOpen", false)
@@ -565,10 +499,8 @@ function ENT:UpdateWeapons(ct)
         return
     end
 
-    -- ---- Phase: closing ----
     if self.WPN_Phase == "closing" then
-        if ct < self.WPN_PhaseUntil then return end  -- still animating
-        -- Door fully closed - start peace timer.
+        if ct < self.WPN_PhaseUntil then return end
         self:Debug("Weapon window: " .. self.WPN_Active .. " | door closed, peace timer started")
         self.WPN_Active     = nil
         self.WPN_Phase      = nil
@@ -624,7 +556,6 @@ function ENT:DestroyPlane()
     self.Destroyed = true
     self:SetNWBool("Destroyed", true)
     self:SetNWBool("CargoDoorOpen", false)
-    -- Cancel any in-flight weapon state so UpdateWeapons never fires again.
     self.WPN_Active     = nil
     self.WPN_Phase      = nil
     self.WPN_PeaceUntil = math.huge
@@ -746,13 +677,11 @@ function ENT:SpawnDartBomb(entClass, dropPos, targetPos, isRetarded)
     bomb:Activate()
     if isRetarded then bomb:SetBodygroup(1, 1) end
 
-    -- NoCollide bomb <-> plane before touching physics or arming.
     local handle = constraint.NoCollide(bomb, self, 0, 0)
     timer.Simple(0.6, function()
         if IsValid(handle) then handle:Remove() end
     end)
 
-    -- Bug C fix: set velocity BEFORE arming.
     local bPhys = bomb:GetPhysicsObject()
     if IsValid(bPhys) then
         bPhys:SetVelocity(CalcDartVelocity(dropPos, targetPos))
@@ -783,7 +712,6 @@ function ENT:SpawnCarpetBomb(entClass, dropPos, aimPos)
         if IsValid(handle) then handle:Remove() end
     end)
 
-    -- Bug C fix: velocity before arm.
     local bPhys = bomb:GetPhysicsObject()
     if IsValid(bPhys) then
         local aircraftFwd = Angle(0, self.flightYaw, 0):Forward() * self.Speed
@@ -903,12 +831,6 @@ end
 -- W3: GBU-53 PARACHUTE CLUSTER DROP
 -- ============================================================
 function ENT:SpawnOneGBU53Pallet()
-    -- FIX: All pallets spawn from the same cargo door position.
-    -- The original code applied palletIndex * CFG_W3_AltStagger as a
-    -- vertical offset at spawn time, placing pallets 2 and 3 hundreds
-    -- of units below the fuselage before freefall even started.
-    -- The 1.2s inter-shot delay (CFG_W3_GBU53_Delay) already ensures
-    -- each pallet has physically separated before the next one drops.
     local tailWorld = self:LocalToWorld(CFG_W3_DropOffset)
     local dropPos = Vector(
         tailWorld.x,
@@ -986,10 +908,9 @@ end
 
 -- ============================================================
 -- W7: WP ILLUMINATION CANISTER (parachute)
--- 4 canisters per pass, 1.5s inter-drop delay.
--- Each canister deploys its own parachute and autonomously ignites
--- after WP_IGNITE_DELAY seconds, producing omnidirectional white
--- phosphorus illumination.
+-- Each canister receives the aircraft's current forward velocity
+-- so it arcs outward realistically instead of dropping straight down.
+-- A wood pallet is spawned with each drop for visual realism.
 -- ============================================================
 function ENT:SpawnOneWP()
     local tailWorld = self:LocalToWorld(CFG_W7_DropOffset)
@@ -1008,6 +929,12 @@ function ENT:SpawnOneWP()
         return
     end
 
+    -- Compute aircraft forward velocity at this exact moment and pass it
+    -- to the canister BEFORE Spawn() so Initialize() can store it.
+    local fwdVel = Angle(0, self.flightYaw, 0):Forward() * self.Speed
+    fwdVel.z = 0
+    can.WP_LaunchVel = fwdVel
+
     can:SetPos(dropPos)
     can:SetAngles(Angle(0, self.flightYaw, 0))
     can:SetOwner(self)
@@ -1020,7 +947,13 @@ function ENT:SpawnOneWP()
         if IsValid(ncHandle) then ncHandle:Remove() end
     end)
 
-    SpawnWoodPallet(dropPos + Vector(0,0,-15), Vector(math.Rand(-50,50), math.Rand(-50,50), -70), nil)
+    -- Wood pallet debris, consistent with all other weapon windows.
+    SpawnWoodPallet(
+        dropPos + Vector(0, 0, -15),
+        Vector(math.Rand(-50,50), math.Rand(-50,50), -70),
+        nil
+    )
+
     self:Debug("W7 WP canister dropped at " .. tostring(dropPos))
 end
 

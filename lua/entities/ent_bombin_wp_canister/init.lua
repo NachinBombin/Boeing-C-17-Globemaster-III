@@ -13,10 +13,13 @@ local WP_IGNITE_DELAY = 4.5
 local WP_IGNITE_DUR   = 2.5
 local WP_BURN_LIFE    = 45
 
--- Drag: we target terminal velocity ~70 u/s downward.
--- PhysicsUpdate applies an upward impulse each tick to clamp velocity.
--- Using impulse approach (not raw force * mass) avoids the overshoot CTD.
-local WP_TERM_VEL     = -70   -- negative = downward
+-- Terminal velocity for the chute descent (~70 u/s downward).
+local WP_TERM_VEL = -70
+
+-- Pendulum sway: lateral sine force applied in PhysicsUpdate.
+-- Amplitude (u/s^2 equivalent impulse scale) and period in seconds.
+local WP_SWAY_AMP    = 18    -- peak lateral force magnitude
+local WP_SWAY_PERIOD = 3.8   -- seconds per full sway cycle
 
 local WP_CHUTE_OFFSET = Vector(0, 0, 90)
 local THINK_DT        = 0.1
@@ -37,7 +40,8 @@ end
 
 -- ============================================================
 -- INITIALIZE
--- NOTE: never call self:Spawn()/self:Activate() inside Initialize().
+-- WP_LaunchVel may be set by the spawning plane BEFORE Spawn()/Activate()
+-- to give the canister the aircraft's forward velocity at drop time.
 -- ============================================================
 function ENT:Initialize()
     self:SetModel(WP_MODEL)
@@ -51,8 +55,10 @@ function ENT:Initialize()
         phys:Wake()
         phys:EnableGravity(true)
         phys:SetMass(40)
-        phys:SetDamping(0.1, 0.4)
-        phys:SetVelocity(Vector(math.Rand(-20,20), math.Rand(-20,20), -60))
+        phys:SetDamping(0.05, 0.3)
+        -- Initial downward nudge; horizontal launch vel is applied
+        -- in the first PhysicsUpdate tick via WP_VelApplied flag.
+        phys:SetVelocity(Vector(math.Rand(-8,8), math.Rand(-8,8), -60))
     end
 
     self.WP_State     = STATE_FALLING
@@ -62,6 +68,12 @@ function ENT:Initialize()
     self.WP_SoundTime = 0
     self.WP_SparkNext = 0
     self.WP_ChuteEnt  = nil
+    self.WP_VelApplied = false   -- one-shot: inject launch vel on first physics tick
+    self.WP_SwayPhase  = math.Rand(0, math.pi * 2)  -- random sway phase per canister
+    -- WP_LaunchVel is set externally by SpawnOneWP before Spawn(); default to zero.
+    if not self.WP_LaunchVel then
+        self.WP_LaunchVel = Vector(0, 0, 0)
+    end
 
     timer.Simple(0, function()
         if not IsValid(self) then return end
@@ -88,26 +100,50 @@ function ENT:Initialize()
 end
 
 -- ============================================================
--- PHYSICS: parachute drag via velocity clamping impulse
--- PhysicsUpdate fires ~66 Hz. We apply a corrective upward
--- impulse only when falling faster than terminal velocity.
--- Impulse = mass * delta_v, so it's frame-rate independent.
+-- PHYSICS: launch velocity injection + chute drag + pendulum sway
+--
+-- First tick: add the aircraft forward velocity so the canister
+-- inherits horizontal speed and arcs forward, not straight down.
+--
+-- Every tick:
+--   - Drag: clamp downward velocity to WP_TERM_VEL via upward impulse.
+--   - Sway: lateral sine force simulates pendulum swing under the chute.
 -- ============================================================
 function ENT:PhysicsUpdate(phys)
     if self.WP_State == STATE_DEAD then return end
-    local vel = phys:GetVelocity()
 
+    -- One-shot: inject aircraft forward velocity on the very first tick.
+    if not self.WP_VelApplied then
+        self.WP_VelApplied = true
+        local cur = phys:GetVelocity()
+        phys:SetVelocity(Vector(
+            cur.x + self.WP_LaunchVel.x,
+            cur.y + self.WP_LaunchVel.y,
+            cur.z
+        ))
+    end
+
+    local vel  = phys:GetVelocity()
+    local mass = phys:GetMass()
+
+    -- Chute drag: gradual upward impulse when falling faster than terminal.
     if vel.z < WP_TERM_VEL then
-        -- Apply impulse to bring vz back toward terminal this tick
-        local dv   = WP_TERM_VEL - vel.z   -- positive upward correction needed
-        local mass = phys:GetMass()
-        -- Scale impulse: only apply a fraction per tick so deceleration is gradual
+        local dv      = WP_TERM_VEL - vel.z
         local impulse = mass * dv * 0.08
         phys:ApplyForceCenter(Vector(0, 0, impulse))
     end
 
-    -- Gentle horizontal damping (pendulum sway settling)
-    phys:ApplyForceCenter(Vector(-vel.x * 0.5, -vel.y * 0.5, 0))
+    -- Horizontal drag (slows lateral bleed-off from aircraft speed).
+    phys:ApplyForceCenter(Vector(-vel.x * 0.4, -vel.y * 0.4, 0))
+
+    -- Pendulum sway: sinusoidal lateral force perpendicular to descent.
+    self.WP_SwayPhase = self.WP_SwayPhase + (2 * math.pi / WP_SWAY_PERIOD) * 0.015
+    local swayForce   = math.sin(self.WP_SwayPhase) * WP_SWAY_AMP * mass
+    -- Sway axis: perpendicular to the launch direction in the XY plane.
+    local launchDir = self.WP_LaunchVel:GetNormalized()
+    if launchDir:LengthSqr() < 0.01 then launchDir = Vector(1,0,0) end
+    local swayAxis = Vector(-launchDir.y, launchDir.x, 0)
+    phys:ApplyForceCenter(swayAxis * swayForce)
 end
 
 -- ============================================================
@@ -138,9 +174,10 @@ function ENT:Think()
         if ct >= self.WP_IgniteEnd then
             self.WP_State = STATE_BURNING
             BroadcastState(self, STATE_BURNING)
+            -- Small contained ignition flash (not a mega explosion).
             local fed = EffectData()
             fed:SetOrigin(pos)
-            fed:SetScale(2)
+            fed:SetScale(0.4)
             util.Effect("Explosion", fed, true, true)
             sound.Play("ambient/fire/fire_large_loop1.wav", pos, 95, 80, 1.0)
             self.WP_SoundTime = ct + 4.5
