@@ -358,7 +358,11 @@ function ENT:DestroyPallet()
 	if self.PalletDead then return end
 	self.PalletDead  = true
 	self.Detached    = true
-	self.MunitionEnts = self.MunitionEnts or {}
+
+	-- Snapshot MunitionEnts NOW before any timers fire and potentially
+	-- see a nil table (e.g. if OnRemove/FullRemove runs first).
+	local munSnapshot = {}
+	for i = 1, 4 do munSnapshot[i] = self.MunitionEnts and self.MunitionEnts[i] or nil end
 
 	BroadcastPalletTier(self, 0)
 	BroadcastChuteTier(self, 0)
@@ -409,7 +413,7 @@ function ENT:DestroyPallet()
 	end
 
 	for i = 1, 4 do
-		local mun        = self.MunitionEnts[i]
+		local mun        = munSnapshot[i]
 		local scatterDir = MUNITION_OFFSETS[i]:GetNormalized()
 		timer.Simple((i - 1) * RELEASE_STEP_DELAY, function()
 			if not IsValid(mun) then return end
@@ -443,7 +447,7 @@ function ENT:DestroyPallet()
 
 	timer.Simple(DEBRIS_LIFETIME + (4 * RELEASE_STEP_DELAY), function()
 		for i = 1, 4 do
-			if IsValid(self.MunitionEnts[i]) then self.MunitionEnts[i]:Remove() end
+			if IsValid(munSnapshot[i]) then munSnapshot[i]:Remove() end
 		end
 		if IsValid(self) then self:Remove() end
 	end)
@@ -505,12 +509,12 @@ function ENT:Think()
 
 	if self.ChuteDead and not self.Detached then
 		local pos = self:GetPos()
+		local mEnts = self.MunitionEnts or {}
 		local tr  = util.TraceLine({
 			start  = pos,
 			endpos = pos + Vector(0, 0, -(GROUND_DETONATE_DIST + 10)),
 			filter = function(e)
 				if e == self then return false end
-				local mEnts = self.MunitionEnts or {}
 				for i = 1, 4 do
 					if e == mEnts[i] then return false end
 				end
@@ -542,8 +546,12 @@ function ENT:GroundDetonation()
 
 	local basePos = self:GetPos()
 
+	-- Snapshot before timers
+	local munSnapshot = {}
+	for i = 1, 4 do munSnapshot[i] = self.MunitionEnts and self.MunitionEnts[i] or nil end
+
 	for i = 1, 4 do
-		local mun         = self.MunitionEnts[i]
+		local mun         = munSnapshot[i]
 		local capturedPos = IsValid(mun) and mun:GetPos() or (basePos + MUNITION_OFFSETS[i])
 		timer.Simple((i - 1) * GBU_EXPLODE_STEP_DELAY, function()
 			util.BlastDamage(self, SafeAttacker(self), capturedPos, GBU_EXPLODE_RADIUS, GBU_EXPLODE_DAMAGE)
@@ -564,7 +572,10 @@ end
 function ENT:Detach()
 	if self.Detached then return end
 	self.Detached     = true
-	self.MunitionEnts = self.MunitionEnts or {}
+
+	-- Snapshot before release timers
+	local munSnapshot = {}
+	for i = 1, 4 do munSnapshot[i] = self.MunitionEnts and self.MunitionEnts[i] or nil end
 
 	for _, field in ipairs({"ChuteHitbox", "PalletHitbox"}) do
 		if IsValid(self[field]) then
@@ -614,7 +625,7 @@ function ENT:Detach()
 	end
 
 	for i = 1, 4 do
-		local mun        = self.MunitionEnts[i]
+		local mun        = munSnapshot[i]
 		local scatterDir = MUNITION_OFFSETS[i]:GetNormalized()
 		timer.Simple((i - 1) * RELEASE_STEP_DELAY, function()
 			if not IsValid(mun) then return end
@@ -639,7 +650,7 @@ function ENT:Detach()
 	sound.Play("npc/combine_soldier/zipline_clip2.wav", pos, 82, math.random(93,110), 1.0)
 
 	local debrisRefs = { self, chuteClone }
-	for i = 1, 4 do debrisRefs[#debrisRefs + 1] = self.MunitionEnts[i] end
+	for i = 1, 4 do debrisRefs[#debrisRefs + 1] = munSnapshot[i] end
 	timer.Simple(DEBRIS_LIFETIME + (4 * RELEASE_STEP_DELAY), function()
 		for _, e in ipairs(debrisRefs) do
 			if IsValid(e) then e:Remove() end
@@ -665,7 +676,6 @@ end
 function ENT:FullRemove()
 	self.Detached     = true
 	self.PalletDead   = true
-	self.MunitionEnts = self.MunitionEnts or {}
 
 	for _, field in ipairs({"PalletVisual", "ChuteEnt", "ChuteHitbox", "PalletHitbox", "ChuteClone"}) do
 		if IsValid(self[field]) then
@@ -674,12 +684,15 @@ function ENT:FullRemove()
 			self[field] = nil
 		end
 	end
-	for i = 1, 4 do
-		if IsValid(self.MunitionEnts[i]) then
-			self.MunitionEnts[i]:SetParent(nil)
-			self.MunitionEnts[i]:Remove()
-			self.MunitionEnts[i] = nil
+	if self.MunitionEnts then
+		for i = 1, 4 do
+			if IsValid(self.MunitionEnts[i]) then
+				self.MunitionEnts[i]:SetParent(nil)
+				self.MunitionEnts[i]:Remove()
+				self.MunitionEnts[i] = nil
+			end
 		end
+		self.MunitionEnts = nil
 	end
 	if self.DamageHookName then
 		hook.Remove("EntityTakeDamage", self.DamageHookName)
@@ -705,4 +718,5 @@ function ENT:OnRemove()
 			self.MunitionEnts[i]:Remove()
 		end
 	end
+	self.MunitionEnts = nil
 end

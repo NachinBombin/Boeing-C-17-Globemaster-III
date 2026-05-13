@@ -245,21 +245,23 @@ end
 -- ============================================================
 -- ENGINE SOUND (CLIENT)
 -- CreateSound path is relative to sound/ — no "sound/" prefix.
--- ENT:Think is called every frame by the client ENT framework.
+-- _EnginePlaying is only set true when CreateSound succeeds,
+-- so a missing/unprecached file will retry next Think tick.
 -- ============================================================
 function ENT:Think()
 	local destroyed = self:GetNWBool( "Destroyed", false )
 
 	if not destroyed then
 		if not self._EnginePlaying then
-			self._EngineSound = CreateSound( self, ENGINE_LOOP_SOUND )
-			if self._EngineSound then
-				self._EngineSound:SetSoundLevel( 85 )
-				self._EngineSound:ChangePitch( 95, 0 )
-				self._EngineSound:ChangeVolume( 0.9, 0 )
-				self._EngineSound:Play()
+			local snd = CreateSound( self, ENGINE_LOOP_SOUND )
+			if snd then
+				snd:SetSoundLevel( 85 )
+				snd:ChangePitch( 95, 0 )
+				snd:ChangeVolume( 0.9, 0 )
+				snd:Play()
+				self._EngineSound   = snd
+				self._EnginePlaying = true
 			end
-			self._EnginePlaying = true
 		end
 		-- Keep-alive: CSoundPatch stops automatically when the
 		-- engine goes idle; re-call Play() to keep it looping.
