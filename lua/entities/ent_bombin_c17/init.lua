@@ -408,11 +408,14 @@ function ENT:StartTumble()
     self.IsTumbling     = true
     self.TumbleLastTime = CurTime()
     self.TumbleCrashed  = false
+
     local gnd = self:FindGround(self:GetPos())
     if gnd~=-1 then self.TumbleGroundZ=gnd end
+
     local fwd = Angle(0,self.flightYaw,0):Forward()
     local spd = self.Speed or 260
     self.TumbleVelocity = Vector(fwd.x*spd, fwd.y*spd, -80)
+
     local function sign() return (math.random(2)==1) and 1 or -1 end
     self.TumbleAngVelocity = Vector(
         math.Rand(8,18)*sign(),
@@ -420,14 +423,17 @@ function ENT:StartTumble()
         math.Rand(20,40)*sign()
     )
 
-    -- Freeze the physics object so the engine stops simulating it.
-    -- Without this, Havok continues integrating the body while Think
-    -- is also calling SetPos, causing a race that crashes on ground impact.
+    -- Disable the physics simulation entirely during tumble.
+    -- We drive position/angles manually via SetPos/SetAngles in UpdateTumble.
+    -- NOTE: GMod's PhysObj does NOT have SetAngularVelocity — the correct
+    -- method is SetAngleVelocity. Guard IsValid before every call because
+    -- this can be triggered mid-FireBullets before the physics body is ready.
+    self:SetMoveType(MOVETYPE_NONE)
     local phys = self:GetPhysicsObject()
     if IsValid(phys) then
         phys:EnableGravity(false)
         phys:SetVelocity(Vector(0,0,0))
-        phys:SetAngularVelocity(Vector(0,0,0))
+        phys:SetAngleVelocity(Vector(0,0,0))
         phys:Sleep()
     end
 
@@ -457,8 +463,8 @@ function ENT:UpdateTumble(ct)
         self.ang.r + av.z*dt
     )
 
-    -- Check ground/wall BEFORE moving — so CrashExplode is called
-    -- while self is still at a valid position, not inside the ground.
+    -- Check ground/wall BEFORE moving so CrashExplode fires while
+    -- self is still at a valid above-ground position.
     local hitGround = newPos.z <= (self.TumbleGroundZ or -16384)+200
     local hitWall   = false
     if not hitGround then
@@ -468,7 +474,7 @@ function ENT:UpdateTumble(ct)
 
     if hitGround or hitWall then
         self:CrashExplode()
-        return  -- do NOT call SetPos/SetAngles after crash
+        return
     end
 
     self:SetPos(newPos)
@@ -476,9 +482,6 @@ function ENT:UpdateTumble(ct)
 end
 
 function ENT:CrashExplode()
-    -- Hard gate: TumbleCrashed is the single source of truth.
-    -- Both UpdateTumble and the DestroyPlane safety timer call this;
-    -- only the first call does anything.
     if self.TumbleCrashed then return end
     self.TumbleCrashed = true
 
@@ -506,8 +509,6 @@ function ENT:Think()
     local ct = CurTime()
 
     if self.IsTumbling then
-        -- TumbleCrashed means CrashExplode already fired and removal
-        -- is deferred to next frame — stop doing anything at all.
         if not self.TumbleCrashed then
             self:UpdateTumble(ct)
         end
@@ -553,8 +554,6 @@ function ENT:DestroyPlane()
     self.WPN_PeaceUntil = math.huge
     BroadcastTier(self,3)
     self:StartTumble()
-    -- Safety net: if the plane never hits ground (e.g. spawned over void),
-    -- force a crash after 20 s. TumbleCrashed gate prevents double-fire.
     timer.Simple(20, function()
         if IsValid(self) then self:CrashExplode() end
     end)
