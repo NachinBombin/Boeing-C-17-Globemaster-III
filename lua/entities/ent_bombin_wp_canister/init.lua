@@ -13,14 +13,14 @@ local WP_IGNITE_DELAY = 4.5
 local WP_IGNITE_DUR   = 2.5
 local WP_BURN_LIFE    = 45
 
--- Target terminal velocity (downward u/s). PhysicsUpdate damps toward this.
-local WP_TERM_VEL     = -70
+-- Target terminal velocity (downward). PhysicsUpdate impulse approach.
+local WP_TERM_VEL = -70    -- u/s downward
 
--- Sway: pendulum-like tilt driven by horizontal velocity
+-- Sway: pendulum-like tilt driven by horizontal velocity.
 local WP_SWAY_MAX     = 14     -- max tilt degrees
-local WP_SWAY_LERP    = 0.04   -- lerp rate toward target angle per tick
-local WP_SWAY_OSC_AMP = 6      -- oscillation amplitude when nearly vertical
-local WP_SWAY_OSC_HZ  = 0.35   -- oscillation frequency (Hz)
+local WP_SWAY_LERP    = 0.04   -- lerp factor per sway tick
+local WP_SWAY_OSC_AMP = 6      -- oscillation amplitude degrees
+local WP_SWAY_OSC_HZ  = 0.35   -- oscillation frequency Hz
 
 local WP_CHUTE_OFFSET = Vector(0, 0, 90)
 local THINK_DT        = 0.1
@@ -50,8 +50,7 @@ end
 
 -- ============================================================
 -- INITIALIZE
--- DropVel is set by c17/init.lua before Spawn() is called.
--- It carries the plane's forward momentum + lateral spread vector.
+-- DropVel is optionally set by spawner before Spawn() is called.
 -- ============================================================
 function ENT:Initialize()
     self:SetModel(WP_MODEL)
@@ -66,7 +65,6 @@ function ENT:Initialize()
         phys:EnableGravity(true)
         phys:SetMass(40)
         phys:SetDamping(0.05, 0.3)
-        -- Use DropVel set by spawner; fall back to straight down if not set
         local initVel = self.DropVel or Vector(0, 0, -60)
         phys:SetVelocity(initVel)
     end
@@ -108,25 +106,23 @@ function ENT:Initialize()
 end
 
 -- ============================================================
--- PHYSICS: parachute drag
--- Vertical: impulse clamps descent to WP_TERM_VEL.
--- Horizontal: gentle air resistance decays forward speed over ~8s,
---   producing realistic lateral drift before the chute settles vertical.
+-- PHYSICS: drag + horizontal damping
+-- Impulse approach: only damps vertical beyond terminal.
+-- Horizontal decays naturally so forward drift lasts ~8s.
 -- ============================================================
 function ENT:PhysicsUpdate(phys)
     if self.WP_State == STATE_DEAD then return end
     local vel = phys:GetVelocity()
 
-    -- Vertical drag: only kick upward when faster than terminal
+    -- Vertical: fractional impulse toward terminal
     if vel.z < WP_TERM_VEL then
         local dv      = WP_TERM_VEL - vel.z
         local impulse = phys:GetMass() * dv * 0.08
         phys:ApplyForceCenter(Vector(0, 0, impulse))
     end
 
-    -- Horizontal drag: ~0.35 per tick decays ~220 u/s to <30 u/s in ~8s
-    local hDamp = 0.35
-    phys:ApplyForceCenter(Vector(-vel.x * hDamp, -vel.y * hDamp, 0))
+    -- Horizontal: gentle air resistance (~220 u/s decays to <30 in ~8s)
+    phys:ApplyForceCenter(Vector(-vel.x * 0.35, -vel.y * 0.35, 0))
 end
 
 -- ============================================================
@@ -137,28 +133,23 @@ function ENT:Think()
     local ct  = CurTime()
     local pos = self:GetPos()
 
-    -- ---- Sway at 8 Hz ----
+    -- Sway at 8 Hz
     if ct >= self.WP_SwayNext then
         self.WP_SwayNext = ct + 0.12
         local phys = self:GetPhysicsObject()
         if IsValid(phys) then
             local vel    = phys:GetVelocity()
             local hspeed = math.sqrt(vel.x*vel.x + vel.y*vel.y)
-
-            -- Lean into horizontal motion
             local tiltMag = math.min(hspeed / 80, 1) * WP_SWAY_MAX
             local hdir    = (hspeed > 5) and math.atan2(vel.y, vel.x) or 0
             local targetPitch = -tiltMag * math.cos(hdir)
             local targetRoll  = -tiltMag * math.sin(hdir)
-
-            -- Pendulum oscillation: grows as horizontal speed decays
+            -- Pendulum oscillation, strongest when near-vertical (slow)
             local osc      = WP_SWAY_OSC_AMP * math.sin((ct - self.WP_SwayT0) * 2 * math.pi * WP_SWAY_OSC_HZ)
             local oscDecay = math.max(0, 1 - hspeed / 120)
-            targetPitch    = targetPitch + osc * oscDecay
-
+            targetPitch = targetPitch + osc * oscDecay
             self.WP_SwayPitch = Lerp(WP_SWAY_LERP, self.WP_SwayPitch, targetPitch)
             self.WP_SwayRoll  = Lerp(WP_SWAY_LERP, self.WP_SwayRoll,  targetRoll)
-
             if IsValid(self.WP_ChuteEnt) then
                 self.WP_ChuteEnt:SetLocalAngles(Angle(self.WP_SwayPitch, 0, self.WP_SwayRoll))
             end
@@ -166,7 +157,7 @@ function ENT:Think()
         end
     end
 
-    -- ---- State transitions ----
+    -- State transitions
     if self.WP_State == STATE_FALLING then
         if ct >= self.WP_IgniteAt then
             self.WP_State     = STATE_IGNITING
@@ -210,9 +201,6 @@ function ENT:Think()
     return true
 end
 
--- ============================================================
--- BURN-OUT
--- ============================================================
 function ENT:WP_Die()
     if self.WP_State == STATE_DEAD then return end
     self.WP_State = STATE_DEAD
@@ -226,9 +214,6 @@ function ENT:WP_Die()
     end)
 end
 
--- ============================================================
--- GROUND IMPACT: detach chute
--- ============================================================
 function ENT:PhysicsCollide(data, physObj)
     if self.WP_State == STATE_DEAD then return end
     if data.Speed < 60 then return end

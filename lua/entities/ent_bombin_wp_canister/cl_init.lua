@@ -55,14 +55,13 @@ net.Receive("bombin_wp_state", function()
 end)
 
 -- ============================================================
--- Net: sway angles from server (8 Hz)
+-- Net: sway angles
 -- ============================================================
 net.Receive("bombin_wp_sway", function()
     local idx   = net.ReadUInt(16)
     local pitch = net.ReadInt(16) / 10
     local roll  = net.ReadInt(16) / 10
     wpSway[idx] = { pitch = pitch, roll = roll }
-    -- Apply immediately to the chute child if already cached
     local ent = ents.GetByIndex(idx)
     if IsValid(ent) and IsValid(ent.WP_ChuteEntCL) then
         ent.WP_ChuteEntCL:SetLocalAngles(Angle(pitch, 0, roll))
@@ -70,7 +69,7 @@ net.Receive("bombin_wp_sway", function()
 end)
 
 -- ============================================================
--- Global Think: keep DynamicLight alive + flicker while burning
+-- Global Think: keep light alive + flicker
 -- ============================================================
 hook.Add("Think", "bombin_wp_light_think", function()
     local t = CurTime()
@@ -114,7 +113,7 @@ function ENT:Think()
     local pos = self:GetPos()
     local t   = CurTime()
 
-    -- Cache reference to chute child entity
+    -- Locate chute child once
     if not IsValid(self.WP_ChuteEntCL) then
         for _, child in ipairs(self:GetChildren()) do
             if IsValid(child) then
@@ -124,7 +123,7 @@ function ENT:Think()
         end
     end
 
-    -- Apply latest sway to chute child
+    -- Apply latest sway to chute
     local sw = wpSway[idx]
     if sw and IsValid(self.WP_ChuteEntCL) then
         self.WP_ChuteEntCL:SetLocalAngles(Angle(sw.pitch, 0, sw.roll))
@@ -140,7 +139,7 @@ function ENT:Think()
         util.Effect("cball_bounce", ed)
     end
 
-    -- ---- Igniting: client-side spark flash ----
+    -- ---- Igniting: client spark ----
     if state == STATE_IGNITING then
         if t - self.WP_LastSpark > 0.1 then
             self.WP_LastSpark = t
@@ -151,9 +150,8 @@ function ENT:Think()
         end
     end
 
-    -- ---- Burning: small proportionate fire puffs ----
-    -- MuzzleEffect at scale=0.4, magnitude=0.3 for a hand-canister-sized flame.
-    -- Replaces HelicopterMegaBomb which produced an oversized fireball.
+    -- ---- Burning: small fire puffs ----
+    -- MuzzleEffect at scale 0.4 is proportionate for a hand-held canister.
     if state == STATE_BURNING then
         if t - self.WP_LastFire > 0.09 then
             self.WP_LastFire = t
