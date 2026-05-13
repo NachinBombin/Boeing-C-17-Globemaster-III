@@ -42,8 +42,6 @@ local CFG_PeacefulMin  = 6
 local CFG_PeacefulMax  = 14
 
 -- Drop point in C-17 local space.
--- At MODEL_SCALE=1.8 the belly of the fuselage is ~120u below the
--- entity origin.  -130 clears the hull and exits below the ramp.
 local CFG_BombBayLocal = Vector(100,100, -30)
 
 -- Orbit / target-tracking tuning.
@@ -256,12 +254,18 @@ function ENT:Initialize()
     self.DestroyStart = nil
     self.Destroyed    = false
 
+    -- Tumble state (ported from B-52)
+    self.IsTumbling        = false
+    self.TumbleStartTime   = 0
+    self.TumbleGroundZ     = ground
+    self.TumbleCrashed     = false
+    self.TumbleVelocity    = Vector(0, 0, 0)
+    self.TumbleAngVelocity = Vector(0, 0, 0)
+
     self.FadeAlpha    = 0
     self.FadeIn       = true
 
     self.JASSM_Stock  = 6
-
-    -- Engine sound is managed client-side in cl_init.lua
 
     self:SetNWBool("Destroyed", false)
 
@@ -418,6 +422,18 @@ function ENT:UpdateOrbit(ct, dt)
 end
 
 function ENT:PhysicsUpdate(phys, dt)
+    if self.IsTumbling then
+        if self.TumbleCrashed then return end
+        local dtt = engine.TickInterval()
+        self.TumbleVelocity.z = self.TumbleVelocity.z + physenv.GetGravity().z * dtt
+        local pos    = self:GetPos()
+        local newPos = pos + self.TumbleVelocity * dtt
+        local av     = self.TumbleAngVelocity
+        self.ang = Angle(self.ang.p+av.x*dtt, self.ang.y+av.y*dtt, self.ang.r+av.z*dtt)
+        self:SetPos(newPos) self:SetAngles(self.ang)
+        if IsValid(phys) then phys:SetPos(newPos) phys:SetAngles(self.ang) end
+        return
+    end
     if self.Destroyed then return end
     if not self.DesiredVelocity then return end
     if phys:IsAsleep() then phys:Wake() end
@@ -434,6 +450,119 @@ function ENT:UpdateFade(dt)
     end
 end
 
+-- ============================================================
+-- TUMBLE / CRASH  (ported from B-52)
+-- ============================================================
+function ENT:StartTumble()
+    self.IsTumbling      = true
+    self.TumbleStartTime = CurTime()
+    self.TumbleCrashed   = false
+    local gnd = self:FindGround(self:GetPos())
+    if gnd ~= -1 then self.TumbleGroundZ = gnd end
+    local fwd = Angle(0, self.flightYaw, 0):Forward()
+    self.TumbleVelocity    = Vector(fwd.x*(self.Speed or 260), fwd.y*(self.Speed or 260), -200)
+    local function sign() return (math.random(2)==1) and 1 or -1 end
+    self.TumbleAngVelocity = Vector(
+        math.Rand(80,200)*sign(),
+        math.Rand(20,80)*sign(),
+        math.Rand(150,400)*sign()
+    )
+    local pos = self:GetPos()
+    local ed  = EffectData() ed:SetOrigin(pos) ed:SetScale(4) ed:SetMagnitude(4) ed:SetRadius(400)
+    util.Effect("500lb_air", ed, true, true)
+    sound.Play("ambient/explosions/explode_4.wav", pos, 135, 95, 1.0)
+end
+
+function ENT:CrashExplode()
+    if self.TumbleCrashed then return end
+    self.TumbleCrashed = true
+    local pos = self:GetPos()
+    local e1=EffectData() e1:SetOrigin(pos) e1:SetScale(6) e1:SetMagnitude(6) e1:SetRadius(600) util.Effect("HelicopterMegaBomb",e1,true,true)
+    local e2=EffectData() e2:SetOrigin(pos) e2:SetScale(5) e2:SetMagnitude(5) e2:SetRadius(500) util.Effect("500lb_air",e2,true,true)
+    local e3=EffectData() e3:SetOrigin(pos+Vector(0,0,80)) e3:SetScale(4) e3:SetMagnitude(4) e3:SetRadius(400) util.Effect("500lb_air",e3,true,true)
+    sound.Play("ambient/explosions/explode_8.wav", pos, 140, 90, 1.0)
+    sound.Play("weapon_AWP.Single", pos, 145, 60, 1.0)
+    util.BlastDamage(self, self, pos, 400, 200)
+    self:Remove()
+end
+
+function ENT:Think()
+    if not self.DieTime then self:NextThink(CurTime() + 0.1) return true end
+
+    local ct = CurTime()
+
+    -- Tumble ground-check loop
+    if self.IsTumbling and not self.TumbleCrashed then
+        local pos = self:GetPos()
+        if pos.z <= (self.TumbleGroundZ or -16384) + 150 then self:CrashExplode() return end
+        local tr = util.TraceLine({start=pos, endpos=pos+Vector(0,0,-200), filter=self})
+        if tr.HitWorld then self:CrashExplode() return end
+        self:NextThink(ct + 0.05)
+        return true
+    end
+
+    if ct >= self.DieTime then
+        self:DestroyPlane()
+        return
+    end
+
+    local dt = FrameTime()
+    if dt <= 0 then dt = 0.015 end
+
+    if self.Destroyed then
+        self:NextThink(ct + 0.05)
+        return true
+    end
+
+    self:UpdateFade(dt)
+    self:UpdateOrbit(ct, dt)
+    self:UpdateWeapons(ct)
+
+    self:NextThink(ct + 0.015)
+    return true
+end
+
+function ENT:OnTakeDamage(dmginfo)
+    if self.Destroyed then return end
+    local dmg = dmginfo:GetDamage()
+    self.HP = math.max(self.HP - dmg, 0)
+    self:SetNWInt("HP", self.HP)
+
+    local tier = CalcTier(self.HP, self.MaxHP)
+    if tier ~= self.DamageTier then
+        self.DamageTier = tier
+        BroadcastTier(self, tier)
+    end
+
+    if self.HP <= 0 then
+        self:DestroyPlane()
+    end
+end
+
+function ENT:DestroyPlane()
+    if self.Destroyed then return end
+    self.Destroyed = true
+    self:SetNWBool("Destroyed", true)
+    self:SetNWBool("CargoDoorOpen", false)
+    self.WPN_Active     = nil
+    self.WPN_Phase      = nil
+    self.WPN_PeaceUntil = math.huge
+    BroadcastTier(self, 3)
+
+    self:StartTumble()
+
+    timer.Simple(12, function()
+        if IsValid(self) then self:CrashExplode() end
+    end)
+end
+
+function ENT:OnRemove()
+    -- Engine sound lifecycle is owned by cl_init.lua.
+end
+
+-- ============================================================
+-- WEAPON SYSTEM
+-- ============================================================
 function ENT:PickNewWeapon(ct)
     local available = {}
     for _, w in ipairs(WEAPON_ROSTER) do
@@ -504,94 +633,6 @@ function ENT:UpdateWeapons(ct)
     end
 end
 
-function ENT:Think()
-    if not self.DieTime then self:NextThink(CurTime() + 0.1) return true end
-
-    local ct = CurTime()
-    if ct >= self.DieTime then
-        self:DestroyPlane()
-        return
-    end
-
-    local dt = FrameTime()
-    if dt <= 0 then dt = 0.015 end
-
-    if self.Destroyed then
-        self:NextThink(ct + 0.05)
-        return true
-    end
-
-    self:UpdateFade(dt)
-    self:UpdateOrbit(ct, dt)
-    self:UpdateWeapons(ct)
-
-    self:NextThink(ct + 0.015)
-    return true
-end
-
-function ENT:OnTakeDamage(dmginfo)
-    if self.Destroyed then return end
-    local dmg = dmginfo:GetDamage()
-    self.HP = math.max(self.HP - dmg, 0)
-    self:SetNWInt("HP", self.HP)
-
-    local tier = CalcTier(self.HP, self.MaxHP)
-    if tier ~= self.DamageTier then
-        self.DamageTier = tier
-        BroadcastTier(self, tier)
-    end
-
-    if self.HP <= 0 then
-        self:DestroyPlane()
-    end
-end
-
-function ENT:DestroyPlane()
-    if self.Destroyed then return end
-    self.Destroyed = true
-    self:SetNWBool("Destroyed", true)
-    self:SetNWBool("CargoDoorOpen", false)
-    self.WPN_Active     = nil
-    self.WPN_Phase      = nil
-    self.WPN_PeaceUntil = math.huge
-    BroadcastTier(self, 3)
-
-    local pos = self:GetPos()
-    local expEd = EffectData()
-    expEd:SetOrigin(pos)
-    expEd:SetScale(4)
-    util.Effect("HelicopterMegaBomb", expEd, true, true)
-    sound.Play("ambient/explosions/explode_8.wav", pos, 145, 90, 1.0)
-
-    local debrisModels = {
-        "models/props_c17/FurnitureDrawer001a.mdl",
-        "models/props_c17/FurnitureCouch001a.mdl",
-    }
-    for i = 1, 4 do
-        local deb = ents.Create("prop_physics")
-        if IsValid(deb) then
-            deb:SetModel(debrisModels[math.random(#debrisModels)])
-            deb:SetPos(pos + Vector(math.Rand(-200, 200), math.Rand(-200, 200), math.Rand(-100, 100)))
-            deb:SetAngles(Angle(math.Rand(0,360), math.Rand(0,360), math.Rand(0,360)))
-            deb:Spawn()
-            deb:Activate()
-            local dp = deb:GetPhysicsObject()
-            if IsValid(dp) then
-                dp:SetVelocity(Vector(math.Rand(-300,300), math.Rand(-300,300), math.Rand(100,400)))
-            end
-            timer.Simple(8, function() if IsValid(deb) then deb:Remove() end end)
-        end
-    end
-
-    timer.Simple(3.0, function()
-        if IsValid(self) then self:Remove() end
-    end)
-end
-
-function ENT:OnRemove()
-    -- No-op: engine sound lifecycle is owned entirely by cl_init.lua.
-end
-
 -- ============================================================
 -- VELOCITY SOLVERS
 -- ============================================================
@@ -638,329 +679,4 @@ function ENT:GetAimPos(scatter)
     return cp
 end
 
--- ============================================================
--- SPAWN HELPERS
--- ============================================================
-function ENT:SpawnDartBomb(entClass, dropPos, targetPos, isRetarded)
-    local bomb = ents.Create(entClass)
-    if not IsValid(bomb) then
-        self:Debug("SpawnDartBomb: class not found: " .. tostring(entClass))
-        return nil
-    end
-    bomb.IsOnPlane = true
-    bomb.Launcher  = self
-    bomb:SetOwner(self)
-    local toTarget = targetPos - dropPos
-    local dropAng
-    if toTarget:LengthSqr() > 1 then
-        toTarget:Normalize()
-        dropAng = toTarget:Angle()
-    else
-        dropAng = Angle(90, 0, 0)
-    end
-    bomb:SetPos(dropPos)
-    bomb:SetAngles(dropAng)
-    bomb:Spawn()
-    bomb:Activate()
-    if isRetarded then bomb:SetBodygroup(1, 1) end
-
-    local handle = constraint.NoCollide(bomb, self, 0, 0)
-    timer.Simple(0.6, function()
-        if IsValid(handle) then handle:Remove() end
-    end)
-
-    local bPhys = bomb:GetPhysicsObject()
-    if IsValid(bPhys) then
-        bPhys:SetVelocity(CalcDartVelocity(dropPos, targetPos))
-    end
-
-    if bomb.Arm then bomb:Arm()
-    elseif bomb.Armed ~= nil then bomb.Armed = true end
-
-    return bomb
-end
-
-function ENT:SpawnCarpetBomb(entClass, dropPos, aimPos)
-    local bomb = ents.Create(entClass)
-    if not IsValid(bomb) then
-        self:Debug("SpawnCarpetBomb: class not found: " .. tostring(entClass))
-        return nil
-    end
-    bomb.IsOnPlane = true
-    bomb.Launcher  = self
-    bomb:SetOwner(self)
-    bomb:SetPos(dropPos)
-    bomb:SetAngles(Angle(90, self.flightYaw, 0))
-    bomb:Spawn()
-    bomb:Activate()
-
-    local handle = constraint.NoCollide(bomb, self, 0, 0)
-    timer.Simple(0.6, function()
-        if IsValid(handle) then handle:Remove() end
-    end)
-
-    local bPhys = bomb:GetPhysicsObject()
-    if IsValid(bPhys) then
-        local aircraftFwd = Angle(0, self.flightYaw, 0):Forward() * self.Speed
-        aircraftFwd.z = 0
-        bPhys:SetVelocity(CalcCarpetImpulse(dropPos, aimPos, aircraftFwd))
-    end
-
-    if bomb.Arm then bomb:Arm()
-    elseif bomb.Armed ~= nil then bomb.Armed = true end
-
-    return bomb
-end
-
--- ============================================================
--- W1: JASSM PARACHUTE DROP
--- ============================================================
-function ENT:SpawnOneJASSM(dropIndex)
-    dropIndex = dropIndex or 0
-
-    local tailWorld = self:LocalToWorld(CFG_W1_JASSM_TailOffset)
-    local dropPos = Vector(tailWorld.x, tailWorld.y, tailWorld.z - (dropIndex * CFG_W1_JASSM_AltOffset))
-    if not util.IsInWorld(dropPos) then
-        dropPos = Vector(self.CenterPos.x, self.CenterPos.y, self:GetPos().z - (dropIndex * CFG_W1_JASSM_AltOffset))
-    end
-
-    local missile = ents.Create("ent_bombin_jassm_owned")
-    if not IsValid(missile) then
-        self:Debug("W1 JASSM: ent_bombin_jassm_owned not found - dependency missing")
-        return
-    end
-
-    local callDir = Angle(0, self.flightYaw, 0):Forward()
-    local groundZ = self:FindGround(dropPos)
-    if groundZ == -1 then groundZ = self.CenterPos.z end
-    local dropHeight = math.max(dropPos.z - groundZ, 0)
-
-    if dropHeight < CFG_W1_JASSM_MIN_DROP_HEIGHT then
-        self:Debug("W1 JASSM: drop altitude too low (" .. math.Round(dropHeight) .. "u), aborting drop")
-        return
-    end
-
-    local shaMax = (dropHeight - CFG_W1_JASSM_MIN_FREEFALL_CLEARANCE) / 1.25
-    local sha    = math.max(shaMax, CFG_W1_JASSM_SHA_FLOOR)
-
-    missile:SetPos(dropPos)
-    missile:SetAngles(callDir:Angle())
-    missile.SpawnedFromPlane = true
-    missile.CenterPos    = self.CenterPos
-    missile.CallDir      = callDir
-    missile.Lifetime     = math.min(self.Lifetime, 35)
-    missile.Speed        = 250
-    missile.OrbitRadius  = self.OrbitRadius * 0.75
-    missile.SkyHeightAdd = sha
-    missile:SetOwner(self)
-    missile.IsOnPlane = true
-    missile.Launcher  = self
-    missile:Spawn()
-    missile:Activate()
-
-    local mHandle = constraint.NoCollide(missile, self, 0, 0)
-    timer.Simple(1.25, function()
-        if IsValid(mHandle) then mHandle:Remove() end
-    end)
-
-    local chute = ents.Create("ent_bombin_jassm_chute_owned")
-    if IsValid(chute) then
-        chute:SetOwner(missile)
-        chute:SetPos(dropPos + Vector(0, 0, 105))
-        chute:SetAngles(Angle(0, self.flightYaw, 0))
-        chute:Spawn()
-        chute:Activate()
-        local cPlaneHandle   = constraint.NoCollide(chute, self, 0, 0)
-        local cMissileHandle = constraint.NoCollide(chute, missile, 0, 0)
-        timer.Simple(1.25, function()
-            if IsValid(cPlaneHandle)   then cPlaneHandle:Remove()   end
-            if IsValid(cMissileHandle) then cMissileHandle:Remove() end
-        end)
-    else
-        self:Debug("W1 JASSM: ent_bombin_jassm_chute_owned not found - chute missing")
-    end
-
-    SpawnWoodPallet(dropPos + Vector(0,0,-20), Vector(math.Rand(-60,60), math.Rand(-60,60), -80), nil)
-
-    if self.JASSM_Stock > 0 then
-        self.JASSM_Stock = self.JASSM_Stock - 1
-    end
-    self:Debug("W1 JASSM drop #" .. (dropIndex+1) .. " pos=" .. tostring(dropPos) .. " SHA=" .. math.Round(sha) .. " dropHeight=" .. math.Round(dropHeight))
-end
-
-function ENT:UpdateJASSM(ct)
-    if self.WPN_ShotsFired >= CFG_W1_JASSM_Count then return true end
-    if ct < self.WPN_NextShot then return false end
-    self.WPN_NextShot   = ct + CFG_W1_JASSM_Delay
-    self.WPN_ShotsFired = self.WPN_ShotsFired + 1
-    self:SpawnOneJASSM(self.WPN_ShotsFired - 1)
-    return (self.WPN_ShotsFired >= CFG_W1_JASSM_Count)
-end
-
--- ============================================================
--- W2: HEAVY ORDNANCE
--- ============================================================
-function ENT:UpdateHeavy(ct)
-    if self.WPN_ShotsFired >= CFG_W2_Count then return true end
-    if ct < self.WPN_NextShot then return false end
-    self.WPN_NextShot   = ct + CFG_W2_Delay
-    self.WPN_ShotsFired = self.WPN_ShotsFired + 1
-
-    local entry     = CFG_W2_Pool[math.random(#CFG_W2_Pool)]
-    local dropPos   = self:LocalToWorld(CFG_BombBayLocal)
-    local targetPos = self:GetAimPos(CFG_W2_Scatter)
-    local bomb      = self:SpawnDartBomb(entry.class, dropPos, targetPos, entry.retarded)
-    SpawnWoodPallet(dropPos + Vector(0,0,-10), Vector(math.Rand(-80,80), math.Rand(-80,80), -60), bomb)
-    return (self.WPN_ShotsFired >= CFG_W2_Count)
-end
-
--- ============================================================
--- W3: GBU-53 PARACHUTE CLUSTER DROP
--- ============================================================
-function ENT:SpawnOneGBU53Pallet()
-    local tailWorld = self:LocalToWorld(CFG_W3_DropOffset)
-    local dropPos = Vector(
-        tailWorld.x,
-        tailWorld.y,
-        tailWorld.z - CFG_W3_BodyClearance
-    )
-    if not util.IsInWorld(dropPos) then
-        dropPos = Vector(self.CenterPos.x, self.CenterPos.y, self:GetPos().z - CFG_W3_BodyClearance)
-    end
-
-    local pallet = ents.Create("ent_bombin_gbu53_owned")
-    if not IsValid(pallet) then
-        self:Debug("W3 GBU53: ent_bombin_gbu53_owned not found")
-        return
-    end
-
-    local callDir = Angle(0, self.flightYaw, 0):Forward()
-
-    pallet:SetPos(dropPos)
-    pallet:SetAngles(Angle(0, self.flightYaw, 0))
-    pallet.SpawnedFromPlane = true
-    pallet.CenterPos    = self.CenterPos
-    pallet.CallDir      = callDir
-    pallet.Lifetime     = math.min(self.Lifetime, 60)
-    pallet.Speed        = 420
-    pallet.OrbitRadius  = self.OrbitRadius
-    local groundZ = self:FindGround(dropPos)
-    if groundZ == -1 then
-        pallet.SkyHeightAdd = 1200
-    else
-        pallet.SkyHeightAdd = math.max(dropPos.z - groundZ, 1200)
-    end
-    pallet:SetOwner(self)
-    pallet.IsOnPlane = true
-    pallet.Launcher  = self
-    pallet:Spawn()
-    pallet:Activate()
-
-    local pHandle = constraint.NoCollide(pallet, self, 0, 0)
-    timer.Simple(CFG_W3_NoCollideHoldTime, function()
-        if IsValid(pHandle) then pHandle:Remove() end
-    end)
-
-    SpawnWoodPallet(dropPos + Vector(0,0,-15), Vector(math.Rand(-50,50), math.Rand(-50,50), -70), nil)
-    self:Debug("W3 GBU53 pallet dropped at " .. tostring(dropPos))
-end
-
-function ENT:UpdateGBU53(ct)
-    if self.WPN_ShotsFired >= CFG_W3_GBU53_Count then return true end
-    if ct < self.WPN_NextShot then return false end
-    self.WPN_NextShot   = ct + CFG_W3_GBU53_Delay
-    self.WPN_ShotsFired = self.WPN_ShotsFired + 1
-    self:SpawnOneGBU53Pallet()
-    return (self.WPN_ShotsFired >= CFG_W3_GBU53_Count)
-end
-
--- ============================================================
--- W6: RETARDED / PARACHUTE BOMBS
--- ============================================================
-function ENT:UpdateRetarded(ct)
-    if self.WPN_ShotsFired >= CFG_W6_Count then return true end
-    if ct < self.WPN_NextShot then return false end
-    self.WPN_NextShot   = ct + CFG_W6_Delay
-    self.WPN_ShotsFired = self.WPN_ShotsFired + 1
-
-    local entClass = CFG_W6_Pool[math.random(#CFG_W6_Pool)]
-    local dropPos   = self:LocalToWorld(CFG_BombBayLocal)
-    local aimPos    = self:GetAimPos(CFG_W6_Scatter)
-    local bomb      = self:SpawnDartBomb(entClass, dropPos, aimPos, true)
-    if self.WPN_ShotsFired == 1 then
-        SpawnWoodPallet(dropPos + Vector(0,0,-10), Vector(math.Rand(-50,50), math.Rand(-50,50), -60), bomb)
-    end
-    return (self.WPN_ShotsFired >= CFG_W6_Count)
-end
-
--- ============================================================
--- W7: WP ILLUMINATION CANISTER (parachute)
--- Each canister receives the aircraft's current forward velocity
--- so it arcs outward realistically instead of dropping straight down.
--- A wood pallet is spawned with each drop for visual realism.
--- ============================================================
-function ENT:SpawnOneWP()
-    local tailWorld = self:LocalToWorld(CFG_W7_DropOffset)
-    local dropPos = Vector(
-        tailWorld.x,
-        tailWorld.y,
-        tailWorld.z - CFG_W7_BodyClearance
-    )
-    if not util.IsInWorld(dropPos) then
-        dropPos = Vector(self.CenterPos.x, self.CenterPos.y, self:GetPos().z - CFG_W7_BodyClearance)
-    end
-
-    local can = ents.Create("ent_bombin_wp_canister")
-    if not IsValid(can) then
-        self:Debug("W7 WP: ent_bombin_wp_canister not found")
-        return
-    end
-
-    -- Compute aircraft forward velocity at this exact moment and pass it
-    -- to the canister BEFORE Spawn() so Initialize() can store it.
-    local fwdVel = Angle(0, self.flightYaw, 0):Forward() * self.Speed
-    fwdVel.z = 0
-    can.WP_LaunchVel = fwdVel
-
-    can:SetPos(dropPos)
-    can:SetAngles(Angle(0, self.flightYaw, 0))
-    can:SetOwner(self)
-    can.Launcher = self
-    can:Spawn()
-    can:Activate()
-
-    local ncHandle = constraint.NoCollide(can, self, 0, 0)
-    timer.Simple(CFG_W7_NoCollideHold, function()
-        if IsValid(ncHandle) then ncHandle:Remove() end
-    end)
-
-    -- Wood pallet debris, consistent with all other weapon windows.
-    SpawnWoodPallet(
-        dropPos + Vector(0, 0, -15),
-        Vector(math.Rand(-50,50), math.Rand(-50,50), -70),
-        nil
-    )
-
-    self:Debug("W7 WP canister dropped at " .. tostring(dropPos))
-end
-
-function ENT:UpdateWP(ct)
-    if self.WPN_ShotsFired >= CFG_W7_Count then return true end
-    if ct < self.WPN_NextShot then return false end
-    self.WPN_NextShot   = ct + CFG_W7_Delay
-    self.WPN_ShotsFired = self.WPN_ShotsFired + 1
-    self:SpawnOneWP()
-    return (self.WPN_ShotsFired >= CFG_W7_Count)
-end
-
-function ENT:SetVar(key, value)
-    self.__vars = self.__vars or {}
-    self.__vars[key] = value
-end
-
-function ENT:GetVar(key, default)
-    if self.__vars and self.__vars[key] ~= nil then
-        return self.__vars[key]
-    end
-    return default
-end
+-- ===========
